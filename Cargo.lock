@@ -2693,10 +2693,12 @@ name = "senders"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "grammers-client",
  "notify-rust",
  "qrcode",
  "ratatui",
+ "thiserror 2.0.20",
  "tokio",
  "whatsapp-rust",
  "whatsapp-rust-chat-store",

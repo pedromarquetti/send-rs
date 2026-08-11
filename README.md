@@ -9,6 +9,7 @@ Sender is an TUI app for interacting with Whatsapp AND telegram (maybe more in t
 
 - [ ] ***One-Executable-app*** - no co dependencies, one binary to rule them all. 
 - [ ] ***All-in-one app for messages***  - at first, Whatsapp + Telegram, but maybe more apps could be implemented?
+- [ ] Configurable
 - [ ] Support for notifications 
 - [ ] Multi platform
 - [ ] Image rendering

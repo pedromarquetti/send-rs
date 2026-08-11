@@ -84,9 +84,9 @@ impl App {
         let horizontal = Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)])
             .split(vertical[0]);
 
-        let dialogs = Block::bordered().title(" Chats ");
+        let chat_list = Block::bordered().title(" Chats ");
         // TODO: The current chat should be the contact name/phone number
-        let chat = Block::bordered().title(" Selected chat ");
+        let active_chat = Block::bordered().title(" Selected chat ");
 
         let status = Paragraph::new(Line::from(vec![
             Span::raw(self.last_tick.clone()),
@@ -95,8 +95,8 @@ impl App {
         ]))
         .block(Block::bordered().title(" Status "));
 
-        frame.render_widget(dialogs, horizontal[0]);
-        frame.render_widget(chat, horizontal[1]);
+        frame.render_widget(chat_list, horizontal[0]);
+        frame.render_widget(active_chat, horizontal[1]);
         frame.render_widget(status, vertical[1]);
     }
 }
