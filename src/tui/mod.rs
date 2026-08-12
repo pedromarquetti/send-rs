@@ -26,6 +26,7 @@ mod status_bar;
 enum UiEvent {
     Key(KeyEvent),
     Backend(usize, BackendEvent),
+    Resize(u16, u16),
 }
 
 pub async fn run(
@@ -91,6 +92,7 @@ async fn run_app(
             UiEvent::Backend(index, backend_event) => {
                 app.state.handle_backend_event(index, backend_event);
             }
+            UiEvent::Resize(..) => {}
         }
         if !app.state.running {
             break;
@@ -105,6 +107,11 @@ fn spawn_terminal_reader(tx: mpsc::UnboundedSender<UiEvent>) {
             match event::read() {
                 Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                     if tx.send(UiEvent::Key(key)).is_err() {
+                        break;
+                    }
+                }
+                Ok(Event::Resize(width, height)) => {
+                    if tx.send(UiEvent::Resize(width, height)).is_err() {
                         break;
                     }
                 }
@@ -200,7 +207,7 @@ impl App {
             return;
         }
 
-        if key == km.focus_write && !self.state.chats.is_empty() {
+        if key == km.focus_write && self.state.selected_chat().is_some() {
             self.state.focus = Focus::Write;
             return;
         }
@@ -276,8 +283,8 @@ impl App {
         self.draw_chat_view(frame, horizontal[1]);
         let current = self
             .state
-            .chats
-            .get(self.state.selected_chat().unwrap_or(0))
+            .selected_chat()
+            .and_then(|index| self.state.chats.get(index))
             .map(|chat| chat.name.clone());
         frame.render_widget(StatusBarWidget::new(current, self.state.focus), vertical[1]);
     }
@@ -291,16 +298,39 @@ impl App {
     fn draw_chat_view(&mut self, frame: &mut Frame, area: Rect) {
         let chat_focused = matches!(self.state.focus, Focus::Chat | Focus::Write);
         let write_focused = self.state.focus == Focus::Write;
-        let title = self
-            .state
-            .chats
-            .get(self.state.selected_chat().unwrap_or(0))
+
+        let selected = self.state.selected_chat();
+        let opened = selected
+            .and_then(|index| self.state.chats.get(index))
+            .map(|chat| {
+                self.state
+                    .history_chat
+                    .as_ref()
+                    .map(|c| c == &chat.id)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        let title = selected
+            .and_then(|index| self.state.chats.get(index))
             .map(|chat| chat.name.clone())
             .unwrap_or_else(|| "No chat selected".into());
+        let hint = if selected.is_some() && !opened {
+            Some("Press Enter to open this chat")
+        } else if selected.is_none() {
+            Some("No chat selected. j/k move, Enter open.")
+        } else {
+            None
+        };
+        let history = if opened {
+            self.state.history.as_slice()
+        } else {
+            &[]
+        };
 
         let widget = ChatView::new(
-            &self.state.history,
+            history,
             &title,
+            hint,
             chat_focused,
             write_focused,
             &mut self.state.write,
