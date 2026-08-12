@@ -1,3 +1,4 @@
+pub mod mock;
 pub mod telegram;
 pub mod whatsapp;
 
@@ -34,7 +35,7 @@ pub enum BackendEvent {
     Connected,
     Disconnected(String),
     MessageReceived(Message),
-    DialogUpdated(Chat),
+    ChatUpdated(Chat),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -57,8 +58,8 @@ pub trait Messenger: Send + Sync {
     async fn is_authenticated(&self) -> bool;
     /// get chat list for populating sidebar
     async fn chats(&self) -> Result<Vec<Chat>, BackendError>;
-    /// check / change message/chat read status
-    async fn read(&mut self) -> Result<()>;
+    /// mark a chat as read
+    async fn read(&mut self, chat: &ChatId) -> Result<(), BackendError>;
     async fn history(&self, chat: &ChatId) -> Result<Vec<Message>, BackendError>;
     async fn send(&self, chat: &ChatId, text: &str) -> Result<(), BackendError>;
     fn subscribe(&self) -> broadcast::Receiver<BackendEvent>;
@@ -88,6 +89,6 @@ mod tests {
         };
         assert_eq!(chat.name, "Alice");
         assert_eq!(chat.last_message.as_deref(), Some("hey"));
-        assert_eq!(chat.unread, true);
+        assert!(chat.unread);
     }
 }

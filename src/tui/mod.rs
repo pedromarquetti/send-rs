@@ -1,102 +1,317 @@
 use anyhow::Result;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::crossterm::ExecutableCommand;
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use ratatui::crossterm::event::{
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::{DefaultTerminal, Frame};
-use std::time::Duration;
 use tokio::sync::mpsc;
+
+use crate::backend::{BackendEvent, Messenger};
+use crate::config::{Config, Keymap};
+use crate::tui::chat::ChatView;
+use crate::tui::chat_list::ChatList;
+use crate::tui::settings::Settings;
+use crate::tui::state::{AppState, Focus, Screen};
+use crate::tui::status_bar::StatusBarWidget;
+
+mod chat;
+mod chat_list;
+mod overlay;
+mod settings;
+mod state;
+mod status_bar;
 
 enum UiEvent {
     Key(KeyEvent),
-    Ticker(String),
+    Backend(usize, BackendEvent),
 }
 
-pub async fn run() -> Result<()> {
+pub async fn run(
+    config: Config,
+    keymap: Keymap,
+    messengers: Vec<Box<dyn Messenger>>,
+    open_settings: bool,
+) -> Result<()> {
     let mut terminal = ratatui::init();
-    let result = run_app(&mut terminal).await;
+    // TODO: check this AI generated func.
+    // this is supposed to fix Shift+Enter for newline not working, but uncommenting this breaks
+    // everything
+    //
+    // enable_keyboard_enhancement();
+    let result = run_app(&mut terminal, config, keymap, messengers, open_settings).await;
+    // disable_keyboard_enhancement();
     ratatui::restore();
     result
 }
 
-async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
+/// Ask the terminal to report modifier keys (Shift+Enter etc.) distinctly.
+fn enable_keyboard_enhancement() {
+    let _ = std::io::stdout().execute(PushKeyboardEnhancementFlags(
+        KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+    ));
+}
+
+fn disable_keyboard_enhancement() {
+    let _ = std::io::stdout().execute(PopKeyboardEnhancementFlags);
+}
+
+async fn run_app(
+    terminal: &mut DefaultTerminal,
+    config: Config,
+    keymap: Keymap,
+    messengers: Vec<Box<dyn Messenger>>,
+    open_settings: bool,
+) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
     spawn_terminal_reader(tx.clone());
-    tokio::spawn(async move {
-        demo_ticker(tx).await;
-    });
 
-    let mut app = App::default();
+    // handling new events for each messenger type
+    for (index, messenger) in messengers.iter().enumerate() {
+        let mut backend_rx = messenger.subscribe();
+        let forward_tx = tx.clone();
+        tokio::spawn(async move {
+            while let Ok(event) = backend_rx.recv().await {
+                if forward_tx.send(UiEvent::Backend(index, event)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    let mut app = App::new(config, keymap, messengers, open_settings).await?;
     loop {
-        let event = match rx.recv().await {
-            Some(event) => event,
-            None => break,
+        terminal.draw(|frame| app.draw(frame))?;
+        let Some(event) = rx.recv().await else {
+            break;
         };
         match event {
-            UiEvent::Key(key) if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') => break,
-            UiEvent::Key(key) if key.code == KeyCode::Char('q') => break,
-            UiEvent::Key(_) => {}
-            UiEvent::Ticker(text) => app.last_tick = text,
+            UiEvent::Key(key) => app.handle_key(key).await,
+            UiEvent::Backend(index, backend_event) => {
+                app.state.handle_backend_event(index, backend_event);
+            }
         }
-        terminal.draw(|frame| app.draw(frame))?;
+        if !app.state.running {
+            break;
+        }
     }
     Ok(())
 }
 
 fn spawn_terminal_reader(tx: mpsc::UnboundedSender<UiEvent>) {
-    std::thread::spawn(move || loop {
-        match event::read() {
-            Ok(Event::Key(key)) => {
-                if tx.send(UiEvent::Key(key)).is_err() {
-                    break;
+    std::thread::spawn(move || {
+        loop {
+            match event::read() {
+                Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                    if tx.send(UiEvent::Key(key)).is_err() {
+                        break;
+                    }
                 }
+                Ok(_) => {}
+                Err(_) => break,
             }
-            Ok(_) => {}
-            Err(_) => break,
         }
     });
 }
 
-// TODO: remove demo code
-async fn demo_ticker(tx: mpsc::UnboundedSender<UiEvent>) {
-    let mut tick = 0u64;
-    loop {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        tick += 1;
-        if tx
-            .send(UiEvent::Ticker(format!("tokio heartbeat #{tick}")))
-            .is_err()
-        {
-            return;
-        }
-    }
-}
-
-#[derive(Default)]
 struct App {
-    last_tick: String,
+    state: AppState,
 }
 
 impl App {
-    fn draw(&self, frame: &mut Frame) {
-        let vertical = Layout::vertical([Constraint::Fill(1), Constraint::Length(3)]).split(frame.area());
-        let horizontal = Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)])
-            .split(vertical[0]);
+    async fn new(
+        config: Config,
+        keymap: Keymap,
+        messengers: Vec<Box<dyn Messenger>>,
+        open_settings: bool,
+    ) -> Result<Self> {
+        Ok(Self {
+            state: AppState::new(config, keymap, messengers, open_settings).await?,
+        })
+    }
 
-        let chat_list = Block::bordered().title(" Chats ");
-        // TODO: The current chat should be the contact name/phone number
-        let active_chat = Block::bordered().title(" Selected chat ");
+    async fn handle_key(&mut self, key: KeyEvent) {
+        if key == self.state.keymap.quit {
+            self.state.running = false;
+            return;
+        }
 
-        let status = Paragraph::new(Line::from(vec![
-            Span::raw(self.last_tick.clone()),
-            Span::raw("   "),
-            Span::styled("q: quit", Style::default().add_modifier(Modifier::DIM)),
-        ]))
-        .block(Block::bordered().title(" Status "));
+        // A dialog/overlay keeps focus and captures all keys until dismissed.
+        if self.state.overlay.is_some() {
+            if key == self.state.keymap.dismiss {
+                self.state.dismiss_overlay();
+            }
+            return;
+        }
 
-        frame.render_widget(chat_list, horizontal[0]);
-        frame.render_widget(active_chat, horizontal[1]);
-        frame.render_widget(status, vertical[1]);
+        match self.state.screen {
+            Screen::Settings => self.handle_settings_key(key).await,
+            Screen::Main => self.handle_main_key(key).await,
+        }
+    }
+
+    async fn handle_settings_key(&mut self, key: KeyEvent) {
+        let km = self.state.keymap.clone();
+        if key == km.dismiss || key == km.open_settings {
+            self.state.screen = Screen::Main;
+        } else if key == km.chat_list_up {
+            let index = self
+                .state
+                .settings_state
+                .selected()
+                .unwrap_or(0)
+                .saturating_sub(1);
+            self.state.settings_state.select(Some(index));
+        } else if key == km.chat_list_down {
+            let index = self.state.settings_state.selected().unwrap_or(0);
+            if index + 1 < 2 {
+                self.state.settings_state.select(Some(index + 1));
+            }
+        } else if key == km.select {
+            let index = self.state.settings_state.selected().unwrap_or(0);
+            self.state.toggle_provider(index).await;
+        }
+    }
+
+    async fn handle_main_key(&mut self, key: KeyEvent) {
+        let km = self.state.keymap.clone();
+
+        if key == km.dismiss {
+            match self.state.focus {
+                Focus::Write => {
+                    self.state.focus = Focus::Chat;
+                }
+                Focus::Chat => {
+                    self.state.focus = Focus::ChatList;
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if key == km.open_settings && self.state.focus != Focus::Write {
+            self.state.screen = Screen::Settings;
+            return;
+        }
+
+        if key == km.pane_next {
+            self.state.cycle_focus();
+            return;
+        }
+
+        if key == km.focus_write && !self.state.chats.is_empty() {
+            self.state.focus = Focus::Write;
+            return;
+        }
+
+        match self.state.focus {
+            Focus::ChatList => {
+                if key == km.chat_list_up {
+                    self.state.chat_list_state.select_previous();
+                } else if key == km.chat_list_down {
+                    self.state.chat_list_state.select_next();
+                } else if key == km.select && !self.state.chats.is_empty() {
+                    match self.state.selected_chat() {
+                        Some(chat) => {
+                            self.state.select_chat(chat).await;
+                        }
+                        None => {
+                            self.state.show_error("No chat selected");
+                        }
+                    };
+                }
+            }
+            Focus::Chat => {
+                if key == km.history_up {
+                    self.state.chat_view_state.scroll =
+                        self.state.chat_view_state.scroll.saturating_add(1);
+                } else if key == km.history_down {
+                    self.state.chat_view_state.scroll =
+                        self.state.chat_view_state.scroll.saturating_sub(1);
+                } else if key.code == KeyCode::PageUp {
+                    self.state.chat_view_state.scroll = self
+                        .state
+                        .chat_view_state
+                        .scroll
+                        .saturating_add(self.state.chat_view_state.page);
+                } else if key.code == KeyCode::PageDown {
+                    self.state.chat_view_state.scroll = self
+                        .state
+                        .chat_view_state
+                        .scroll
+                        .saturating_sub(self.state.chat_view_state.page);
+                }
+            }
+            Focus::Write => {
+                if key == km.send {
+                    self.state.send_message().await;
+                } else if key == km.newline {
+                    self.state.write.insert_newline();
+                } else {
+                    self.state.write.input(key);
+                }
+            }
+            Focus::Overlay => {}
+        }
+    }
+
+    fn draw(&mut self, frame: &mut Frame) {
+        if let Some(overlay) = &self.state.overlay {
+            overlay::render(frame, overlay);
+        }
+        match self.state.screen {
+            Screen::Main => self.draw_main(frame),
+            Screen::Settings => self.draw_settings(frame),
+        }
+    }
+
+    fn draw_main(&mut self, frame: &mut Frame) {
+        let area = frame.area();
+        let vertical = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(area);
+        let horizontal =
+            Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)])
+                .split(vertical[0]);
+        self.draw_chat_list(frame, horizontal[0]);
+        self.draw_chat_view(frame, horizontal[1]);
+        let current = self
+            .state
+            .chats
+            .get(self.state.selected_chat().unwrap_or(0))
+            .map(|chat| chat.name.clone());
+        frame.render_widget(StatusBarWidget::new(current, self.state.focus), vertical[1]);
+    }
+
+    fn draw_chat_list(&mut self, frame: &mut Frame, area: Rect) {
+        let focused = self.state.focus == Focus::ChatList;
+        let widget = ChatList::new(&self.state.chats, &self.state.chat_tags, focused);
+        frame.render_stateful_widget(widget, area, &mut self.state.chat_list_state);
+    }
+
+    fn draw_chat_view(&mut self, frame: &mut Frame, area: Rect) {
+        let chat_focused = matches!(self.state.focus, Focus::Chat | Focus::Write);
+        let write_focused = self.state.focus == Focus::Write;
+        let title = self
+            .state
+            .chats
+            .get(self.state.selected_chat().unwrap_or(0))
+            .map(|chat| chat.name.clone())
+            .unwrap_or_else(|| "No chat selected".into());
+
+        let widget = ChatView::new(
+            &self.state.history,
+            &title,
+            chat_focused,
+            write_focused,
+            &mut self.state.write,
+        );
+        let view_state = &mut self.state.chat_view_state;
+        frame.render_stateful_widget(widget, area, view_state);
+    }
+
+    fn draw_settings(&mut self, frame: &mut Frame) {
+        let area = frame.area();
+        let widget = Settings::new(&self.state.config.providers);
+        frame.render_stateful_widget(widget, area, &mut self.state.settings_state);
     }
 }

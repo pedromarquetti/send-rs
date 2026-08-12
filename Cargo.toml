@@ -18,3 +18,8 @@ whatsapp-rust-chat-store = { git = "https://github.com/jlucaso1/whatsapp-rust", 
 
 qrcode = "0.14"
 notify-rust = "4"
+dirs = "6"
+serde = { version = "1", features = ["derive"] }
+toml = "1.1"
+ratatui-textarea = "0.9.2"
+chrono = "0.4"
