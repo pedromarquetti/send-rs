@@ -1,23 +1,50 @@
 pub mod mock;
 pub mod telegram;
 pub mod whatsapp;
-
 use anyhow::Result;
 use tokio::sync::broadcast;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
 pub enum ChatId {
     Telegram(i64),
     WhatsApp(String),
+    #[default]
+    // TODO: add a Myself conversation for storing messages
+    Myself,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct Chat {
     pub id: ChatId,
-    pub name: String,
+    pub contact_name: String,
     pub last_message: Option<String>,
+    /// keeps track of current chat scroll
+    /// TODO: make this configurable? should the user be able to config if the chat keeps track of
+    /// scroll?
+    pub scroll: usize,
+    // Keeps track of unread state for the chat
     pub unread: bool,
     pub unread_count: i32,
+}
+
+impl ChatId {
+    /// The provider platform this chat belongs to.
+    pub fn platform(&self) -> &'static str {
+        match self {
+            ChatId::Telegram(_) => "Telegram",
+            ChatId::WhatsApp(_) => "WhatsApp",
+            ChatId::Myself => "",
+        }
+    }
+
+    /// Short display tag used in the chat list.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            ChatId::Telegram(_) => "TG",
+            ChatId::WhatsApp(_) => "WA",
+            ChatId::Myself => "ME",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -59,9 +86,12 @@ pub trait Messenger: Send + Sync {
     /// get chat list for populating sidebar
     async fn chats(&self) -> Result<Vec<Chat>, BackendError>;
     /// mark a chat as read
-    async fn read(&mut self, chat: &ChatId) -> Result<(), BackendError>;
+    async fn set_read(&mut self, chat: &ChatId) -> Result<(), BackendError>;
+    /// Requests the Messenger provider for chat history
     async fn history(&self, chat: &ChatId) -> Result<Vec<Message>, BackendError>;
+    /// Handles sending Client >>> Messenger (provider) messages
     async fn send(&self, chat: &ChatId, text: &str) -> Result<(), BackendError>;
+    /// Messenger provider >>> Client message handling
     fn subscribe(&self) -> broadcast::Receiver<BackendEvent>;
 }
 
@@ -82,12 +112,13 @@ mod tests {
     fn dialog_carries_sidebar_fields() {
         let chat = Chat {
             id: ChatId::WhatsApp("5511999999999@s.whatsapp.net".into()),
-            name: "Alice".into(),
+            contact_name: "Alice".into(),
             last_message: Some("hey".into()),
             unread: true,
             unread_count: 1,
+            ..Default::default()
         };
-        assert_eq!(chat.name, "Alice");
+        assert_eq!(chat.contact_name, "Alice");
         assert_eq!(chat.last_message.as_deref(), Some("hey"));
         assert!(chat.unread);
     }

@@ -5,17 +5,12 @@ use crate::backend::Chat;
 
 pub struct ChatList<'a> {
     chats: &'a [Chat],
-    tags: &'a [&'static str],
     focused: bool,
 }
 
 impl<'a> ChatList<'a> {
-    pub fn new(chats: &'a [Chat], tags: &'a [&'static str], focused: bool) -> Self {
-        Self {
-            chats,
-            tags,
-            focused,
-        }
+    pub fn new(chats: &'a [Chat], focused: bool) -> Self {
+        Self { chats, focused }
     }
 }
 
@@ -41,24 +36,21 @@ impl StatefulWidget for ChatList<'_> {
         let items: Vec<ListItem> = self
             .chats
             .iter()
-            .enumerate()
-            .map(|(index, chat)| {
+            .map(|item| {
                 let mut spans = Vec::new();
-                if let Some(tag) = self.tags.get(index) {
-                    spans.push(Span::styled(
-                        format!("{tag:>2} "),
-                        Style::default().fg(Color::DarkGray),
-                    ));
-                }
-                let name_style = if chat.unread {
+                spans.push(Span::styled(
+                    format!("{:>2} ", item.id.tag()),
+                    Style::default().fg(Color::DarkGray),
+                ));
+                let name_style = if item.unread {
                     Style::default().add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
-                spans.push(Span::styled(chat.name.clone(), name_style));
-                if chat.unread_count > 0 {
+                spans.push(Span::styled(item.contact_name.clone(), name_style));
+                if item.unread_count > 0 {
                     spans.push(Span::styled(
-                        format!(" ({})", chat.unread_count),
+                        format!(" ({})", item.unread_count),
                         Style::default().fg(Color::Yellow),
                     ));
                 }

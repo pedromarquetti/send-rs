@@ -24,7 +24,7 @@ impl Widget for StatusBarWidget {
                 "j/k move (up/down); Enter select; Tab switch focus; i write; s settings; Ctrl+C quit"
             }
             Focus::Chat => {
-                "j/k scroll; PgUp/PgDn page; i write; Tab switch focus; s settings; Ctrl+C quit"
+                "j/k scroll; G bottom; PgUp/PgDn page; i write; Tab switch focus; s settings; Ctrl+C quit"
             }
             Focus::Write => {
                 "Enter send; Shift+Enter newline; Esc back; Tab switch focus; Ctrl+C quit"

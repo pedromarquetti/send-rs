@@ -1,15 +1,22 @@
 use super::{BackendError, BackendEvent, Chat, ChatId, Message, Messenger};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
+
+const NEWS_ID: ChatId = ChatId::Telegram(101);
+const FAMILY_ID: ChatId = ChatId::Telegram(102);
+const ALICE_ID: ChatId = ChatId::Telegram(103);
+const ECHO_ID: ChatId = ChatId::Telegram(104);
+const ECHO_SENDER: &str = "Echo Bot";
 
 pub struct MockMessenger {
     name: &'static str,
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
     tx: broadcast::Sender<BackendEvent>,
     incoming_chat: ChatId,
+    echo_chat: ChatId,
 }
 
 struct State {
@@ -18,39 +25,59 @@ struct State {
     outgoing_seq: u64,
 }
 
+struct MockData {
+    chats: Vec<Chat>,
+    history: HashMap<ChatId, Vec<Message>>,
+    incoming_chat: ChatId,
+    echo_chat: ChatId,
+}
+
 impl MockMessenger {
     pub fn new(name: &'static str) -> Self {
         let (tx, _) = broadcast::channel(128);
-        let (chats, history) = mock_data(name);
-        let incoming_chat = chats.first().map(|c| c.id.clone()).expect("mock has chats");
+        let data = mock_data(name);
         Self {
             name,
-            state: Mutex::new(State {
-                chats,
-                history,
+            state: Arc::new(Mutex::new(State {
+                chats: data.chats,
+                history: data.history,
                 outgoing_seq: 0,
-            }),
+            })),
             tx,
-            incoming_chat,
+            incoming_chat: data.incoming_chat,
+            echo_chat: data.echo_chat,
         }
     }
 
     pub fn spawn_incoming_messages(&self) {
+        self.spawn_incoming_messages_every(Duration::from_secs(15));
+    }
+
+    fn spawn_incoming_messages_every(&self, interval: Duration) {
         let tx = self.tx.clone();
         let chat = self.incoming_chat.clone();
+        let state = self.state.clone();
+        let name = self.name;
         tokio::spawn(async move {
             let mut n = 0u64;
             loop {
-                sleep(Duration::from_secs(15)).await;
+                sleep(interval).await;
                 n += 1;
                 let msg = Message {
-                    id: format!("mock-incoming-{n}"),
+                    id: format!("mock-{name}-incoming-{n}"),
                     chat: chat.clone(),
-                    sender: "Mock Bot".into(),
+                    sender: format!("{name} Mock"),
                     text: format!("simulated incoming message #{n}"),
                     timestamp: now(),
                     from_me: false,
                 };
+                let mut state = state.lock().expect("mock state poisoned");
+                state
+                    .history
+                    .entry(chat.clone())
+                    .or_default()
+                    .push(msg.clone());
+                drop(state);
                 if tx.send(BackendEvent::MessageReceived(msg)).is_err() {
                     return;
                 }
@@ -74,7 +101,7 @@ impl Messenger for MockMessenger {
         Ok(state.chats.clone())
     }
 
-    async fn read(&mut self, chat: &ChatId) -> Result<(), BackendError> {
+    async fn set_read(&mut self, chat: &ChatId) -> Result<(), BackendError> {
         let mut state = self.state.lock().expect("Expected valid state");
         for entry in &mut state.chats {
             if entry.id == *chat {
@@ -127,6 +154,10 @@ impl Messenger for MockMessenger {
                 .send(BackendEvent::ChatUpdated(chat))
                 .map_err(|_| BackendError::Other("event channel closed".into()))?;
         }
+
+        if chat == &self.echo_chat {
+            self.spawn_echo(chat.clone(), text);
+        }
         Ok(())
     }
 
@@ -135,73 +166,159 @@ impl Messenger for MockMessenger {
     }
 }
 
-fn mock_data(name: &'static str) -> (Vec<Chat>, HashMap<ChatId, Vec<Message>>) {
-    let mut history = HashMap::new();
+impl MockMessenger {
+    fn spawn_echo(&self, chat: ChatId, text: &str) {
+        let tx = self.tx.clone();
+        let state = self.state.clone();
+        let sender = ECHO_SENDER.to_string();
+        let text = text.to_string();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(150)).await;
+            let mut state = state.lock().expect("mock state poisoned");
+            state.outgoing_seq += 1;
+            let msg = Message {
+                id: format!("mock-echo-{}", state.outgoing_seq),
+                chat: chat.clone(),
+                sender: sender.clone(),
+                text: text.clone(),
+                timestamp: now(),
+                from_me: false,
+            };
+            state
+                .history
+                .entry(chat.clone())
+                .or_default()
+                .push(msg.clone());
+            let updated_chat = state
+                .chats
+                .iter()
+                .find(|c| c.id == chat)
+                .cloned()
+                .map(|mut c| {
+                    c.last_message = Some(format!("{sender}: {text}"));
+                    c
+                });
+            drop(state);
+            if tx.send(BackendEvent::MessageReceived(msg)).is_err() {
+                return;
+            }
+            if let Some(chat) = updated_chat {
+                let _ = tx.send(BackendEvent::ChatUpdated(chat));
+            }
+        });
+    }
+}
+
+fn mock_data(name: &'static str) -> MockData {
+    let mut history: HashMap<ChatId, Vec<Message>> = HashMap::new();
     match name {
         "Telegram" => {
-            let news = ChatId::Telegram(101);
-            let family = ChatId::Telegram(102);
-            let alice = ChatId::Telegram(103);
             let chats = vec![
                 Chat {
-                    id: news.clone(),
-                    name: "Telegram News".into(),
+                    id: NEWS_ID.clone(),
+                    contact_name: "Telegram News".into(),
                     last_message: Some("MTProto v0.10 released".into()),
                     unread: false,
                     unread_count: 0,
+                    ..Default::default()
                 },
                 Chat {
-                    id: family.clone(),
-                    name: "Family Group".into(),
+                    id: FAMILY_ID.clone(),
+                    contact_name: "Family Group".into(),
                     last_message: Some("Mum: call me later".into()),
                     unread: true,
                     unread_count: 3,
+                    ..Default::default()
                 },
                 Chat {
-                    id: alice.clone(),
-                    name: "Alice".into(),
+                    id: ALICE_ID.clone(),
+                    contact_name: "Alice".into(),
                     last_message: Some("You: ok, see you".into()),
                     unread: false,
                     unread_count: 0,
+                    ..Default::default()
+                },
+                Chat {
+                    id: ECHO_ID.clone(),
+                    contact_name: ECHO_SENDER.into(),
+                    last_message: None,
+                    unread: false,
+                    unread_count: 0,
+                    ..Default::default()
                 },
             ];
-            history.insert(family.clone(), long_history(family));
+
+            history.insert(FAMILY_ID.clone(), long_history(FAMILY_ID.clone()));
             history.insert(
-                news.clone(),
+                NEWS_ID.clone(),
                 vec![
-                    message("tg-1", &news, "Telegram News", "MTProto v0.10 is out!", false),
-                    message("tg-2", &news, "Telegram News", "Pure-Rust client library.", false),
+                    message(
+                        "tg-1",
+                        &NEWS_ID,
+                        "Telegram News",
+                        "MTProto v0.10 is out!",
+                        false,
+                    ),
+                    message(
+                        "tg-2",
+                        &NEWS_ID,
+                        "Telegram News",
+                        "Pure-Rust client library.",
+                        false,
+                    ),
                 ],
             );
             history.insert(
-                alice.clone(),
+                ALICE_ID.clone(),
                 vec![
-                    message("tg-3", &alice, "Alice", "Are you coming tonight?", false),
-                    message("tg-4", &alice, "You", "ok, see you", true),
+                    message("tg-3", &ALICE_ID, "Alice", "Are you coming tonight?", false),
+                    message("tg-4", &ALICE_ID, "You", "ok, see you", true),
                 ],
             );
-            (chats, history)
+            MockData {
+                chats,
+                history,
+                incoming_chat: FAMILY_ID,
+                echo_chat: ECHO_ID,
+            }
         }
         _ => {
             let bob = ChatId::WhatsApp("5511999990001@s.whatsapp.net".into());
             let design = ChatId::WhatsApp("5511999990002@s.whatsapp.net".into());
+            let echo = ChatId::WhatsApp("5511999990003@s.whatsapp.net".into());
             let chats = vec![
                 Chat {
                     id: bob.clone(),
-                    name: "Bob".into(),
+                    contact_name: "Bob".into(),
                     last_message: Some("Bob: did you push?".into()),
                     unread: true,
                     unread_count: 5,
+                    ..Default::default()
                 },
                 Chat {
                     id: design.clone(),
-                    name: "Design Team".into(),
+                    contact_name: "Design Team".into(),
                     last_message: Some("Lia: new figma board".into()),
                     unread: false,
                     unread_count: 0,
+                    ..Default::default()
+                },
+                Chat {
+                    id: echo.clone(),
+                    contact_name: ECHO_SENDER.into(),
+                    last_message: None,
+                    unread: false,
+                    unread_count: 0,
+                    ..Default::default()
                 },
             ];
-            history.insert(bob.clone(), long_history(bob));
+            history.insert(
+                bob.clone(),
+                vec![
+                    message("wa-0a", &bob, "Bob", "suh", false),
+                    message("wa-0b", &bob, "You", "suh", true),
+                ],
+            );
             history.insert(
                 design.clone(),
                 vec![
@@ -209,7 +326,12 @@ fn mock_data(name: &'static str) -> (Vec<Chat>, HashMap<ChatId, Vec<Message>>) {
                     message("wa-2", &design, "You", "looks good!", true),
                 ],
             );
-            (chats, history)
+            MockData {
+                chats,
+                history,
+                incoming_chat: bob,
+                echo_chat: echo,
+            }
         }
     }
 }
@@ -256,7 +378,11 @@ fn long_history(chat: ChatId) -> Vec<Message> {
             message(
                 &format!("mock-{i}"),
                 &chat,
-                if from_me { "You" } else { senders[i % senders.len()] },
+                if from_me {
+                    "You"
+                } else {
+                    senders[i % senders.len()]
+                },
                 text,
                 from_me,
             )
@@ -324,8 +450,59 @@ mod tests {
 
     #[test]
     fn mock_data_is_deterministic() {
-        let (chats, history) = mock_data("Telegram");
-        assert_eq!(chats.len(), 3);
-        assert!(history.values().all(|msgs| !msgs.is_empty()));
+        let data = mock_data("Telegram");
+        assert_eq!(data.chats.len(), 4);
+        assert!(data.history.values().all(|msgs| !msgs.is_empty()));
+        assert_eq!(data.incoming_chat, ChatId::Telegram(102));
+        assert_eq!(data.echo_chat, ChatId::Telegram(104));
+        assert!(data
+            .chats
+            .iter()
+            .any(|c| c.id == data.echo_chat && c.contact_name == ECHO_SENDER));
+    }
+
+    #[tokio::test]
+    async fn echo_chat_replies_to_sent_message() {
+        let mock = MockMessenger::new("Telegram");
+        let mut rx = mock.subscribe();
+        let echo = mock.echo_chat.clone();
+        mock.send(&echo, "hello there").await.unwrap();
+
+        let echoed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match rx.recv().await {
+                    Ok(BackendEvent::MessageReceived(msg))
+                        if !msg.from_me && msg.chat == echo =>
+                    {
+                        break msg;
+                    }
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => panic!("channel closed before echo"),
+                }
+            }
+        })
+        .await
+        .expect("echo reply never arrived");
+
+        assert_eq!(echoed.text, "hello there");
+        assert_eq!(echoed.sender, ECHO_SENDER);
+        let history = mock.history(&echo).await.unwrap();
+        assert!(history.iter().any(|m| m.id == echoed.id));
+    }
+
+    #[tokio::test]
+    async fn incoming_messages_are_persisted_to_history() {
+        let mock = MockMessenger::new("Telegram");
+        let incoming = mock.incoming_chat.clone();
+        mock.spawn_incoming_messages_every(Duration::from_millis(50));
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let history = mock.history(&incoming).await.unwrap();
+        assert!(
+            history.iter().any(|m| m.sender == "Telegram Mock"),
+            "expected a persisted incoming message"
+        );
     }
 }

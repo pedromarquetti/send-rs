@@ -20,6 +20,8 @@ pub struct ProvidersConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct KeymapConfig {
+    // TODO: Add common up/down keys that are reused so the user doesn't have to configure
+    // multiple up/down keys
     pub chat_list_up: String,
     pub chat_list_down: String,
     pub select: String,
@@ -31,6 +33,7 @@ pub struct KeymapConfig {
     pub focus_write: String,
     pub history_up: String,
     pub history_down: String,
+    pub scroll_to_bottom: String,
     pub send: String,
     pub newline: String,
 }
@@ -49,6 +52,7 @@ impl Default for KeymapConfig {
             focus_write: "i".into(),
             history_up: "k".into(),
             history_down: "j".into(),
+            scroll_to_bottom: "G".into(),
             send: "enter".into(),
             newline: "shift+enter".into(),
         }
@@ -69,6 +73,7 @@ impl KeymapConfig {
             focus_write: parse_key(&self.focus_write)?,
             history_up: parse_key(&self.history_up)?,
             history_down: parse_key(&self.history_down)?,
+            scroll_to_bottom: parse_key(&self.scroll_to_bottom)?,
             send: parse_key(&self.send)?,
             newline: parse_key(&self.newline)?,
         })
@@ -88,6 +93,7 @@ pub struct Keymap {
     pub focus_write: KeyEvent,
     pub history_up: KeyEvent,
     pub history_down: KeyEvent,
+    pub scroll_to_bottom: KeyEvent,
     pub send: KeyEvent,
     // BUG: this is not working
     pub newline: KeyEvent,
@@ -228,6 +234,10 @@ mod tests {
         assert_eq!(
             keymap.dismiss,
             KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+        );
+        assert_eq!(
+            keymap.scroll_to_bottom,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::SHIFT)
         );
     }
 

@@ -10,14 +10,13 @@ use tokio::sync::mpsc;
 
 use crate::backend::{BackendEvent, Messenger};
 use crate::config::{Config, Keymap};
-use crate::tui::chat::ChatView;
-use crate::tui::chat_list::ChatList;
+use crate::tui::chat::chat_list::ChatList;
+use crate::tui::chat::chat_widget::ChatWidget;
 use crate::tui::settings::Settings;
 use crate::tui::state::{AppState, Focus, Screen};
 use crate::tui::status_bar::StatusBarWidget;
 
 mod chat;
-mod chat_list;
 mod overlay;
 mod settings;
 mod state;
@@ -190,6 +189,7 @@ impl App {
                     self.state.focus = Focus::Chat;
                 }
                 Focus::Chat => {
+                    self.state.chat_state.open_chat = None;
                     self.state.focus = Focus::ChatList;
                 }
                 _ => {}
@@ -207,7 +207,10 @@ impl App {
             return;
         }
 
-        if key == km.focus_write && self.state.selected_chat().is_some() {
+        if key == km.focus_write
+            && self.state.selected_chat_idx().is_some()
+            && self.state.focus != Focus::Write
+        {
             self.state.focus = Focus::Write;
             return;
         }
@@ -215,11 +218,14 @@ impl App {
         match self.state.focus {
             Focus::ChatList => {
                 if key == km.chat_list_up {
-                    self.state.chat_list_state.select_previous();
+                    self.state.chat_state.chat_list_state.select_previous();
                 } else if key == km.chat_list_down {
-                    self.state.chat_list_state.select_next();
-                } else if key == km.select && !self.state.chats.is_empty() {
-                    match self.state.selected_chat() {
+                    self.state.chat_state.chat_list_state.select_next();
+                } else if key == km.select
+                    && !self.state.chat_state.chats.is_empty()
+                    && self.state.chat_state.chat_list_state.selected().is_some()
+                {
+                    match self.state.selected_chat_idx() {
                         Some(chat) => {
                             self.state.select_chat(chat).await;
                         }
@@ -231,33 +237,44 @@ impl App {
             }
             Focus::Chat => {
                 if key == km.history_up {
-                    self.state.chat_view_state.scroll =
-                        self.state.chat_view_state.scroll.saturating_add(1);
+                    if let Some(chat) = self.state.chat_state.selected_chat_mut() {
+                        chat.scroll = chat.scroll.saturating_add(1);
+                    }
                 } else if key == km.history_down {
-                    self.state.chat_view_state.scroll =
-                        self.state.chat_view_state.scroll.saturating_sub(1);
+                    if let Some(chat) = self.state.chat_state.selected_chat_mut() {
+                        chat.scroll = chat.scroll.saturating_sub(1);
+                    }
+                } else if key == km.scroll_to_bottom {
+                    if let Some(chat) = self.state.chat_state.selected_chat_mut() {
+                        chat.scroll = 0;
+                    }
                 } else if key.code == KeyCode::PageUp {
-                    self.state.chat_view_state.scroll = self
-                        .state
-                        .chat_view_state
-                        .scroll
-                        .saturating_add(self.state.chat_view_state.page);
+                    let page = self.state.chat_state.visible_page;
+                    if let Some(chat) = self.state.chat_state.selected_chat_mut() {
+                        chat.scroll = chat.scroll.saturating_add(page);
+                    }
                 } else if key.code == KeyCode::PageDown {
-                    self.state.chat_view_state.scroll = self
-                        .state
-                        .chat_view_state
-                        .scroll
-                        .saturating_sub(self.state.chat_view_state.page);
+                    let page = self.state.chat_state.visible_page;
+                    if let Some(chat) = self.state.chat_state.selected_chat_mut() {
+                        chat.scroll = chat.scroll.saturating_sub(page);
+                    }
                 }
             }
             Focus::Write => {
                 if key == km.send {
                     self.state.send_message().await;
-                } else if key == km.newline {
-                    self.state.write.insert_newline();
                 } else {
                     self.state.write.input(key);
                 }
+
+                // removing this for now because newline is not working
+                // if key == km.newline {
+                //     self.state.write.insert_newline();
+                // } else if key == km.send {
+                //     self.state.send_message().await;
+                // } else {
+                //     self.state.write.input(key);
+                // }
             }
             Focus::Overlay => {}
         }
@@ -281,62 +298,26 @@ impl App {
                 .split(vertical[0]);
         self.draw_chat_list(frame, horizontal[0]);
         self.draw_chat_view(frame, horizontal[1]);
-        let current = self
+        let name = self
             .state
+            .chat_state
             .selected_chat()
-            .and_then(|index| self.state.chats.get(index))
-            .map(|chat| chat.name.clone());
-        frame.render_widget(StatusBarWidget::new(current, self.state.focus), vertical[1]);
+            .map(|c| c.contact_name.clone());
+        frame.render_widget(StatusBarWidget::new(name, self.state.focus), vertical[1]);
     }
 
     fn draw_chat_list(&mut self, frame: &mut Frame, area: Rect) {
         let focused = self.state.focus == Focus::ChatList;
-        let widget = ChatList::new(&self.state.chats, &self.state.chat_tags, focused);
-        frame.render_stateful_widget(widget, area, &mut self.state.chat_list_state);
+        let widget = ChatList::new(&self.state.chat_state.chats, focused);
+        frame.render_stateful_widget(widget, area, &mut self.state.chat_state.chat_list_state);
     }
 
     fn draw_chat_view(&mut self, frame: &mut Frame, area: Rect) {
         let chat_focused = matches!(self.state.focus, Focus::Chat | Focus::Write);
         let write_focused = self.state.focus == Focus::Write;
 
-        let selected = self.state.selected_chat();
-        let opened = selected
-            .and_then(|index| self.state.chats.get(index))
-            .map(|chat| {
-                self.state
-                    .history_chat
-                    .as_ref()
-                    .map(|c| c == &chat.id)
-                    .unwrap_or(false)
-            })
-            .unwrap_or(false);
-        let title = selected
-            .and_then(|index| self.state.chats.get(index))
-            .map(|chat| chat.name.clone())
-            .unwrap_or_else(|| "No chat selected".into());
-        let hint = if selected.is_some() && !opened {
-            Some("Press Enter to open this chat")
-        } else if selected.is_none() {
-            Some("No chat selected. j/k move, Enter open.")
-        } else {
-            None
-        };
-        let history = if opened {
-            self.state.history.as_slice()
-        } else {
-            &[]
-        };
-
-        let widget = ChatView::new(
-            history,
-            &title,
-            hint,
-            chat_focused,
-            write_focused,
-            &mut self.state.write,
-        );
-        let view_state = &mut self.state.chat_view_state;
-        frame.render_stateful_widget(widget, area, view_state);
+        let widget = ChatWidget::new(chat_focused, write_focused, &mut self.state.write);
+        frame.render_stateful_widget(widget, area, &mut self.state.chat_state);
     }
 
     fn draw_settings(&mut self, frame: &mut Frame) {
