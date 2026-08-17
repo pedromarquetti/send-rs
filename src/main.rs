@@ -2,12 +2,13 @@
 
 mod backend;
 mod config;
+mod helpers;
 mod notify;
 mod tui;
 
 use anyhow::Result;
-use backend::mock::MockMessenger;
 use backend::Messenger;
+use backend::mock::MockMessenger;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -22,7 +23,8 @@ async fn main() -> Result<()> {
     mock_telegram.spawn_incoming_messages();
     let mock_whatsapp = MockMessenger::new("WhatsApp");
     mock_whatsapp.spawn_incoming_messages();
-    let messengers: Vec<Box<dyn Messenger>> = vec![Box::new(mock_telegram), Box::new(mock_whatsapp)];
+    let messengers: Vec<Box<dyn Messenger>> =
+        vec![Box::new(mock_telegram), Box::new(mock_whatsapp)];
 
     tui::run(config, keymap, messengers, first_boot).await
 }

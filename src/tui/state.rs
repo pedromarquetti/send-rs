@@ -1,15 +1,17 @@
 use anyhow::{Context, Result};
 use ratatui::style::{Color, Style};
 use ratatui::widgets::ListState;
-use ratatui_textarea::TextArea;
+use ratatui_textarea::{TextArea, WrapMode};
 use std::collections::HashMap;
 
 use crate::backend::{BackendError, BackendEvent, Chat, ChatId, Messenger};
 use crate::config::{Config, Keymap};
 use crate::tui::chat::{ChatState, OpenChat};
+use crate::tui::popup::PopupKind;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
+    #[default]
     ChatList,
     Chat,
     Write,
@@ -20,19 +22,6 @@ pub enum Focus {
 pub enum Screen {
     Main,
     Settings,
-}
-
-pub enum OverlayKind {
-    Info,
-    Error,
-    Warn,
-}
-
-pub struct Overlay {
-    pub title: String,
-    pub kind: OverlayKind,
-    pub message: String,
-    prev_focus: Focus,
 }
 
 /// Common application state shared across pages.
@@ -50,8 +39,13 @@ pub struct AppState {
     pub focus: Focus,
     pub screen: Screen,
     pub write: TextArea<'static>,
-    pub overlay: Option<Overlay>,
+    pub pop_up: Option<PopupState>,
     pub running: bool,
+}
+
+pub struct PopupState {
+    pub popup_type: PopupKind,
+    prev_focus: Focus,
 }
 
 impl AppState {
@@ -64,6 +58,7 @@ impl AppState {
         let mut write = TextArea::default();
         write.set_placeholder_text("Write a message...");
         write.set_cursor_style(Style::default().fg(Color::Yellow));
+        write.set_wrap_mode(WrapMode::WordOrGlyph);
 
         let mut app = Self {
             config,
@@ -77,15 +72,15 @@ impl AppState {
                 Screen::Main
             },
             write,
-            overlay: None,
+            pop_up: None,
             chat_state: Default::default(),
             running: true,
         };
         app.rebuild_chats().await.context("loading chats")?;
         if open_settings {
-            app.show_info(
+            app.create_popup(PopupKind::Info(String::from(
                 "Welcome! Press Enter on a provider to enable it. Connections are mocked for now.",
-            );
+            )));
         }
         Ok(app)
     }
@@ -130,29 +125,16 @@ impl AppState {
         Ok(())
     }
 
-    pub fn show_info(&mut self, message: impl Into<String>) {
-        self.overlay = Some(Overlay {
-            title: "Info".into(),
-            kind: OverlayKind::Info,
-            message: message.into(),
+    pub fn create_popup(&mut self, popup_type: PopupKind) {
+        self.pop_up = Some(PopupState {
+            popup_type,
             prev_focus: self.focus,
-        });
-        self.focus = Focus::Overlay;
+        })
     }
 
-    pub fn show_error(&mut self, message: impl Into<String>) {
-        self.overlay = Some(Overlay {
-            title: "Error".into(),
-            kind: OverlayKind::Error,
-            message: message.into(),
-            prev_focus: self.focus,
-        });
-        self.focus = Focus::Overlay;
-    }
-
-    pub fn dismiss_overlay(&mut self) {
-        if let Some(overlay) = self.overlay.take() {
-            self.focus = overlay.prev_focus;
+    pub fn dismiss_popup(&mut self) {
+        if let Some(popup) = self.pop_up.take() {
+            self.focus = popup.prev_focus;
         }
     }
 
@@ -177,7 +159,7 @@ impl AppState {
             None => Ok(()),
         };
         if let Err(e) = read_result {
-            self.show_error(format!("failed to mark as read: {e}"));
+            self.create_popup(PopupKind::Error(format!("failed to mark as read: {e}",)));
             return;
         }
 
@@ -194,10 +176,17 @@ impl AppState {
             }
             Err(e) => {
                 self.chat_state.open_chat = None;
-                self.show_error(format!("failed to load history: {e}"));
+                self.create_popup(PopupKind::Error(format!("failed to load history: {e}",)));
             }
         }
         self.focus = Focus::Chat;
+    }
+
+    /// Inserts pasted text into the write box if it has focus.
+    pub fn handle_paste(&mut self, text: String) {
+        if self.focus == Focus::Write {
+            self.write.insert_str(&text);
+        }
     }
 
     pub async fn send_message(&mut self) {
@@ -207,7 +196,7 @@ impl AppState {
         }
 
         let Some(chat) = self.chat_state.selected_chat() else {
-            self.show_error("No chat selected");
+            self.create_popup(PopupKind::Error(String::from("No chat selected")));
             return;
         };
 
@@ -219,7 +208,7 @@ impl AppState {
             Ok(()) => {
                 self.write.clear();
             }
-            Err(e) => self.show_error(format!("failed to send: {e}")),
+            Err(e) => self.create_popup(PopupKind::Error(format!("failed to send: {e}"))),
         }
     }
 
@@ -261,21 +250,25 @@ impl AppState {
             Ok(()) => match self.rebuild_chats().await {
                 Ok(()) => {
                     if enabled {
-                        self.show_info(format!("{name} enabled (mock connection)"));
+                        self.create_popup(PopupKind::Info(format!(
+                            "{name} enabled (mock connection)"
+                        )));
                     } else {
-                        self.show_info(format!("{name} disabled"));
+                        self.create_popup(PopupKind::Info(format!("{name} disabled")));
                     }
                 }
-                Err(e) => self.show_error(format!("failed to refresh chats: {e}")),
+                Err(e) => {
+                    self.create_popup(PopupKind::Error(format!("failed to refresh chats: {e}")))
+                }
             },
-            Err(e) => self.show_error(format!("could not save config: {e}")),
+            Err(e) => self.create_popup(PopupKind::Error(format!("could not save config: {e}"))),
         }
     }
 
     pub fn handle_backend_event(&mut self, _messenger_index: usize, event: BackendEvent) {
         match event {
             BackendEvent::Connected => {}
-            BackendEvent::Disconnected(message) => self.show_error(message),
+            BackendEvent::Disconnected(message) => self.create_popup(PopupKind::Error(message)),
             BackendEvent::MessageReceived(message) => {
                 let is_open = self.chat_state.push_incoming(message.clone());
                 let selected_id = self
@@ -330,6 +323,39 @@ mod tests {
         assert_eq!(state.chat_state.chats.len(), 4);
         assert!(state.selected_chat_idx().is_none());
         assert!(state.chat_state.open_chat.is_none());
+    }
+
+    #[test]
+    fn paste_goes_into_the_write_box_when_focused() {
+        let mut state = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(app_state());
+        state.focus = Focus::Write;
+        state.handle_paste("line one\nline two".into());
+        assert_eq!(
+            state.write.lines().to_vec(),
+            vec!["line one".to_string(), "line two".to_string()]
+        );
+    }
+
+    #[test]
+    fn paste_is_ignored_when_write_is_not_focused() {
+        let mut state = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(app_state());
+        state.focus = Focus::Chat;
+        state.handle_paste("line one\nline two".into());
+        assert_eq!(state.write.lines().to_vec(), vec![String::new()]);
+    }
+
+    #[tokio::test]
+    async fn write_uses_word_wrap() {
+        let state = app_state().await;
+        assert_eq!(state.write.wrap_mode(), WrapMode::WordOrGlyph);
     }
 
     #[tokio::test]

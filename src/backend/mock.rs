@@ -455,10 +455,11 @@ mod tests {
         assert!(data.history.values().all(|msgs| !msgs.is_empty()));
         assert_eq!(data.incoming_chat, ChatId::Telegram(102));
         assert_eq!(data.echo_chat, ChatId::Telegram(104));
-        assert!(data
-            .chats
-            .iter()
-            .any(|c| c.id == data.echo_chat && c.contact_name == ECHO_SENDER));
+        assert!(
+            data.chats
+                .iter()
+                .any(|c| c.id == data.echo_chat && c.contact_name == ECHO_SENDER)
+        );
     }
 
     #[tokio::test]
@@ -471,9 +472,7 @@ mod tests {
         let echoed = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 match rx.recv().await {
-                    Ok(BackendEvent::MessageReceived(msg))
-                        if !msg.from_me && msg.chat == echo =>
-                    {
+                    Ok(BackendEvent::MessageReceived(msg)) if !msg.from_me && msg.chat == echo => {
                         break msg;
                     }
                     Ok(_) => continue,

@@ -1,10 +1,10 @@
 use anyhow::Result;
 use ratatui::crossterm::ExecutableCommand;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::crossterm::event::{
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
 };
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout};
+use ratatui::widgets::{StatefulWidget, Widget};
 use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc;
 
@@ -12,18 +12,20 @@ use crate::backend::{BackendEvent, Messenger};
 use crate::config::{Config, Keymap};
 use crate::tui::chat::chat_list::ChatList;
 use crate::tui::chat::chat_widget::ChatWidget;
+use crate::tui::popup::PopupKind;
 use crate::tui::settings::Settings;
 use crate::tui::state::{AppState, Focus, Screen};
 use crate::tui::status_bar::StatusBarWidget;
 
 mod chat;
-mod overlay;
+mod popup;
 mod settings;
 mod state;
 mod status_bar;
 
 enum UiEvent {
     Key(KeyEvent),
+    Paste(String),
     Backend(usize, BackendEvent),
     Resize(u16, u16),
 }
@@ -35,26 +37,13 @@ pub async fn run(
     open_settings: bool,
 ) -> Result<()> {
     let mut terminal = ratatui::init();
-    // TODO: check this AI generated func.
-    // this is supposed to fix Shift+Enter for newline not working, but uncommenting this breaks
-    // everything
-    //
-    // enable_keyboard_enhancement();
+    // Let the terminal send pasted text as a single bracketed-paste event instead of a stream of
+    // raw keys, so multi-line paste cannot trigger Enter=send mid-paste.
+    let _ = std::io::stdout().execute(EnableBracketedPaste)?;
     let result = run_app(&mut terminal, config, keymap, messengers, open_settings).await;
-    // disable_keyboard_enhancement();
+    let _ = std::io::stdout().execute(DisableBracketedPaste)?;
     ratatui::restore();
     result
-}
-
-/// Ask the terminal to report modifier keys (Shift+Enter etc.) distinctly.
-fn enable_keyboard_enhancement() {
-    let _ = std::io::stdout().execute(PushKeyboardEnhancementFlags(
-        KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
-    ));
-}
-
-fn disable_keyboard_enhancement() {
-    let _ = std::io::stdout().execute(PopKeyboardEnhancementFlags);
 }
 
 async fn run_app(
@@ -88,6 +77,7 @@ async fn run_app(
         };
         match event {
             UiEvent::Key(key) => app.handle_key(key).await,
+            UiEvent::Paste(text) => app.state.handle_paste(text),
             UiEvent::Backend(index, backend_event) => {
                 app.state.handle_backend_event(index, backend_event);
             }
@@ -106,6 +96,11 @@ fn spawn_terminal_reader(tx: mpsc::UnboundedSender<UiEvent>) {
             match event::read() {
                 Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                     if tx.send(UiEvent::Key(key)).is_err() {
+                        break;
+                    }
+                }
+                Ok(Event::Paste(text)) => {
+                    if tx.send(UiEvent::Paste(text)).is_err() {
                         break;
                     }
                 }
@@ -143,10 +138,10 @@ impl App {
             return;
         }
 
-        // A dialog/overlay keeps focus and captures all keys until dismissed.
-        if self.state.overlay.is_some() {
+        // Disable key detection (except Esc) on Popup mode
+        if self.state.pop_up.is_some() {
             if key == self.state.keymap.dismiss {
-                self.state.dismiss_overlay();
+                self.state.dismiss_popup();
             }
             return;
         }
@@ -208,7 +203,7 @@ impl App {
         }
 
         if key == km.focus_write
-            && self.state.selected_chat_idx().is_some()
+            && self.state.chat_state.open_chat.is_some()
             && self.state.focus != Focus::Write
         {
             self.state.focus = Focus::Write;
@@ -230,7 +225,8 @@ impl App {
                             self.state.select_chat(chat).await;
                         }
                         None => {
-                            self.state.show_error("No chat selected");
+                            self.state
+                                .create_popup(PopupKind::Error(String::from("No chat selected")));
                         }
                     };
                 }
@@ -261,32 +257,39 @@ impl App {
                 }
             }
             Focus::Write => {
-                if key == km.send {
+                if key.kind != KeyEventKind::Press {
+                    // Paste-sourced keys are never send/newline actions.
+                    self.state.write.input(key);
+                } else if key == km.send {
                     self.state.send_message().await;
+                } else if key == km.newline || key.code == KeyCode::Enter {
+                    // A configured newline key (Shift+Enter by default) inserts a newline.
+                    // Any Enter with a modifier (Alt/Ctrl) also inserts a newline, since many
+                    // terminals cannot report modifiers on Enter and treat it as plain Enter.
+                    self.state.write.insert_newline();
                 } else {
                     self.state.write.input(key);
                 }
-
-                // removing this for now because newline is not working
-                // if key == km.newline {
-                //     self.state.write.insert_newline();
-                // } else if key == km.send {
-                //     self.state.send_message().await;
-                // } else {
-                //     self.state.write.input(key);
-                // }
             }
             Focus::Overlay => {}
         }
     }
 
     fn draw(&mut self, frame: &mut Frame) {
-        if let Some(overlay) = &self.state.overlay {
-            overlay::render(frame, overlay);
-        }
         match self.state.screen {
             Screen::Main => self.draw_main(frame),
-            Screen::Settings => self.draw_settings(frame),
+            Screen::Settings => {
+                Settings::new(&self.state.config.providers).render(
+                    frame.area(),
+                    frame.buffer_mut(),
+                    &mut self.state.settings_state,
+                );
+            }
+        }
+
+        // add this here to the popup actually clears the content below it
+        if let Some(state) = &mut self.state.pop_up {
+            popup::PopUp::new().render(frame.area(), frame.buffer_mut(), state);
         }
     }
 
@@ -296,33 +299,34 @@ impl App {
         let horizontal =
             Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)])
                 .split(vertical[0]);
-        self.draw_chat_list(frame, horizontal[0]);
-        self.draw_chat_view(frame, horizontal[1]);
+
+        ChatList::new(
+            self.state.chat_state.get_tag(),
+            &self.state.chat_state.chats,
+            self.state.focus,
+        )
+        .render(
+            horizontal[0],
+            frame.buffer_mut(),
+            &mut self.state.chat_state.chat_list_state,
+        );
+
+        ChatWidget::new(
+            self.state.focus,
+            &mut self.state.write,
+            self.state.config.max_write_lines,
+        )
+        .render(
+            horizontal[1],
+            frame.buffer_mut(),
+            &mut self.state.chat_state,
+        );
+
         let name = self
             .state
             .chat_state
             .selected_chat()
             .map(|c| c.contact_name.clone());
-        frame.render_widget(StatusBarWidget::new(name, self.state.focus), vertical[1]);
-    }
-
-    fn draw_chat_list(&mut self, frame: &mut Frame, area: Rect) {
-        let focused = self.state.focus == Focus::ChatList;
-        let widget = ChatList::new(&self.state.chat_state.chats, focused);
-        frame.render_stateful_widget(widget, area, &mut self.state.chat_state.chat_list_state);
-    }
-
-    fn draw_chat_view(&mut self, frame: &mut Frame, area: Rect) {
-        let chat_focused = matches!(self.state.focus, Focus::Chat | Focus::Write);
-        let write_focused = self.state.focus == Focus::Write;
-
-        let widget = ChatWidget::new(chat_focused, write_focused, &mut self.state.write);
-        frame.render_stateful_widget(widget, area, &mut self.state.chat_state);
-    }
-
-    fn draw_settings(&mut self, frame: &mut Frame) {
-        let area = frame.area();
-        let widget = Settings::new(&self.state.config.providers);
-        frame.render_stateful_widget(widget, area, &mut self.state.settings_state);
+        StatusBarWidget::new(name, self.state.focus).render(vertical[1], frame.buffer_mut());
     }
 }

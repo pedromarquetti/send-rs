@@ -10,8 +10,9 @@ Sender is an TUI app for interacting with Whatsapp AND telegram (maybe more in t
 - [x] ***One-Executable-app*** - no co dependencies, one binary to rule them all. 
 - [ ] ***All-in-one app for messages***  - at first, Whatsapp + Telegram, but maybe more apps could be implemented?
 - [x] Configurable
+- [ ] WhatsApp integration
+- [ ] Telegram integration
 - [ ] Support for notifications 
-- [ ] Multi platform
 - [ ] Image rendering
 
 ## Controls
@@ -28,7 +29,7 @@ Sender is an TUI app for interacting with Whatsapp AND telegram (maybe more in t
 | `j/k` | Chat | Scroll up / down on chat history | 
 | `PgUp/PgDn` | Chat | Page up / down on chat history (fixed, not configurable) |
 | `Enter` | Write message | Send message (configurable) |
-| `Shift+Enter` | Write message | Insert newline (configurable, requires a terminal that reports modified keys) |
+| `Alt+Enter` | Write message | Insert newline. `Shift+Enter` also works but only on terminals that report modifier keys on Enter (kitty, foot, WezTerm, Alacritty; not GNOME Terminal or a plain TTY). |
 | `j/k` / `Enter` / `Esc` | Settings | Move / toggle provider / close settings (reuses chat-list keys) |
 
 > All keys except `PgUp/PgDn` are configurable in the config file.
@@ -43,6 +44,8 @@ On first boot the app opens the settings screen (`s` in normal mode) so you can 
 Example `config.toml`:
 
 ```toml
+max_write_lines = 5
+
 [keys]
 chat_list_up = "k"
 chat_list_down = "j"
@@ -62,7 +65,7 @@ telegram = true
 whatsapp = false
 ```
 
-Key values are written as `key` or `modifier+key` (`ctrl+c`, `alt+enter`, `shift+tab`, `pgup`, `f1`, ...). Omitted keys fall back to the defaults above.
+Key values are written as `key` or `modifier+key` (`ctrl+c`, `alt+enter`, `shift+tab`, `pgup`, `f1`, ...). Omitted keys fall back to the defaults above. `max_write_lines` controls how many text lines the Write box can grow to (default `5`); the input wraps long lines and scrolls once it exceeds that.
 
 
 ## Built with 

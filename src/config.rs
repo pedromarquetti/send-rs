@@ -3,11 +3,22 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     pub keys: KeymapConfig,
     pub providers: ProvidersConfig,
+    pub max_write_lines: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            keys: KeymapConfig::default(),
+            providers: ProvidersConfig::default(),
+            max_write_lines: 5,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -95,7 +106,8 @@ pub struct Keymap {
     pub history_down: KeyEvent,
     pub scroll_to_bottom: KeyEvent,
     pub send: KeyEvent,
-    // BUG: this is not working
+    /// Enter (with a modifier) also inserts a newline; this key is honored if the terminal
+    /// reports it (e.g. Shift+Enter on kitty-protocol terminals).
     pub newline: KeyEvent,
 }
 
@@ -258,11 +270,13 @@ mod tests {
     fn config_round_trips_through_toml() {
         let mut config = Config::default();
         config.providers.telegram = true;
+        config.max_write_lines = 3;
         let raw = toml::to_string_pretty(&config).unwrap();
         let back: Config = toml::from_str(&raw).unwrap();
         assert!(back.providers.telegram);
         assert!(!back.providers.whatsapp);
         assert_eq!(back.keys.send, "enter");
+        assert_eq!(back.max_write_lines, 3);
     }
 
     #[test]
@@ -272,5 +286,6 @@ mod tests {
         assert_eq!(config.keys.send, "enter");
         assert!(!config.providers.telegram);
         assert!(config.providers.whatsapp);
+        assert_eq!(config.max_write_lines, 5);
     }
 }

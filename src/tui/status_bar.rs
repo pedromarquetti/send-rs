@@ -27,7 +27,7 @@ impl Widget for StatusBarWidget {
                 "j/k scroll; G bottom; PgUp/PgDn page; i write; Tab switch focus; s settings; Ctrl+C quit"
             }
             Focus::Write => {
-                "Enter send; Shift+Enter newline; Esc back; Tab switch focus; Ctrl+C quit"
+                "Enter send; Alt+Enter newline; Esc back; Tab switch focus; Ctrl+C quit"
             }
             Focus::Overlay => "Esc close overlay",
         };

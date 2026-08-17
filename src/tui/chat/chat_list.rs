@@ -2,15 +2,21 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, StatefulWidget, Widget, Wrap};
 
 use crate::backend::Chat;
+use crate::tui::state::Focus;
 
 pub struct ChatList<'a> {
     chats: &'a [Chat],
-    focused: bool,
+    curr_tag: Option<&'static str>,
+    focus: Focus,
 }
 
 impl<'a> ChatList<'a> {
-    pub fn new(chats: &'a [Chat], focused: bool) -> Self {
-        Self { chats, focused }
+    pub fn new(curr_tag: Option<&'static str>, chats: &'a [Chat], focus: Focus) -> Self {
+        Self {
+            chats,
+            focus,
+            curr_tag,
+        }
     }
 }
 
@@ -18,7 +24,7 @@ impl StatefulWidget for ChatList<'_> {
     type State = ListState;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
-        let border = if self.focused {
+        let border = if self.focus == Focus::ChatList {
             Style::default().fg(Color::Yellow)
         } else {
             Style::default()
@@ -42,6 +48,7 @@ impl StatefulWidget for ChatList<'_> {
                     format!("{:>2} ", item.id.tag()),
                     Style::default().fg(Color::DarkGray),
                 ));
+
                 let name_style = if item.unread {
                     Style::default().add_modifier(Modifier::BOLD)
                 } else {
@@ -58,11 +65,19 @@ impl StatefulWidget for ChatList<'_> {
             })
             .collect();
 
-        let highlight = if self.focused {
-            Style::default()
-                .bg(Color::Yellow)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD)
+        let highlight = if self.focus == Focus::ChatList {
+            match self.curr_tag {
+                Some("TG") => Style::default()
+                    .bg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+                Some("WA") => Style::default()
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+                _ => Style::default()
+                    .bg(Color::Yellow)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            }
         } else {
             Style::default().add_modifier(Modifier::REVERSED)
         };

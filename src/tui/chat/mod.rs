@@ -25,6 +25,12 @@ pub struct ChatState {
 }
 
 impl ChatState {
+    pub fn get_tag(&self) -> Option<&'static str> {
+        match self.selected_chat() {
+            Some(c) => Some(c.id.tag()),
+            None => None,
+        }
+    }
     pub fn selected_chat_mut(&mut self) -> Option<&mut Chat> {
         self.chat_list_state
             .selected()
@@ -45,7 +51,9 @@ impl ChatState {
     }
 
     pub fn push_incoming(&mut self, message: Message) -> bool {
-        if self.is_open(&message.chat) && let Some(open) = &mut self.open_chat {
+        if self.is_open(&message.chat)
+            && let Some(open) = &mut self.open_chat
+        {
             open.history.push(message);
             true
         } else {
