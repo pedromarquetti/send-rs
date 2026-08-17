@@ -31,10 +31,8 @@ pub struct ProvidersConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct KeymapConfig {
-    // TODO: Add common up/down keys that are reused so the user doesn't have to configure
-    // multiple up/down keys
-    pub chat_list_up: String,
-    pub chat_list_down: String,
+    pub scroll_up: String,
+    pub scroll_down: String,
     pub select: String,
     pub pane_prev: String,
     pub pane_next: String,
@@ -42,8 +40,6 @@ pub struct KeymapConfig {
     pub quit: String,
     pub open_settings: String,
     pub focus_write: String,
-    pub history_up: String,
-    pub history_down: String,
     pub scroll_to_bottom: String,
     pub send: String,
     pub newline: String,
@@ -52,8 +48,8 @@ pub struct KeymapConfig {
 impl Default for KeymapConfig {
     fn default() -> Self {
         Self {
-            chat_list_up: "k".into(),
-            chat_list_down: "j".into(),
+            scroll_up: "k".into(),
+            scroll_down: "j".into(),
             select: "enter".into(),
             pane_prev: "shift+tab".into(),
             pane_next: "tab".into(),
@@ -61,8 +57,6 @@ impl Default for KeymapConfig {
             quit: "ctrl+c".into(),
             open_settings: "s".into(),
             focus_write: "i".into(),
-            history_up: "k".into(),
-            history_down: "j".into(),
             scroll_to_bottom: "G".into(),
             send: "enter".into(),
             newline: "shift+enter".into(),
@@ -73,8 +67,8 @@ impl Default for KeymapConfig {
 impl KeymapConfig {
     pub fn parse(&self) -> Result<Keymap> {
         Ok(Keymap {
-            chat_list_up: parse_key(&self.chat_list_up)?,
-            chat_list_down: parse_key(&self.chat_list_down)?,
+            scroll_up: parse_key(&self.scroll_up)?,
+            scroll_down: parse_key(&self.scroll_down)?,
             select: parse_key(&self.select)?,
             pane_prev: parse_key(&self.pane_prev)?,
             pane_next: parse_key(&self.pane_next)?,
@@ -82,8 +76,6 @@ impl KeymapConfig {
             quit: parse_key(&self.quit)?,
             open_settings: parse_key(&self.open_settings)?,
             focus_write: parse_key(&self.focus_write)?,
-            history_up: parse_key(&self.history_up)?,
-            history_down: parse_key(&self.history_down)?,
             scroll_to_bottom: parse_key(&self.scroll_to_bottom)?,
             send: parse_key(&self.send)?,
             newline: parse_key(&self.newline)?,
@@ -93,8 +85,8 @@ impl KeymapConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Keymap {
-    pub chat_list_up: KeyEvent,
-    pub chat_list_down: KeyEvent,
+    pub scroll_up: KeyEvent,
+    pub scroll_down: KeyEvent,
     pub select: KeyEvent,
     pub pane_next: KeyEvent,
     pub pane_prev: KeyEvent,
@@ -102,8 +94,6 @@ pub struct Keymap {
     pub quit: KeyEvent,
     pub open_settings: KeyEvent,
     pub focus_write: KeyEvent,
-    pub history_up: KeyEvent,
-    pub history_down: KeyEvent,
     pub scroll_to_bottom: KeyEvent,
     pub send: KeyEvent,
     /// Enter (with a modifier) also inserts a newline; this key is honored if the terminal

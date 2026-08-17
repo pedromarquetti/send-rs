@@ -156,7 +156,7 @@ impl App {
         let km = self.state.keymap.clone();
         if key == km.dismiss || key == km.open_settings {
             self.state.screen = Screen::Main;
-        } else if key == km.chat_list_up {
+        } else if key == km.scroll_up {
             let index = self
                 .state
                 .settings_state
@@ -164,7 +164,7 @@ impl App {
                 .unwrap_or(0)
                 .saturating_sub(1);
             self.state.settings_state.select(Some(index));
-        } else if key == km.chat_list_down {
+        } else if key == km.scroll_down {
             let index = self.state.settings_state.selected().unwrap_or(0);
             if index + 1 < 2 {
                 self.state.settings_state.select(Some(index + 1));
@@ -212,9 +212,9 @@ impl App {
 
         match self.state.focus {
             Focus::ChatList => {
-                if key == km.chat_list_up {
+                if key == km.scroll_up {
                     self.state.chat_state.chat_list_state.select_previous();
-                } else if key == km.chat_list_down {
+                } else if key == km.scroll_down {
                     self.state.chat_state.chat_list_state.select_next();
                 } else if key == km.select
                     && !self.state.chat_state.chats.is_empty()
@@ -232,11 +232,11 @@ impl App {
                 }
             }
             Focus::Chat => {
-                if key == km.history_up {
+                if key == km.scroll_up {
                     if let Some(chat) = self.state.chat_state.selected_chat_mut() {
                         chat.scroll = chat.scroll.saturating_add(1);
                     }
-                } else if key == km.history_down {
+                } else if key == km.scroll_down {
                     if let Some(chat) = self.state.chat_state.selected_chat_mut() {
                         chat.scroll = chat.scroll.saturating_sub(1);
                     }

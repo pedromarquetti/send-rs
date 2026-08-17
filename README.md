@@ -19,14 +19,13 @@ Sender is an TUI app for interacting with Whatsapp AND telegram (maybe more in t
 
 | Keys | Pane / Mode | Action |
 | --------------- | --------------- | --------------- |
-| `j/k` | Chat list | go up (k) or down (j) to select chat |
+| `j/k` | -  | go up (k) or down (j)  |
 | `Enter` | Chat list | select chat |
 | `Tab` | -  | Change pane focus (Chat list → Chat → Write) |
 | `Esc` | - | Remove focus from 'write message' or dismiss error/info dialog |
 | `Ctrl+c` | - | Quit app |
 | `s` | Normal mode | open settings |
 | `i` | Chat | Focus on 'write message' |
-| `j/k` | Chat | Scroll up / down on chat history | 
 | `PgUp/PgDn` | Chat | Page up / down on chat history (fixed, not configurable) |
 | `Enter` | Write message | Send message (configurable) |
 | `Alt+Enter` | Write message | Insert newline. `Shift+Enter` also works but only on terminals that report modifier keys on Enter (kitty, foot, WezTerm, Alacritty; not GNOME Terminal or a plain TTY). |
@@ -47,16 +46,14 @@ Example `config.toml`:
 max_write_lines = 5
 
 [keys]
-chat_list_up = "k"
-chat_list_down = "j"
+up = "k"
+down = "j"
 select = "enter"
 pane_next = "tab"
 dismiss = "esc"
 quit = "ctrl+c"
 open_settings = "s"
 focus_write = "i"
-history_up = "k"
-history_down = "j"
 send = "enter"
 newline = "shift+enter"
 
