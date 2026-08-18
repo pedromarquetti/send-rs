@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use ratatui::widgets::ListState;
 
 use crate::backend::{Chat, ChatId, Message};
@@ -22,6 +24,8 @@ pub struct ChatState {
     pub visible_page: usize,
     /// The chat whose history is currently loaded, if any.
     pub open_chat: Option<OpenChat>,
+    /// Per-chat draft messages (unsent text saved when switching chats).
+    pub drafts: HashMap<ChatId, String>,
 }
 
 impl ChatState {
@@ -66,6 +70,20 @@ impl ChatState {
             .iter_mut()
             .enumerate()
             .find(|(_, chat)| chat.id == *id)
+    }
+
+    /// Save a draft for a chat. Empty/whitespace-only drafts are removed.
+    pub fn save_draft(&mut self, id: &ChatId, text: String) {
+        if text.trim().is_empty() {
+            self.drafts.remove(id);
+        } else {
+            self.drafts.insert(id.clone(), text);
+        }
+    }
+
+    /// Load the draft for a chat, or None if there is no draft.
+    pub fn load_draft(&self, id: &ChatId) -> Option<&str> {
+        self.drafts.get(id).map(|s| s.as_str())
     }
 }
 

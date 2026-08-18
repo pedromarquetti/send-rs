@@ -133,6 +133,7 @@ impl App {
     }
 
     async fn handle_key(&mut self, key: KeyEvent) {
+        // TODO: add a overlay menu / screen to display all the keymappings 
         if key == self.state.keymap.quit {
             self.state.running = false;
             return;
@@ -181,11 +182,11 @@ impl App {
         if key == km.dismiss {
             match self.state.focus {
                 Focus::Write => {
-                    self.state.focus = Focus::Chat;
+                    self.state.cycle_focus();
                 }
                 Focus::Chat => {
                     self.state.chat_state.open_chat = None;
-                    self.state.focus = Focus::ChatList;
+                    self.state.cycle_focus();
                 }
                 _ => {}
             }
@@ -202,12 +203,23 @@ impl App {
             return;
         }
 
-        if key == km.focus_write
-            && self.state.chat_state.open_chat.is_some()
-            && self.state.focus != Focus::Write
-        {
-            self.state.focus = Focus::Write;
-            return;
+        if key == km.focus_write && self.state.focus != Focus::Write {
+            match &self.state.chat_state.open_chat {
+                Some(_) => {
+                    self.state.focus = Focus::Write;
+                    return;
+                }
+                None => match self.state.selected_chat_idx() {
+                    Some(chat) => {
+                        self.state.select_chat(chat).await;
+                        self.state.focus = Focus::Write;
+                        return;
+                    }
+                    None => {
+                        return;
+                    }
+                },
+            }
         }
 
         match self.state.focus {

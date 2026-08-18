@@ -140,9 +140,45 @@ impl AppState {
 
     pub fn cycle_focus(&mut self) {
         self.focus = match self.focus {
-            Focus::ChatList => Focus::Chat,
-            Focus::Chat => Focus::ChatList,
-            Focus::Write => Focus::ChatList,
+            Focus::ChatList => {
+                if self.chat_state.open_chat.is_some() {
+                    self.chat_state.open_chat = None;
+                    Focus::Chat
+                } else {
+                    Focus::ChatList
+                }
+            }
+            Focus::Chat => {
+                // Save draft and clear write when exiting chat
+                if let Some(chat_id) = self
+                    .chat_state
+                    .open_chat
+                    .as_ref()
+                    .map(|o| o.chat.id.clone())
+                {
+                    let text = self.write.lines().join("\n");
+                    self.chat_state.save_draft(&chat_id, text);
+                }
+                self.write.clear();
+                self.chat_state.open_chat = None;
+                Focus::ChatList
+            }
+            Focus::Write => {
+                // Save draft and clear write when exiting chat
+                // + close the current chat
+                if let Some(chat_id) = self
+                    .chat_state
+                    .open_chat
+                    .as_ref()
+                    .map(|o| o.chat.id.clone())
+                {
+                    let text = self.write.lines().join("\n");
+                    self.chat_state.save_draft(&chat_id, text);
+                }
+                self.write.clear();
+                self.chat_state.open_chat = None;
+                Focus::ChatList
+            }
             Focus::Overlay => Focus::ChatList,
         };
     }
@@ -151,6 +187,17 @@ impl AppState {
         let Some(chat) = self.chat_state.chats.get(index).cloned() else {
             return;
         };
+
+        // Save current draft before switching
+        if let Some(current_chat_id) = self
+            .chat_state
+            .open_chat
+            .as_ref()
+            .map(|o| o.chat.id.clone())
+        {
+            let text = self.write.lines().join("\n");
+            self.chat_state.save_draft(&current_chat_id, text);
+        }
 
         self.chat_state.chats[index].unread = false;
         self.chat_state.chats[index].unread_count = 0;
@@ -179,6 +226,13 @@ impl AppState {
                 self.create_popup(PopupKind::Error(format!("failed to load history: {e}",)));
             }
         }
+
+        // Load draft for the new chat
+        self.write.clear();
+        if let Some(draft) = self.chat_state.load_draft(&chat.id) {
+            self.write.insert_str(draft);
+        }
+
         self.focus = Focus::Chat;
     }
 
@@ -195,7 +249,7 @@ impl AppState {
             return;
         }
 
-        let Some(chat) = self.chat_state.selected_chat() else {
+        let Some(chat) = self.chat_state.selected_chat().cloned() else {
             self.create_popup(PopupKind::Error(String::from("No chat selected")));
             return;
         };
@@ -207,6 +261,7 @@ impl AppState {
         match send_result {
             Ok(()) => {
                 self.write.clear();
+                self.chat_state.drafts.remove(&chat.id);
             }
             Err(e) => self.create_popup(PopupKind::Error(format!("failed to send: {e}"))),
         }
@@ -442,5 +497,128 @@ mod tests {
 
         assert!(state.chat_state.chats[2].unread);
         assert_eq!(state.chat_state.chats[2].unread_count, 1);
+    }
+
+    #[tokio::test]
+    async fn draft_is_saved_when_switching_chats() {
+        let mut state = app_state().await;
+
+        state.chat_state.chat_list_state.select(Some(0));
+        state.select_chat(0).await;
+        state.write.insert_str("hello from chat 0");
+
+        state.chat_state.chat_list_state.select(Some(1));
+        state.select_chat(1).await;
+
+        assert_eq!(
+            state.chat_state.load_draft(&ChatId::Telegram(101)),
+            Some("hello from chat 0")
+        );
+    }
+
+    #[tokio::test]
+    async fn draft_is_loaded_when_selecting_chat() {
+        let mut state = app_state().await;
+
+        state.chat_state.chat_list_state.select(Some(0));
+        state.select_chat(0).await;
+        state.write.insert_str("draft message");
+
+        state.chat_state.chat_list_state.select(Some(1));
+        state.select_chat(1).await;
+
+        state.chat_state.chat_list_state.select(Some(0));
+        state.select_chat(0).await;
+
+        assert_eq!(state.write.lines().join("\n"), "draft message");
+    }
+
+    #[tokio::test]
+    async fn draft_is_cleared_on_exit() {
+        let mut state = app_state().await;
+
+        state.chat_state.chat_list_state.select(Some(0));
+        state.select_chat(0).await;
+        state.write.insert_str("unsent text");
+
+        state.focus = Focus::Chat;
+        state.cycle_focus();
+
+        assert!(state.write.lines().join("\n").is_empty());
+        assert_eq!(
+            state.chat_state.load_draft(&ChatId::Telegram(101)),
+            Some("unsent text")
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_draft_is_not_stored() {
+        let mut state = app_state().await;
+
+        state
+            .chat_state
+            .save_draft(&ChatId::Telegram(101), "   ".into());
+        assert!(
+            state
+                .chat_state
+                .load_draft(&ChatId::Telegram(101))
+                .is_none()
+        );
+
+        state
+            .chat_state
+            .save_draft(&ChatId::Telegram(101), "".into());
+        assert!(
+            state
+                .chat_state
+                .load_draft(&ChatId::Telegram(101))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn draft_is_removed_after_sending() {
+        let mut state = app_state().await;
+
+        state.chat_state.chat_list_state.select(Some(0));
+        state.select_chat(0).await;
+        state.write.insert_str("hello");
+
+        state
+            .chat_state
+            .save_draft(&ChatId::Telegram(101), "hello".into());
+        state.chat_state.drafts.remove(&ChatId::Telegram(101));
+
+        assert!(
+            state
+                .chat_state
+                .load_draft(&ChatId::Telegram(101))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn draft_per_chat_is_independent() {
+        let mut state = app_state().await;
+
+        state.chat_state.chat_list_state.select(Some(0));
+        state.select_chat(0).await;
+        state.write.insert_str("msg for chat 0");
+
+        state.chat_state.chat_list_state.select(Some(1));
+        state.select_chat(1).await;
+        state.write.insert_str("msg for chat 1");
+
+        state.chat_state.chat_list_state.select(Some(0));
+        state.select_chat(0).await;
+
+        assert_eq!(
+            state.chat_state.load_draft(&ChatId::Telegram(101)),
+            Some("msg for chat 0")
+        );
+        assert_eq!(
+            state.chat_state.load_draft(&ChatId::Telegram(102)),
+            Some("msg for chat 1")
+        );
     }
 }

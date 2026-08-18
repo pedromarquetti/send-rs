@@ -21,7 +21,7 @@ impl Widget for StatusBarWidget {
     {
         let hint = match self.focus {
             Focus::ChatList => {
-                "j/k move (up/down); Enter select; Tab switch focus; i write; s settings; Ctrl+C quit"
+                "Ctrl+C quit; j/k move (up/down); Enter select chat; Tab switch focus; i select chat + write; s settings; "
             }
             Focus::Chat => {
                 "j/k scroll; G bottom; PgUp/PgDn page; i write; Tab switch focus; s settings; Ctrl+C quit"
@@ -31,17 +31,8 @@ impl Widget for StatusBarWidget {
             }
             Focus::Overlay => "Esc close overlay",
         };
-        let line = match self.curr_chat {
-            Some(chat) => Line::from(vec![
-                Span::styled(chat, Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw("  "),
-                Span::styled(hint, Style::default().fg(Color::DarkGray)),
-            ]),
-            None => Line::from(vec![
-                Span::raw("  "),
-                Span::styled(hint, Style::default().fg(Color::DarkGray)),
-            ]),
-        };
+
+        let line = Span::styled(hint, Style::default().fg(Color::DarkGray));
 
         Paragraph::new(line).render(area, buf);
     }
