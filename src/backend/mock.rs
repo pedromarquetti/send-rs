@@ -70,6 +70,7 @@ impl MockMessenger {
                     text: format!("simulated incoming message #{n}"),
                     timestamp: now(),
                     from_me: false,
+                    options: Vec::new(),
                 };
                 let mut state = state.lock().expect("mock state poisoned");
                 state
@@ -129,6 +130,7 @@ impl Messenger for MockMessenger {
             text: text.to_string(),
             timestamp: now(),
             from_me: true,
+            options: Vec::new(),
         };
         state
             .history
@@ -183,6 +185,7 @@ impl MockMessenger {
                 text: text.clone(),
                 timestamp: now(),
                 from_me: false,
+                options: Vec::new(),
             };
             state
                 .history
@@ -398,6 +401,7 @@ fn message(id: &str, chat: &ChatId, sender: &str, text: &str, from_me: bool) -> 
         text: text.into(),
         timestamp: now(),
         from_me,
+        options: Vec::new(),
     }
 }
 

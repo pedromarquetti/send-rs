@@ -8,7 +8,7 @@ use ratatui::widgets::{StatefulWidget, Widget};
 use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc;
 
-use crate::backend::{BackendEvent, Messenger};
+use crate::backend::{BackendEvent, MessageAction, Messenger};
 use crate::config::{Config, Keymap};
 use crate::tui::chat::chat_list::ChatList;
 use crate::tui::chat::chat_widget::ChatWidget;
@@ -133,17 +133,14 @@ impl App {
     }
 
     async fn handle_key(&mut self, key: KeyEvent) {
-        // TODO: add a overlay menu / screen to display all the keymappings 
+        // TODO: add a overlay menu / screen to display all the keymappings
         if key == self.state.keymap.quit {
             self.state.running = false;
             return;
         }
 
-        // Disable key detection (except Esc) on Popup mode
         if self.state.pop_up.is_some() {
-            if key == self.state.keymap.dismiss {
-                self.state.dismiss_popup();
-            }
+            self.handle_popup_key(key);
             return;
         }
 
@@ -245,27 +242,55 @@ impl App {
             }
             Focus::Chat => {
                 if key == km.scroll_up {
-                    if let Some(chat) = self.state.chat_state.selected_chat_mut() {
-                        chat.scroll = chat.scroll.saturating_add(1);
-                    }
+                    self.state.chat_state.message_list_state.select_previous();
                 } else if key == km.scroll_down {
-                    if let Some(chat) = self.state.chat_state.selected_chat_mut() {
-                        chat.scroll = chat.scroll.saturating_sub(1);
-                    }
+                    self.state.chat_state.message_list_state.select_next();
                 } else if key == km.scroll_to_bottom {
-                    if let Some(chat) = self.state.chat_state.selected_chat_mut() {
-                        chat.scroll = 0;
-                    }
+                    let last = self
+                        .state
+                        .chat_state
+                        .open_chat
+                        .as_ref()
+                        .map(|o| o.history.len().saturating_sub(1));
+                    self.state.chat_state.message_list_state.select(last);
                 } else if key.code == KeyCode::PageUp {
                     let page = self.state.chat_state.visible_page;
-                    if let Some(chat) = self.state.chat_state.selected_chat_mut() {
-                        chat.scroll = chat.scroll.saturating_add(page);
-                    }
+                    let current = self
+                        .state
+                        .chat_state
+                        .message_list_state
+                        .selected()
+                        .unwrap_or(0);
+                    let new = current.saturating_add(page);
+                    let max = self
+                        .state
+                        .chat_state
+                        .open_chat
+                        .as_ref()
+                        .map(|o| o.history.len().saturating_sub(1))
+                        .unwrap_or(0);
+                    self.state
+                        .chat_state
+                        .message_list_state
+                        .select(Some(new.min(max)));
                 } else if key.code == KeyCode::PageDown {
                     let page = self.state.chat_state.visible_page;
-                    if let Some(chat) = self.state.chat_state.selected_chat_mut() {
-                        chat.scroll = chat.scroll.saturating_sub(page);
-                    }
+                    let current = self
+                        .state
+                        .chat_state
+                        .message_list_state
+                        .selected()
+                        .unwrap_or(0);
+                    let new = current.saturating_sub(page);
+                    self.state.chat_state.message_list_state.select(Some(new));
+                } else if key == km.select
+                    && let Some(idx) = self.state.chat_state.message_list_state.selected()
+                    && let Some(open) = &self.state.chat_state.open_chat
+                    && let Some(msg) = open.history.get(idx)
+                {
+                    let mut msg = msg.clone();
+                    msg.options = vec![MessageAction::Reply, MessageAction::Edit];
+                    self.state.create_popup(PopupKind::Message(msg));
                 }
             }
             Focus::Write => {
@@ -283,7 +308,47 @@ impl App {
                     self.state.write.input(key);
                 }
             }
-            Focus::Overlay => {}
+            Focus::Popup => {}
+        }
+    }
+
+    fn handle_popup_key(&mut self, key: KeyEvent) {
+        if key == self.state.keymap.dismiss {
+            self.state.dismiss_popup();
+        }
+        let km = self.state.keymap.clone();
+        let popup = match self.state.pop_up.as_mut() {
+            Some(p) => p,
+            None => {
+                return;
+            }
+        };
+
+        if key == km.scroll_up {
+            popup.scroll_idx = popup.scroll_idx.saturating_sub(1);
+        } else if key == km.scroll_down {
+            popup.scroll_idx = popup.scroll_idx.saturating_add(1);
+        }
+
+        if let PopupKind::Message(msg) = &popup.popup_type
+            && let KeyCode::Char(c) = key.code
+            && let Some(digit) = c.to_digit(10)
+        {
+            let idx = (digit as usize).saturating_sub(1);
+            if idx < msg.options.len() {
+                // TODO: implement MessageAction actions
+                match msg.options[idx] {
+                    MessageAction::Reply => {
+                        self.state
+                            .create_popup(PopupKind::Info(String::from("reply")));
+                    }
+                    MessageAction::Edit => {
+                        self.state
+                            .create_popup(PopupKind::Info(String::from("edit")));
+                    }
+                }
+                self.state.dismiss_popup();
+            }
         }
     }
 

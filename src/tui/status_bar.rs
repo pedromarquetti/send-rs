@@ -29,7 +29,7 @@ impl Widget for StatusBarWidget {
             Focus::Write => {
                 "Enter send; Alt+Enter newline; Esc back; Tab switch focus; Ctrl+C quit"
             }
-            Focus::Overlay => "Esc close overlay",
+            Focus::Popup => "Esc close overlay",
         };
 
         let line = Span::styled(hint, Style::default().fg(Color::DarkGray));

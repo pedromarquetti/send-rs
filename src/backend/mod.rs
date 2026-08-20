@@ -47,6 +47,12 @@ impl ChatId {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessageAction {
+    Reply,
+    Edit,
+}
+
 #[derive(Debug, Clone)]
 pub struct Message {
     pub id: String,
@@ -55,6 +61,7 @@ pub struct Message {
     pub text: String,
     pub timestamp: i64,
     pub from_me: bool,
+    pub options: Vec<MessageAction>,
 }
 
 #[derive(Debug, Clone)]

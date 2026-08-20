@@ -1,6 +1,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{
-    Block, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget, Wrap,
+    Block, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    StatefulWidget, Widget, Wrap,
 };
 use ratatui_textarea::TextArea;
 
@@ -66,38 +67,73 @@ impl StatefulWidget for ChatWidget<'_> {
         });
 
         if let Some(history) = opened {
-            let lines: Vec<Line> = history.iter().flat_map(message_lines).collect();
             let inner = msgs_area.inner(Margin {
                 vertical: 1,
                 horizontal: 1,
             });
-            let columns =
-                Layout::horizontal([Constraint::Fill(1), Constraint::Length(1)]).split(inner);
-            let content = columns[0];
-            let scrollbar_col = columns[1];
 
-            let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-            // Total wrapped content height (in visual rows) at the available width.
-            let content_height = paragraph.line_count(content.width);
+            let columns = Layout::horizontal([
+                Constraint::Fill(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .split(inner);
+
+            let content = columns[0];
+            let scrollbar_col = columns[2];
+
+            let max_lines = Some(5);
+            let item_heights: Vec<usize> = history
+                .iter()
+                .map(|msg| message_line_count(msg, content.width, max_lines).0)
+                .collect();
+
+            let total_lines: usize = item_heights.iter().sum();
+
             let visible = inner.height as usize;
-            let (scroll_top, max_scroll) = state
-                .selected_chat_mut()
-                .map(|chat| {
-                    let (scroll, top, max) =
-                        chat_scroll_offset(content_height, visible, chat.scroll);
-                    chat.scroll = scroll;
-                    (top, max)
-                })
-                .unwrap_or_else(|| (0, content_height.saturating_sub(visible)));
+
+            let current_offset = state.message_list_state.offset();
+            let selected = state.message_list_state.selected();
+            let offset = compute_list_offset(&item_heights, selected, visible, current_offset);
+
+            state.visible_page = visible;
+            *state.message_list_state.offset_mut() = offset;
+
+            let items: Vec<ListItem> = history
+                .iter()
+                .map(|msg| ListItem::new(message_lines(msg, content.width, max_lines)))
+                .collect();
+
+            let highlight = if self.focus == Focus::Chat {
+                match tag {
+                    "TG" => Style::default()
+                        .bg(Color::LightBlue)
+                        .fg(Color::Black)
+                        .add_modifier(Modifier::BOLD),
+                    "WA" => Style::default()
+                        .bg(Color::Green)
+                        .fg(Color::Black)
+                        .add_modifier(Modifier::BOLD),
+                    _ => Style::default()
+                        .bg(Color::Yellow)
+                        .fg(Color::Black)
+                        .add_modifier(Modifier::BOLD),
+                }
+            } else {
+                Style::default().add_modifier(Modifier::REVERSED)
+            };
+
+            let list = List::new(items)
+                .highlight_style(highlight)
+                .highlight_symbol("> ");
 
             block.render(msgs_area, buf);
-            state.visible_page = visible;
-            paragraph.scroll((scroll_top, 0)).render(content, buf);
+            StatefulWidget::render(list, content, buf, &mut state.message_list_state);
 
-            if content_height > visible {
+            if total_lines > visible {
                 let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
-                let mut scrollbar_state = ScrollbarState::new(max_scroll)
-                    .position(scroll_top as usize)
+                let mut scrollbar_state = ScrollbarState::new(total_lines.saturating_sub(visible))
+                    .position(offset)
                     .viewport_content_length(visible);
                 StatefulWidget::render(scrollbar, scrollbar_col, buf, &mut scrollbar_state);
             }
@@ -131,53 +167,209 @@ impl StatefulWidget for ChatWidget<'_> {
     }
 }
 
-/// Renders one message as one or more physical lines (multi-line messages keep their newlines).
-fn message_lines(message: &Message) -> Vec<Line<'static>> {
+/// Word-wraps a text line into chunks that fit within `max_width` characters.
+/// Words exceeding the limit are truncated and get `…` appended.
+pub(crate) fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
+    if max_width == 0 {
+        return vec![text.to_string()];
+    }
+
+    let words: Vec<&str> = text.split_whitespace().collect();
+
+    if words.is_empty() {
+        return vec![text.to_string()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for word in words {
+        if current.is_empty() {
+            if word.len() > max_width {
+                let truncated: String = word.chars().take(max_width.saturating_sub(1)).collect();
+                chunks.push(format!("{truncated}…"));
+            } else {
+                current = word.to_string();
+            }
+        } else if current.len() + 1 + word.len() <= max_width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            chunks.push(std::mem::take(&mut current));
+            if word.len() > max_width {
+                let truncated: String = word.chars().take(max_width.saturating_sub(1)).collect();
+                chunks.push(format!("{truncated}…"));
+            } else {
+                current = word.to_string();
+            }
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    if chunks.is_empty() {
+        chunks.push(text.to_string());
+    }
+    chunks
+}
+
+/// Renders one message as one or more physical lines, word-wrapped to fit `width` columns.
+/// If `max_lines` is set, output is capped and a "Press Enter for full message…" hint is added.
+fn message_lines(message: &Message, width: u16, max_lines: Option<usize>) -> Vec<Line<'static>> {
     let sender = if message.from_me {
         "You".to_string()
     } else {
         message.sender.clone()
     };
     let head = format!("{sender} {}", format_timestamp(message.timestamp));
-    let header = Span::styled(
-        head,
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    );
+    let header_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD);
+    let header_width = head.len();
 
-    let mut text_lines = message.text.lines();
     let mut result = Vec::new();
+    let mut text_lines = message.text.lines();
+    let mut any_truncated = false;
+
     match text_lines.next() {
         Some(first) => {
-            result.push(Line::from(vec![
-                header,
-                Span::raw("  "),
-                Span::raw(first.to_string()),
-            ]));
-            for line in text_lines {
-                result.push(Line::from(Span::raw(line.to_string())));
+            let available = width.saturating_sub(2) as usize;
+            let text_avail = available.saturating_sub(header_width + 2);
+            let first_chunks = if text_avail > 0 {
+                wrap_text(first, text_avail)
+            } else {
+                wrap_text(first, available.max(1))
+            };
+            if first.len() > first_chunks.first().map_or(0, |c| c.len()) {
+                any_truncated = true;
+            }
+            if let Some((first_chunk, rest)) = first_chunks.split_first() {
+                result.push(Line::from(vec![
+                    Span::styled(head.clone(), header_style),
+                    Span::raw("  "),
+                    Span::raw(first_chunk.clone()),
+                ]));
+                for chunk in rest {
+                    result.push(Line::from(Span::raw(chunk.clone())));
+                }
             }
         }
-        None => result.push(Line::from(vec![header, Span::raw("  ")])),
+        None => {
+            result.push(Line::from(vec![
+                Span::styled(head, header_style),
+                Span::raw("  "),
+            ]));
+        }
     }
+
+    for line in text_lines {
+        let available = width.saturating_sub(2) as usize;
+        let chunks = wrap_text(line, available);
+        if line.len() > chunks.first().map_or(0, |c| c.len()) {
+            any_truncated = true;
+        }
+        for chunk in chunks {
+            result.push(Line::from(Span::raw(chunk)));
+        }
+    }
+
+    // Check if we need to truncate due to max_lines
+    let hint_line = Line::from(Span::styled(
+        "  Press Enter for full message…",
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+    ));
+
+    if let Some(max) = max_lines
+        && result.len() > max
+    {
+        result.truncate(max);
+        result.push(hint_line);
+        return result;
+    }
+
+    if any_truncated {
+        result.push(hint_line);
+    }
+
     result
 }
 
-/// Computes the effective scroll position for a chat viewport.
-///
-/// `content_height` is the total wrapped content height in rows, `visible_height` the number of
-/// rows that fit, and `chat_scroll` the amount scrolled away from the bottom (0 = at the bottom).
-/// Returns the clamped `chat_scroll`, the top-row offset to hand to `Paragraph::scroll`, and the
-/// maximum scroll amount (`content_height - visible_height`).
-fn chat_scroll_offset(
-    content_height: usize,
-    visible_height: usize,
-    chat_scroll: usize,
-) -> (usize, u16, usize) {
-    let max_scroll = content_height.saturating_sub(visible_height);
-    let scroll = chat_scroll.min(max_scroll);
-    (scroll, (max_scroll - scroll) as u16, max_scroll)
+/// Counts the number of visual lines a message occupies at a given width, accounting for
+/// word-wrap. Also indicates whether the message was truncated (for the hint line).
+fn message_line_count(message: &Message, width: u16, max_lines: Option<usize>) -> (usize, bool) {
+    let sender = if message.from_me {
+        "You".to_string()
+    } else {
+        message.sender.clone()
+    };
+    let head = format!("{sender} {}", format_timestamp(message.timestamp));
+    let header_width = head.len();
+    let wrap_width = width.saturating_sub(2) as usize;
+    let mut count = 0usize;
+    let mut any_truncated = false;
+
+    let mut text_lines = message.text.lines();
+    match text_lines.next() {
+        Some(first) => {
+            let text_avail = wrap_width.saturating_sub(header_width + 2).max(1);
+            let chunks = wrap_text(first, text_avail);
+            if first.len() > chunks.first().map_or(0, |c| c.len()) {
+                any_truncated = true;
+            }
+            count += chunks.len().max(1);
+        }
+        None => {
+            count += 1;
+        }
+    }
+
+    for line in text_lines {
+        let chunks = wrap_text(line, wrap_width);
+        if line.len() > chunks.first().map_or(0, |c| c.len()) {
+            any_truncated = true;
+        }
+        count += chunks.len().max(1);
+    }
+
+    if any_truncated {
+        count += 1;
+    }
+
+    if let Some(max) = max_lines
+        && count > max
+    {
+        return (max + 1, true); // +1 for the hint line
+    }
+
+    (count, any_truncated)
+}
+
+/// Computes the offset for a List so that the selected item is visible in the viewport.
+fn compute_list_offset(
+    item_heights: &[usize],
+    selected: Option<usize>,
+    viewport_height: usize,
+    current_offset: usize,
+) -> usize {
+    let Some(selected) = selected else {
+        return 0;
+    };
+
+    if selected >= item_heights.len() {
+        return 0;
+    }
+
+    let selected_top: usize = item_heights[..selected].iter().sum();
+    let selected_height = item_heights[selected];
+
+    if selected_top < current_offset {
+        selected_top
+    } else if selected_top + selected_height > current_offset + viewport_height {
+        selected_top + selected_height - viewport_height
+    } else {
+        current_offset
+    }
 }
 
 /// Number of visual rows the Write box needs for the given text at `width` columns, counting
@@ -200,7 +392,7 @@ fn write_box_height(content_rows: usize, max_lines: usize, area_height: u16) -> 
     ((rows + 2) as u16).min(area_height)
 }
 
-fn format_timestamp(secs: i64) -> String {
+pub(crate) fn format_timestamp(secs: i64) -> String {
     let Some(datetime) = chrono::DateTime::from_timestamp(secs, 0) else {
         return String::new();
     };
@@ -223,12 +415,13 @@ mod tests {
             text: text.into(),
             timestamp: 0,
             from_me: false,
+            options: Vec::new(),
         }
     }
 
     #[test]
     fn message_lines_splits_on_newlines() {
-        let lines = message_lines(&message("first\nsecond\nthird"));
+        let lines = message_lines(&message("first\nsecond\nthird"), 80, None);
         assert_eq!(lines.len(), 3);
         assert!(lines[0].to_string().contains("Alice"));
         assert!(lines[0].to_string().contains("first"));
@@ -238,41 +431,73 @@ mod tests {
 
     #[test]
     fn message_lines_empty_text_keeps_header() {
-        let lines = message_lines(&message(""));
+        let lines = message_lines(&message(""), 80, None);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].to_string().contains("Alice"));
     }
 
     #[test]
-    fn scroll_offset_starts_at_the_bottom() {
-        let (scroll, top, max) = chat_scroll_offset(100, 20, 0);
-        assert_eq!(scroll, 0);
-        assert_eq!(top, 80);
-        assert_eq!(max, 80);
+    fn message_lines_word_wraps_long_text() {
+        let msg = message("hello world this is a long line");
+        let lines = message_lines(&msg, 20, None);
+        // Header "Alice 01-01 00:00" = 17 chars, text_avail = 20-2-17-2 = -1 → fallback
+        // Should produce multiple lines
+        assert!(lines.len() > 1);
     }
 
     #[test]
-    fn scroll_offset_counts_rows_from_the_bottom() {
-        let (scroll, top, max) = chat_scroll_offset(100, 20, 10);
-        assert_eq!(scroll, 10);
-        assert_eq!(top, 70);
-        assert_eq!(max, 80);
+    fn message_lines_adds_hint_when_truncated() {
+        let msg = message("abcdefghijklmnopqrstuvwxyz0123456789");
+        let lines = message_lines(&msg, 10, None);
+        let last = lines.last().unwrap().to_string();
+        assert!(last.contains("Press Enter"));
     }
 
     #[test]
-    fn scroll_offset_is_clamped_to_content() {
-        let (scroll, top, max) = chat_scroll_offset(100, 20, 500);
-        assert_eq!(scroll, 80);
-        assert_eq!(top, 0);
-        assert_eq!(max, 80);
+    fn compute_list_offset_scrolls_down_when_selected_below_viewport() {
+        let heights = vec![2, 1, 3, 1, 2];
+        // selected=3 at y=6, viewport=4, current_offset=0 → offset should be 3
+        let offset = compute_list_offset(&heights, Some(3), 4, 0);
+        assert_eq!(offset, 3);
     }
 
     #[test]
-    fn scroll_offset_is_zero_when_content_fits() {
-        let (scroll, top, max) = chat_scroll_offset(10, 20, 5);
-        assert_eq!(scroll, 0);
-        assert_eq!(top, 0);
-        assert_eq!(max, 0);
+    fn compute_list_offset_scrolls_up_when_selected_above_viewport() {
+        let heights = vec![2, 1, 3, 1, 2];
+        // selected=0 at y=0, viewport=4, current_offset=4 → offset should be 0
+        let offset = compute_list_offset(&heights, Some(0), 4, 4);
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn compute_list_offset_keeps_offset_when_selected_in_viewport() {
+        let heights = vec![1, 1, 1, 1, 1];
+        // selected=2 at y=2, viewport=4, current_offset=0 → stays at 0
+        let offset = compute_list_offset(&heights, Some(2), 4, 0);
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn compute_list_offset_returns_zero_when_no_selection() {
+        let heights = vec![1, 1, 1];
+        let offset = compute_list_offset(&heights, None, 5, 0);
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn message_line_count_single_line_message() {
+        let msg = message("hello");
+        // "Alice 01-01 00:00  hello" = ~25 chars, at width 80 → 1 line, no truncation
+        let (count, truncated) = message_line_count(&msg, 80, None);
+        assert_eq!(count, 1);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn message_line_count_multiline_message() {
+        let msg = message("line1\nline2\nline3");
+        let (count, _truncated) = message_line_count(&msg, 80, None);
+        assert!(count >= 3);
     }
 
     #[test]

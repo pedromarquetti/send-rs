@@ -26,6 +26,10 @@ pub struct ChatState {
     pub open_chat: Option<OpenChat>,
     /// Per-chat draft messages (unsent text saved when switching chats).
     pub drafts: HashMap<ChatId, String>,
+    /// Selection state for the message list in the currently open chat.
+    pub message_list_state: ListState,
+    /// Persisted message selection index per chat (restored when switching chats).
+    pub selected_messages: HashMap<ChatId, usize>,
 }
 
 impl ChatState {
@@ -85,6 +89,35 @@ impl ChatState {
     pub fn load_draft(&self, id: &ChatId) -> Option<&str> {
         self.drafts.get(id).map(|s| s.as_str())
     }
+
+    /// Save the current message selection for the open chat.
+    pub fn save_message_selection(&mut self) {
+        if let (Some(chat_id), Some(idx)) = (
+            self.open_chat.as_ref().map(|o| o.chat.id.clone()),
+            self.message_list_state.selected(),
+        ) {
+            self.selected_messages.insert(chat_id, idx);
+        }
+    }
+
+    /// Restore the message selection for a chat, defaulting to the last message.
+    pub fn restore_message_selection(&mut self, history_len: usize) {
+        if history_len == 0 {
+            self.message_list_state.select(None);
+            return;
+        }
+        let chat_id = match self.open_chat.as_ref().map(|o| o.chat.id.clone()) {
+            Some(id) => id,
+            None => return,
+        };
+        let idx = self
+            .selected_messages
+            .get(&chat_id)
+            .copied()
+            .unwrap_or(history_len - 1)
+            .min(history_len - 1);
+        self.message_list_state.select(Some(idx));
+    }
 }
 
 #[cfg(test)]
@@ -107,6 +140,7 @@ mod tests {
             text: "hello".into(),
             timestamp: 0,
             from_me: false,
+            options: Vec::new(),
         }
     }
 

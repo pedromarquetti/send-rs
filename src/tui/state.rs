@@ -15,7 +15,7 @@ pub enum Focus {
     ChatList,
     Chat,
     Write,
-    Overlay,
+    Popup,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +46,7 @@ pub struct AppState {
 pub struct PopupState {
     pub popup_type: PopupKind,
     prev_focus: Focus,
+    pub scroll_idx: usize,
 }
 
 impl AppState {
@@ -129,6 +130,7 @@ impl AppState {
         self.pop_up = Some(PopupState {
             popup_type,
             prev_focus: self.focus,
+            scroll_idx: 0,
         })
     }
 
@@ -176,10 +178,9 @@ impl AppState {
                     self.chat_state.save_draft(&chat_id, text);
                 }
                 self.write.clear();
-                self.chat_state.open_chat = None;
-                Focus::ChatList
+                Focus::Chat
             }
-            Focus::Overlay => Focus::ChatList,
+            Focus::Popup => Focus::ChatList,
         };
     }
 
@@ -188,7 +189,7 @@ impl AppState {
             return;
         };
 
-        // Save current draft before switching
+        // Save current draft and message selection before switching
         if let Some(current_chat_id) = self
             .chat_state
             .open_chat
@@ -197,6 +198,7 @@ impl AppState {
         {
             let text = self.write.lines().join("\n");
             self.chat_state.save_draft(&current_chat_id, text);
+            self.chat_state.save_message_selection();
         }
 
         self.chat_state.chats[index].unread = false;
@@ -216,10 +218,12 @@ impl AppState {
         };
         match history_result {
             Ok(messages) => {
+                let history_len = messages.len();
                 self.chat_state.open_chat = Some(OpenChat {
                     chat: chat.clone(),
                     history: messages,
                 });
+                self.chat_state.restore_message_selection(history_len);
             }
             Err(e) => {
                 self.chat_state.open_chat = None;
@@ -463,6 +467,7 @@ mod tests {
                 text: "breaking".into(),
                 timestamp: 0,
                 from_me: false,
+                options: Vec::new(),
             }),
         );
 
@@ -492,6 +497,7 @@ mod tests {
                 text: "hi".into(),
                 timestamp: 0,
                 from_me: false,
+                options: Vec::new(),
             }),
         );
 
