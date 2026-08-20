@@ -8,8 +8,11 @@ Sender is an TUI app for interacting with Whatsapp AND telegram (maybe more in t
 ## Features
 
 - [x] ***One-Executable-app*** - no co dependencies, one binary to rule them all. 
-- [ ] ***All-in-one app for messages***  - at first, Whatsapp + Telegram, but maybe more apps could be implemented?
 - [x] Configurable
+- [ ] Draft / Myself conversation
+- [ ] Help menu Popup to show keymaps
+- [ ] Descriptive error handling
+- [ ] Message actions (reply, edit, delete)
 - [ ] WhatsApp integration
 - [ ] Telegram integration
 - [ ] Support for notifications 
@@ -29,7 +32,7 @@ Sender is an TUI app for interacting with Whatsapp AND telegram (maybe more in t
 | `PgUp/PgDn` | Chat | Page up / down on chat history (fixed, not configurable) |
 | `Enter` | Write message | Send message (configurable) |
 | `Alt+Enter` | Write message | Insert newline. `Shift+Enter` also works but only on terminals that report modifier keys on Enter (kitty, foot, WezTerm, Alacritty; not GNOME Terminal or a plain TTY). |
-| `j/k` / `Enter` / `Esc` | Settings | Move / toggle provider / close settings (reuses chat-list keys) |
+| `Enter` | Settings | Select items (use j/k for scrolling) |
 
 > All keys except `PgUp/PgDn` are configurable in the config file.
 

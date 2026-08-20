@@ -8,6 +8,7 @@ use crate::tui::state::PopupState;
 
 pub enum PopupKind {
     Info(String),
+    // TODO: better error handling
     Error(String),
     Warn(String),
     Message(Message),
