@@ -23,6 +23,8 @@ struct State {
     chats: Vec<Chat>,
     history: HashMap<ChatId, Vec<Message>>,
     outgoing_seq: u64,
+    authenticated: bool,
+    connected: bool,
 }
 
 struct MockData {
@@ -42,6 +44,8 @@ impl MockMessenger {
                 chats: data.chats,
                 history: data.history,
                 outgoing_seq: 0,
+                authenticated: true,
+                connected: true,
             })),
             tx,
             incoming_chat: data.incoming_chat,
@@ -96,7 +100,10 @@ impl Messenger for MockMessenger {
     }
 
     async fn is_authenticated(&self) -> bool {
-        true
+        self.state
+            .lock()
+            .map(|s| s.authenticated && s.connected)
+            .unwrap_or(false)
     }
 
     async fn chats(&self) -> Result<Vec<Chat>, BackendError> {
@@ -179,6 +186,34 @@ impl Messenger for MockMessenger {
 
     fn subscribe(&self) -> broadcast::Receiver<BackendEvent> {
         self.tx.subscribe()
+    }
+
+    async fn disconnect(&mut self) -> Result<(), BackendError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|e| BackendError::Other(format!("{} mock state poisoned: {e}", self.name)))?;
+        state.connected = false;
+        Ok(())
+    }
+
+    async fn login(&mut self) -> Result<(), BackendError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|e| BackendError::Other(format!("{} mock state poisoned: {e}", self.name)))?;
+        state.authenticated = true;
+        state.connected = true;
+        Ok(())
+    }
+
+    async fn logout(&mut self) -> Result<(), BackendError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|e| BackendError::Other(format!("{} mock state poisoned: {e}", self.name)))?;
+        state.authenticated = false;
+        Ok(())
     }
 }
 

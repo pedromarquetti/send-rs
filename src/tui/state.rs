@@ -740,6 +740,18 @@ mod tests {
         fn subscribe(&self) -> broadcast::Receiver<BackendEvent> {
             self.tx.subscribe()
         }
+
+        async fn disconnect(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        async fn login(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        async fn logout(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
     }
 
     // -- Error propagation tests --

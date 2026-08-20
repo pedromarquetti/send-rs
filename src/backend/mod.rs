@@ -123,6 +123,13 @@ pub trait Messenger: Send + Sync {
     async fn send(&self, chat: &ChatId, text: &str) -> Result<(), BackendError>;
     /// Messenger provider >>> Client message handling
     fn subscribe(&self) -> broadcast::Receiver<BackendEvent>;
+    /// Graceful shutdown: flush pending work, close transport, stop background tasks.
+    async fn disconnect(&mut self) -> Result<(), BackendError>;
+    /// Start authentication flow. For event-driven providers (WhatsApp) this is a no-op;
+    /// the actual auth happens via BackendEvent callbacks.
+    async fn login(&mut self) -> Result<(), BackendError>;
+    /// Destroy remote session (sign out / deregister device).
+    async fn logout(&mut self) -> Result<(), BackendError>;
 }
 
 #[cfg(test)]
