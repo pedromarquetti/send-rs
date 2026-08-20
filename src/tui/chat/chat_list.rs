@@ -1,5 +1,5 @@
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, StatefulWidget, Widget, Wrap};
+use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, StatefulWidget, Widget};
 
 use crate::backend::Chat;
 use crate::tui::state::Focus;
@@ -33,8 +33,7 @@ impl StatefulWidget for ChatList<'_> {
 
         if self.chats.is_empty() {
             let message = Paragraph::new("No chats yet.\nPress s to enable a provider.")
-                .block(block)
-                .wrap(Wrap { trim: false });
+                .block(block);
             message.render(area, buf);
             return;
         }

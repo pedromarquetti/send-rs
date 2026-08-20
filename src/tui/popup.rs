@@ -1,5 +1,5 @@
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, Paragraph};
 
 use crate::backend::{Message, MessageAction};
 use crate::helpers::{calc_height, popup_area};
@@ -28,10 +28,25 @@ impl PopUp {
     }
     pub fn handle_data_render(&self, data: &String, area: Rect, buf: &mut Buffer, block: Block) {
         let width = 80.min(area.width.saturating_sub(4));
+        let content_width = width.saturating_sub(2) as usize;
         let msg = format!("{data}\n\nPress ESC to close");
         let height = calc_height(&msg, width, area, false);
         let popup_area = popup_area(area, width, height);
-        let paragraph = Paragraph::new(msg).wrap(Wrap { trim: false }).block(block);
+        let lines: Vec<Line> = msg
+            .lines()
+            .flat_map(|line| {
+                let chunks = wrap_text(line, content_width);
+                if chunks.is_empty() {
+                    vec![Line::from(Span::raw(""))]
+                } else {
+                    chunks
+                        .into_iter()
+                        .map(|c| Line::from(Span::raw(c)))
+                        .collect()
+                }
+            })
+            .collect();
+        let paragraph = Paragraph::new(lines).block(block);
         Clear.render(popup_area, buf);
         Widget::render(paragraph, popup_area, buf);
     }
@@ -130,7 +145,6 @@ impl StatefulWidget for &mut PopUp {
 
                 let paragraph = Paragraph::new(content_lines)
                     .scroll((state.scroll_idx as u16, 0))
-                    .wrap(Wrap { trim: false })
                     .block(block);
                 paragraph.render(popup_area, buf);
 

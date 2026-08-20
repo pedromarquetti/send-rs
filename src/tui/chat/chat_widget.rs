@@ -1,7 +1,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{
     Block, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
-    StatefulWidget, Widget, Wrap,
+    StatefulWidget, Widget,
 };
 use ratatui_textarea::TextArea;
 
@@ -373,16 +373,15 @@ fn compute_list_offset(
 }
 
 /// Number of visual rows the Write box needs for the given text at `width` columns, counting
-/// soft-wrapped lines just like the `TextArea` does (word wrap with glyph fallback).
+/// soft-wrapped lines with word-boundary wrapping.
 fn write_visual_rows(lines: &[String], width: u16) -> usize {
-    let text: Vec<Line> = lines
-        .iter()
-        .map(|line| Line::from(Span::raw(line.clone())))
-        .collect();
-    Paragraph::new(text)
-        .wrap(Wrap { trim: false })
-        .line_count(width)
-        .max(1)
+    let wrap_width = width.saturating_sub(2) as usize;
+    let mut count = 0;
+    for line in lines {
+        let chunks = wrap_text(line, wrap_width);
+        count += chunks.len().max(1);
+    }
+    count.max(1)
 }
 
 /// Height of the Write box in rows: two border rows plus up to `max_lines` content rows, never
