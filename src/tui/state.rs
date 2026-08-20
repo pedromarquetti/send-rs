@@ -1,4 +1,3 @@
-use anyhow::{Context, Result};
 use ratatui::style::{Color, Style};
 use ratatui::widgets::ListState;
 use ratatui_textarea::{TextArea, WrapMode};
@@ -55,7 +54,7 @@ impl AppState {
         keymap: Keymap,
         messengers: Vec<Box<dyn Messenger>>,
         open_settings: bool,
-    ) -> Result<Self> {
+    ) -> Self {
         let mut write = TextArea::default();
         write.set_placeholder_text("Write a message...");
         write.set_cursor_style(Style::default().fg(Color::Yellow));
@@ -77,29 +76,35 @@ impl AppState {
             chat_state: Default::default(),
             running: true,
         };
-        app.rebuild_chats().await.context("loading chats")?;
+        let errors = app.rebuild_chats().await;
+        if !errors.is_empty() {
+            let msg = errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n");
+            app.create_popup(PopupKind::Error(msg));
+        }
         if open_settings {
             app.create_popup(PopupKind::Info(String::from(
                 "Welcome! Press Enter on a provider to enable it. Connections are mocked for now.",
             )));
         }
-        Ok(app)
+        app
     }
 
     pub fn selected_chat_idx(&self) -> Option<usize> {
         self.chat_state.chat_list_state.selected()
     }
 
-    pub async fn rebuild_chats(&mut self) -> Result<()> {
+    pub async fn rebuild_chats(&mut self) -> Vec<BackendError> {
         let saved_scrolls: HashMap<ChatId, usize> = self
             .chat_state
             .chats
             .iter()
             .map(|chat| (chat.id.clone(), chat.scroll))
             .collect();
-        let mut entries = Vec::new();
+        let mut chat_list = Vec::new();
+        let mut errors: Vec<BackendError> = Vec::new();
         for messenger in &self.messengers {
-            let enabled = match messenger.platform() {
+            let platform = messenger.platform();
+            let enabled = match platform {
                 "Telegram" => self.config.providers.telegram,
                 "WhatsApp" => self.config.providers.whatsapp,
                 _ => true,
@@ -107,12 +112,19 @@ impl AppState {
             if !enabled {
                 continue;
             }
-            for chat in messenger.chats().await? {
-                let scroll = saved_scrolls.get(&chat.id).copied().unwrap_or(0);
-                entries.push(Chat { scroll, ..chat });
+            match messenger.chats().await {
+                Ok(chats) => {
+                    for chat in chats {
+                        let scroll = saved_scrolls.get(&chat.id).copied().unwrap_or(0);
+                        chat_list.push(Chat { scroll, ..chat });
+                    }
+                }
+                Err(e) => {
+                    errors.push(e);
+                }
             }
         }
-        self.chat_state.chats = entries;
+        self.chat_state.chats = chat_list;
         let len = self.chat_state.chats.len();
         let index = if len == 0 {
             None
@@ -123,7 +135,7 @@ impl AppState {
                 .map(|i| i.min(len - 1))
         };
         self.chat_state.chat_list_state.select(index);
-        Ok(())
+        errors
     }
 
     pub fn create_popup(&mut self, popup_type: PopupKind) {
@@ -208,7 +220,10 @@ impl AppState {
             None => Ok(()),
         };
         if let Err(e) = read_result {
-            self.create_popup(PopupKind::Error(format!("failed to mark as read: {e}",)));
+            self.create_popup(PopupKind::Error(format!(
+                "{} failed to mark chat as read: {e}",
+                chat.id.platform()
+            )));
             return;
         }
 
@@ -227,7 +242,11 @@ impl AppState {
             }
             Err(e) => {
                 self.chat_state.open_chat = None;
-                self.create_popup(PopupKind::Error(format!("failed to load history: {e}",)));
+                self.create_popup(PopupKind::Error(format!(
+                    "{} failed to load history for {}: {e}",
+                    chat.id.platform(),
+                    chat.contact_name
+                )));
             }
         }
 
@@ -267,7 +286,10 @@ impl AppState {
                 self.write.clear();
                 self.chat_state.drafts.remove(&chat.id);
             }
-            Err(e) => self.create_popup(PopupKind::Error(format!("failed to send: {e}"))),
+            Err(e) => self.create_popup(PopupKind::Error(format!(
+                "{} failed to send message: {e}",
+                chat.id.platform()
+            ))),
         }
     }
 
@@ -306,20 +328,17 @@ impl AppState {
             _ => return,
         };
         match self.config.save() {
-            Ok(()) => match self.rebuild_chats().await {
-                Ok(()) => {
-                    if enabled {
-                        self.create_popup(PopupKind::Info(format!(
-                            "{name} enabled (mock connection)"
-                        )));
-                    } else {
-                        self.create_popup(PopupKind::Info(format!("{name} disabled")));
-                    }
+            Ok(()) => {
+                let errors = self.rebuild_chats().await;
+                if enabled {
+                    self.create_popup(PopupKind::Info(format!("{name} enabled (mock connection)")));
+                } else {
+                    self.create_popup(PopupKind::Info(format!("{name} disabled")));
                 }
-                Err(e) => {
-                    self.create_popup(PopupKind::Error(format!("failed to refresh chats: {e}")))
+                if !errors.is_empty() {
+                    self.create_popup(PopupKind::Error(errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n")));
                 }
-            },
+            }
             Err(e) => self.create_popup(PopupKind::Error(format!("could not save config: {e}"))),
         }
     }
@@ -328,6 +347,9 @@ impl AppState {
         match event {
             BackendEvent::Connected => {}
             BackendEvent::Disconnected(message) => self.create_popup(PopupKind::Error(message)),
+            BackendEvent::Error(context, err) => {
+                self.create_popup(PopupKind::Error(format!("{context}: {err}")))
+            }
             BackendEvent::MessageReceived(message) => {
                 let is_open = self.chat_state.push_incoming(message.clone());
                 let selected_id = self
@@ -363,6 +385,7 @@ mod tests {
     use super::*;
     use crate::backend::Message;
     use crate::backend::mock::MockMessenger;
+    use tokio::sync::broadcast;
 
     async fn app_state() -> AppState {
         let mut config = Config::default();
@@ -371,9 +394,7 @@ mod tests {
         let mock = MockMessenger::new("Telegram");
         mock.spawn_incoming_messages();
         let messengers: Vec<Box<dyn Messenger>> = vec![Box::new(mock)];
-        AppState::new(config, keymap, messengers, false)
-            .await
-            .unwrap()
+        AppState::new(config, keymap, messengers, false).await
     }
 
     #[tokio::test]
@@ -626,5 +647,267 @@ mod tests {
             state.chat_state.load_draft(&ChatId::Telegram(102)),
             Some("msg for chat 1")
         );
+    }
+
+    // -- StubMessenger for error propagation tests --
+
+    struct StubMessenger {
+        platform: &'static str,
+        chats_result: std::sync::Mutex<Option<Result<Vec<Chat>, BackendError>>>,
+        send_result: std::sync::Mutex<Option<Result<(), BackendError>>>,
+        history_result: std::sync::Mutex<Option<Result<Vec<Message>, BackendError>>>,
+        set_read_result: std::sync::Mutex<Option<Result<(), BackendError>>>,
+        tx: broadcast::Sender<BackendEvent>,
+    }
+
+    impl StubMessenger {
+        fn new(platform: &'static str) -> Self {
+            let (tx, _) = broadcast::channel(16);
+            Self {
+                platform,
+                chats_result: std::sync::Mutex::new(None),
+                send_result: std::sync::Mutex::new(None),
+                history_result: std::sync::Mutex::new(None),
+                set_read_result: std::sync::Mutex::new(None),
+                tx,
+            }
+        }
+
+        fn with_chats_error(self, err: BackendError) -> Self {
+            *self.chats_result.lock().unwrap() = Some(Err(err));
+            self
+        }
+
+        fn with_send_error(self, err: BackendError) -> Self {
+            *self.send_result.lock().unwrap() = Some(Err(err));
+            self
+        }
+
+        fn with_history_error(self, err: BackendError) -> Self {
+            *self.history_result.lock().unwrap() = Some(Err(err));
+            self
+        }
+
+        fn with_set_read_error(self, err: BackendError) -> Self {
+            *self.set_read_result.lock().unwrap() = Some(Err(err));
+            self
+        }
+
+        fn with_chats(self, chats: Vec<Chat>) -> Self {
+            *self.chats_result.lock().unwrap() = Some(Ok(chats));
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Messenger for StubMessenger {
+        fn platform(&self) -> &'static str {
+            self.platform
+        }
+
+        async fn is_authenticated(&self) -> bool {
+            true
+        }
+
+        async fn chats(&self) -> Result<Vec<Chat>, BackendError> {
+            match self.chats_result.lock().unwrap().take() {
+                Some(result) => result,
+                None => Ok(Vec::new()),
+            }
+        }
+
+        async fn set_read(&mut self, _chat: &ChatId) -> Result<(), BackendError> {
+            match self.set_read_result.lock().unwrap().take() {
+                Some(result) => result,
+                None => Ok(()),
+            }
+        }
+
+        async fn history(&self, _chat: &ChatId) -> Result<Vec<Message>, BackendError> {
+            match self.history_result.lock().unwrap().take() {
+                Some(result) => result,
+                None => Ok(Vec::new()),
+            }
+        }
+
+        async fn send(&self, _chat: &ChatId, _text: &str) -> Result<(), BackendError> {
+            match self.send_result.lock().unwrap().take() {
+                Some(result) => result,
+                None => Ok(()),
+            }
+        }
+
+        fn subscribe(&self) -> broadcast::Receiver<BackendEvent> {
+            self.tx.subscribe()
+        }
+    }
+
+    // -- Error propagation tests --
+
+    #[tokio::test]
+    async fn messenger_chats_failure_is_nonfatal() {
+        let good = MockMessenger::new("Telegram");
+        let bad = StubMessenger::new("WhatsApp")
+            .with_chats_error(BackendError::Other("connection refused".into()));
+        let mut config = Config::default();
+        config.providers.telegram = true;
+        config.providers.whatsapp = true;
+        let keymap = config.keys.parse().unwrap();
+        let messengers: Vec<Box<dyn Messenger>> = vec![Box::new(good), Box::new(bad)];
+        let state = AppState::new(config, keymap, messengers, false).await;
+        assert_eq!(
+            state.chat_state.chats.len(),
+            4,
+            "Telegram chats should still load"
+        );
+        let popup = state.pop_up.as_ref().expect("error popup should exist");
+        match &popup.popup_type {
+            PopupKind::Error(msg) => assert!(msg.contains("connection refused")),
+            other => panic!("expected Error popup, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn messenger_send_failure_shows_overlay() {
+        let chat = Chat {
+            id: ChatId::Telegram(1),
+            contact_name: "Test".into(),
+            ..Default::default()
+        };
+        let stub = StubMessenger::new("Telegram")
+            .with_chats(vec![chat])
+            .with_send_error(BackendError::Other("rate limited".into()));
+        let mut config = Config::default();
+        config.providers.telegram = true;
+        let keymap = config.keys.parse().unwrap();
+        let mut state = AppState::new(config, keymap, vec![Box::new(stub)], false).await;
+        state.chat_state.chat_list_state.select(Some(0));
+        state.write.insert_str("hello");
+        state.send_message().await;
+        let popup = state
+            .pop_up
+            .as_ref()
+            .expect("send error popup should exist");
+        match &popup.popup_type {
+            PopupKind::Error(msg) => {
+                assert!(msg.contains("Telegram"), "should mention provider: {msg}");
+                assert!(msg.contains("rate limited"), "should include error: {msg}");
+            }
+            other => panic!("expected Error popup, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn messenger_history_failure_shows_overlay() {
+        let chat = Chat {
+            id: ChatId::Telegram(1),
+            contact_name: "Test".into(),
+            ..Default::default()
+        };
+        let stub = StubMessenger::new("Telegram")
+            .with_chats(vec![chat])
+            .with_history_error(BackendError::Other("timeout".into()));
+        let mut config = Config::default();
+        config.providers.telegram = true;
+        let keymap = config.keys.parse().unwrap();
+        let mut state = AppState::new(config, keymap, vec![Box::new(stub)], false).await;
+        state.chat_state.chat_list_state.select(Some(0));
+        state.select_chat(0).await;
+        let popup = state
+            .pop_up
+            .as_ref()
+            .expect("history error popup should exist");
+        match &popup.popup_type {
+            PopupKind::Error(msg) => {
+                assert!(msg.contains("Telegram"), "should mention provider: {msg}");
+                assert!(msg.contains("history"), "should mention history: {msg}");
+            }
+            other => panic!("expected Error popup, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn messenger_set_read_failure_shows_overlay() {
+        let chat = Chat {
+            id: ChatId::Telegram(1),
+            contact_name: "Test".into(),
+            ..Default::default()
+        };
+        let stub = StubMessenger::new("Telegram")
+            .with_chats(vec![chat])
+            .with_set_read_error(BackendError::Other("permission denied".into()));
+        let mut config = Config::default();
+        config.providers.telegram = true;
+        let keymap = config.keys.parse().unwrap();
+        let mut state = AppState::new(config, keymap, vec![Box::new(stub)], false).await;
+        state.chat_state.chat_list_state.select(Some(0));
+        state.select_chat(0).await;
+        let popup = state
+            .pop_up
+            .as_ref()
+            .expect("set_read error popup should exist");
+        match &popup.popup_type {
+            PopupKind::Error(msg) => {
+                assert!(msg.contains("Telegram"), "should mention provider: {msg}");
+                assert!(msg.contains("read"), "should mention read: {msg}");
+            }
+            other => panic!("expected Error popup, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_error_event_shows_overlay() {
+        let stub = StubMessenger::new("Telegram");
+        let mut config = Config::default();
+        config.providers.telegram = true;
+        let keymap = config.keys.parse().unwrap();
+        let mut state = AppState::new(config, keymap, vec![Box::new(stub)], false).await;
+        state.handle_backend_event(
+            0,
+            BackendEvent::Error(
+                "Telegram subscription failed".into(),
+                BackendError::Other("stream closed".into()),
+            ),
+        );
+        let popup = state
+            .pop_up
+            .as_ref()
+            .expect("backend error popup should exist");
+        match &popup.popup_type {
+            PopupKind::Error(msg) => {
+                assert!(
+                    msg.contains("Telegram subscription failed"),
+                    "should include context: {msg}"
+                );
+                assert!(msg.contains("stream closed"), "should include error: {msg}");
+            }
+            other => panic!("expected Error popup, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn multiple_messenger_boot_errors_are_combined() {
+        let bad_tg = StubMessenger::new("Telegram")
+            .with_chats_error(BackendError::Other("auth failed".into()));
+        let bad_wa = StubMessenger::new("WhatsApp")
+            .with_chats_error(BackendError::Other("connection refused".into()));
+        let mut config = Config::default();
+        config.providers.telegram = true;
+        config.providers.whatsapp = true;
+        let keymap = config.keys.parse().unwrap();
+        let messengers: Vec<Box<dyn Messenger>> = vec![Box::new(bad_tg), Box::new(bad_wa)];
+        let state = AppState::new(config, keymap, messengers, false).await;
+        assert!(state.chat_state.chats.is_empty());
+        let popup = state
+            .pop_up
+            .as_ref()
+            .expect("combined error popup should exist");
+        match &popup.popup_type {
+            PopupKind::Error(msg) => {
+                assert!(msg.contains("auth failed"), "should mention auth failed: {msg}");
+                assert!(msg.contains("connection refused"), "should mention connection refused: {msg}");
+            }
+            other => panic!("expected Error popup, got {other:?}"),
+        }
     }
 }

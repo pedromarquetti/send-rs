@@ -6,9 +6,9 @@ use crate::helpers::{calc_height, popup_area};
 use crate::tui::chat::chat_widget::{format_timestamp, wrap_text};
 use crate::tui::state::PopupState;
 
+#[derive(Debug)]
 pub enum PopupKind {
     Info(String),
-    // TODO: better error handling
     Error(String),
     Warn(String),
     Message(Message),

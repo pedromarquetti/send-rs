@@ -69,7 +69,7 @@ async fn run_app(
         });
     }
 
-    let mut app = App::new(config, keymap, messengers, open_settings).await?;
+    let mut app = App::new(config, keymap, messengers, open_settings).await;
     loop {
         terminal.draw(|frame| app.draw(frame))?;
         let Some(event) = rx.recv().await else {
@@ -126,10 +126,10 @@ impl App {
         keymap: Keymap,
         messengers: Vec<Box<dyn Messenger>>,
         open_settings: bool,
-    ) -> Result<Self> {
-        Ok(Self {
-            state: AppState::new(config, keymap, messengers, open_settings).await?,
-        })
+    ) -> Self {
+        Self {
+            state: AppState::new(config, keymap, messengers, open_settings).await,
+        }
     }
 
     async fn handle_key(&mut self, key: KeyEvent) {

@@ -1,6 +1,7 @@
 pub mod mock;
 pub mod telegram;
 pub mod whatsapp;
+
 use anyhow::Result;
 use tokio::sync::broadcast;
 
@@ -70,9 +71,10 @@ pub enum BackendEvent {
     Disconnected(String),
     MessageReceived(Message),
     ChatUpdated(Chat),
+    Error(String, BackendError),
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BackendError {
     #[error("not authenticated")]
     NotAuthenticated,
@@ -83,6 +85,27 @@ pub enum BackendError {
 impl From<anyhow::Error> for BackendError {
     fn from(err: anyhow::Error) -> Self {
         BackendError::Other(err.to_string())
+    }
+}
+
+impl From<grammers_client::InvocationError> for BackendError {
+    fn from(err: grammers_client::InvocationError) -> Self {
+        use grammers_client::InvocationError;
+        match err {
+            InvocationError::Authentication(_) => BackendError::NotAuthenticated,
+            other => BackendError::Other(format!("Telegram: {other}")),
+        }
+    }
+}
+
+impl From<whatsapp_rust::ClientError> for BackendError {
+    fn from(err: whatsapp_rust::ClientError) -> Self {
+        use whatsapp_rust::ClientError;
+        match err {
+            ClientError::NotLoggedIn => BackendError::NotAuthenticated,
+            ClientError::NotConnected => BackendError::Other("WhatsApp: not connected".into()),
+            other => BackendError::Other(format!("WhatsApp: {other}")),
+        }
     }
 }
 

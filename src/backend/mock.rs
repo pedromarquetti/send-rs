@@ -72,7 +72,9 @@ impl MockMessenger {
                     from_me: false,
                     options: Vec::new(),
                 };
-                let mut state = state.lock().expect("mock state poisoned");
+                let Ok(mut state) = state.lock() else {
+                    return;
+                };
                 state
                     .history
                     .entry(chat.clone())
@@ -98,12 +100,18 @@ impl Messenger for MockMessenger {
     }
 
     async fn chats(&self) -> Result<Vec<Chat>, BackendError> {
-        let state = self.state.lock().expect("Expected valid state");
+        let state = self
+            .state
+            .lock()
+            .map_err(|e| BackendError::Other(format!("{} mock state poisoned: {e}", self.name)))?;
         Ok(state.chats.clone())
     }
 
     async fn set_read(&mut self, chat: &ChatId) -> Result<(), BackendError> {
-        let mut state = self.state.lock().expect("Expected valid state");
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|e| BackendError::Other(format!("{} mock state poisoned: {e}", self.name)))?;
         for entry in &mut state.chats {
             if entry.id == *chat {
                 entry.unread = false;
@@ -115,13 +123,19 @@ impl Messenger for MockMessenger {
     }
 
     async fn history(&self, chat: &ChatId) -> Result<Vec<Message>, BackendError> {
-        let state = self.state.lock().expect("mock state poisoned");
+        let state = self
+            .state
+            .lock()
+            .map_err(|e| BackendError::Other(format!("{} mock state poisoned: {e}", self.name)))?;
         let messages = state.history.get(chat).cloned().unwrap_or_default();
         Ok(messages)
     }
 
     async fn send(&self, chat: &ChatId, text: &str) -> Result<(), BackendError> {
-        let mut state = self.state.lock().expect("mock state poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|e| BackendError::Other(format!("{} mock state poisoned: {e}", self.name)))?;
         state.outgoing_seq += 1;
         let msg = Message {
             id: format!("mock-outgoing-{}", state.outgoing_seq),
@@ -176,7 +190,9 @@ impl MockMessenger {
         let text = text.to_string();
         tokio::spawn(async move {
             sleep(Duration::from_millis(150)).await;
-            let mut state = state.lock().expect("mock state poisoned");
+            let Ok(mut state) = state.lock() else {
+                return;
+            };
             state.outgoing_seq += 1;
             let msg = Message {
                 id: format!("mock-echo-{}", state.outgoing_seq),
