@@ -8,7 +8,7 @@ use ratatui::widgets::{StatefulWidget, Widget};
 use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc;
 
-use crate::backend::{BackendEvent, MessageAction, Messenger};
+use crate::backend::{AuthSteps, BackendEvent, MessageAction, MessengerKind, Provider};
 use crate::config::{Config, Keymap};
 use crate::tui::chat::chat_list::ChatList;
 use crate::tui::chat::chat_widget::ChatWidget;
@@ -18,6 +18,7 @@ use crate::tui::state::{AppState, Focus, Screen};
 use crate::tui::status_bar::StatusBarWidget;
 
 mod chat;
+mod login;
 mod popup;
 mod settings;
 mod state;
@@ -26,14 +27,14 @@ mod status_bar;
 enum UiEvent {
     Key(KeyEvent),
     Paste(String),
-    Backend(usize, BackendEvent),
+    Backend(Provider, BackendEvent),
     Resize(u16, u16),
 }
 
 pub async fn run(
     config: Config,
     keymap: Keymap,
-    messengers: Vec<Box<dyn Messenger>>,
+    messengers: Vec<MessengerKind>,
     open_settings: bool,
 ) -> Result<()> {
     let mut terminal = ratatui::init();
@@ -50,19 +51,20 @@ async fn run_app(
     terminal: &mut DefaultTerminal,
     config: Config,
     keymap: Keymap,
-    messengers: Vec<Box<dyn Messenger>>,
+    messengers: Vec<MessengerKind>,
     open_settings: bool,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
     spawn_terminal_reader(tx.clone());
 
     // handling new events for each messenger type
-    for (index, messenger) in messengers.iter().enumerate() {
+    for messenger in messengers.iter() {
         let mut backend_rx = messenger.subscribe();
         let forward_tx = tx.clone();
+        let provider = messenger.provider();
         tokio::spawn(async move {
             while let Ok(event) = backend_rx.recv().await {
-                if forward_tx.send(UiEvent::Backend(index, event)).is_err() {
+                if forward_tx.send(UiEvent::Backend(provider, event)).is_err() {
                     break;
                 }
             }
@@ -70,6 +72,7 @@ async fn run_app(
     }
 
     let mut app = App::new(config, keymap, messengers, open_settings).await;
+
     loop {
         terminal.draw(|frame| app.draw(frame))?;
         let Some(event) = rx.recv().await else {
@@ -78,8 +81,8 @@ async fn run_app(
         match event {
             UiEvent::Key(key) => app.handle_key(key).await,
             UiEvent::Paste(text) => app.state.handle_paste(text),
-            UiEvent::Backend(index, backend_event) => {
-                app.state.handle_backend_event(index, backend_event);
+            UiEvent::Backend(provider, backend_event) => {
+                app.state.handle_backend_event(provider, backend_event);
             }
             UiEvent::Resize(..) => {}
         }
@@ -124,7 +127,7 @@ impl App {
     async fn new(
         config: Config,
         keymap: Keymap,
-        messengers: Vec<Box<dyn Messenger>>,
+        messengers: Vec<MessengerKind>,
         open_settings: bool,
     ) -> Self {
         Self {
@@ -147,6 +150,7 @@ impl App {
         match self.state.screen {
             Screen::Settings => self.handle_settings_key(key).await,
             Screen::Main => self.handle_main_key(key).await,
+            Screen::Login => self.handle_login_key(key).await,
         }
     }
 
@@ -164,12 +168,26 @@ impl App {
             self.state.settings_state.select(Some(index));
         } else if key == km.scroll_down {
             let index = self.state.settings_state.selected().unwrap_or(0);
-            if index + 1 < 2 {
+            if index + 1 < Provider::all().len() {
                 self.state.settings_state.select(Some(index + 1));
             }
         } else if key == km.select {
             let index = self.state.settings_state.selected().unwrap_or(0);
-            self.state.toggle_provider(index).await;
+            let Some(&provider) = Provider::all().get(index) else {
+                return;
+            };
+            self.state.toggle_provider(provider).await;
+        }
+    }
+
+    async fn handle_login_key(&mut self, key: KeyEvent) {
+        let km = self.state.keymap.clone();
+        if key == km.dismiss {
+            self.state.cancel_login().await;
+        } else if key == km.send {
+            self.state.submit_login().await;
+        } else if let Some(ref mut ls) = self.state.login_state {
+            ls.login_input.input(key);
         }
     }
 
@@ -361,6 +379,36 @@ impl App {
                     frame.buffer_mut(),
                     &mut self.state.settings_state,
                 );
+            }
+            Screen::Login => {
+                if let Some(login_state) = self.state.login_state.as_ref() {
+                    let provider = login_state.provider;
+                    let step = login_state.step;
+                    if let Some(messenger) = self.state.provider_to_messenger(provider) {
+                        let steps = messenger.login_steps();
+                        let placeholder = messenger.login_placeholder(step);
+                        let masked = steps.get(step) == Some(&AuthSteps::Password);
+
+                        if let Some(ls) = self.state.login_state.as_mut() {
+                            ls.login_input.set_placeholder_text(placeholder);
+                            if masked {
+                                ls.login_input.set_mask_char('●');
+                            } else {
+                                ls.login_input.clear_mask_char();
+                            }
+
+                            login::LoginScreen {
+                                provider_name: provider.name(),
+                                steps: &steps,
+                            }
+                            .render(
+                                frame.area(),
+                                frame.buffer_mut(),
+                                ls,
+                            );
+                        }
+                    }
+                }
             }
         }
 

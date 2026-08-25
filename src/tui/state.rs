@@ -1,9 +1,12 @@
+use anyhow::Result;
 use ratatui::style::{Color, Style};
 use ratatui::widgets::ListState;
 use ratatui_textarea::{TextArea, WrapMode};
 use std::collections::HashMap;
 
-use crate::backend::{BackendError, BackendEvent, Chat, ChatId, Messenger};
+use crate::backend::{
+    BackendError, BackendEvent, Chat, ChatId, LoginStepState, MessengerKind, Provider,
+};
 use crate::config::{Config, Keymap};
 use crate::tui::chat::{ChatState, OpenChat};
 use crate::tui::popup::PopupKind;
@@ -21,13 +24,14 @@ pub enum Focus {
 pub enum Screen {
     Main,
     Settings,
+    Login,
 }
 
 /// Common application state shared across pages.
 pub struct AppState {
     pub config: Config,
     pub keymap: Keymap,
-    pub messengers: Vec<Box<dyn Messenger>>,
+    pub messengers: Vec<MessengerKind>,
 
     /// main chat state handler
     pub chat_state: ChatState,
@@ -40,6 +44,20 @@ pub struct AppState {
     pub write: TextArea<'static>,
     pub pop_up: Option<PopupState>,
     pub running: bool,
+
+    /// Active login session, if any.
+    pub login_state: Option<LoginState>,
+}
+
+pub struct LoginState {
+    /// Which provider is being logged into.
+    pub provider: Provider,
+    /// Current step index within `MessengerKind::login_steps()`.
+    pub step: usize,
+    /// Error from the last submission, if any.
+    pub error: Option<String>,
+    /// Text input reused by the generic login screen.
+    pub login_input: TextArea<'static>,
 }
 
 pub struct PopupState {
@@ -52,13 +70,17 @@ impl AppState {
     pub async fn new(
         config: Config,
         keymap: Keymap,
-        messengers: Vec<Box<dyn Messenger>>,
+        messengers: Vec<MessengerKind>,
         open_settings: bool,
     ) -> Self {
         let mut write = TextArea::default();
         write.set_placeholder_text("Write a message...");
         write.set_cursor_style(Style::default().fg(Color::Yellow));
         write.set_wrap_mode(WrapMode::WordOrGlyph);
+
+        let mut login_input = TextArea::default();
+        login_input.set_cursor_style(Style::default().fg(Color::Yellow));
+        login_input.set_wrap_mode(WrapMode::WordOrGlyph);
 
         let mut app = Self {
             config,
@@ -75,15 +97,20 @@ impl AppState {
             pop_up: None,
             chat_state: Default::default(),
             running: true,
+            login_state: None,
         };
         let errors = app.rebuild_chats().await;
         if !errors.is_empty() {
-            let msg = errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n");
+            let msg = errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
             app.create_popup(PopupKind::Error(msg));
         }
         if open_settings {
             app.create_popup(PopupKind::Info(String::from(
-                "Welcome! Press Enter on a provider to enable it. Connections are mocked for now.",
+                "Welcome! Press Enter on a provider to enable it.",
             )));
         }
         app
@@ -103,13 +130,8 @@ impl AppState {
         let mut chat_list = Vec::new();
         let mut errors: Vec<BackendError> = Vec::new();
         for messenger in &self.messengers {
-            let platform = messenger.platform();
-            let enabled = match platform {
-                "Telegram" => self.config.providers.telegram,
-                "WhatsApp" => self.config.providers.whatsapp,
-                _ => true,
-            };
-            if !enabled {
+            let provider = messenger.provider();
+            if !provider.is_enabled(&self.config.providers) {
                 continue;
             }
             match messenger.chats().await {
@@ -215,7 +237,7 @@ impl AppState {
 
         self.chat_state.chats[index].unread = false;
         self.chat_state.chats[index].unread_count = 0;
-        let read_result = match self.messenger_for_mut(&chat.id) {
+        let read_result = match self.chat_owner_mut(&chat.id) {
             Some(messenger) => messenger.set_read(&chat.id).await,
             None => Ok(()),
         };
@@ -227,7 +249,7 @@ impl AppState {
             return;
         }
 
-        let history_result = match self.messenger_for(&chat.id) {
+        let history_result = match self.chat_owner(&chat.id) {
             Some(messenger) => messenger.history(&chat.id).await,
             None => Ok(Vec::new()),
         };
@@ -264,6 +286,11 @@ impl AppState {
         if self.focus == Focus::Write {
             self.write.insert_str(&text);
         }
+        if let Some(state) = self.login_state.as_mut()
+            && self.screen == Screen::Login
+        {
+            state.login_input.insert_str(&text);
+        }
     }
 
     pub async fn send_message(&mut self) {
@@ -277,7 +304,7 @@ impl AppState {
             return;
         };
 
-        let send_result = match self.messenger_for(&chat.id) {
+        let send_result = match self.chat_owner(&chat.id) {
             Some(messenger) => messenger.send(&chat.id, &text).await,
             None => Err(BackendError::Other("no messenger for this chat".into())),
         };
@@ -293,57 +320,196 @@ impl AppState {
         }
     }
 
-    fn messenger_for<'a>(&'a self, chat: &ChatId) -> Option<&'a dyn Messenger> {
-        self.messengers
-            .iter()
-            .find(|m| m.platform() == chat.platform())
-            .map(|m| m.as_ref())
+    /// Gets the owner of the current chat
+    fn chat_owner(&self, chat: &ChatId) -> Option<&MessengerKind> {
+        let target = match chat {
+            ChatId::Telegram(_) => Provider::Telegram,
+            ChatId::WhatsApp(_) => Provider::WhatsApp,
+            ChatId::Myself => return None,
+        };
+        self.messengers.iter().find(|m| m.provider() == target)
     }
 
-    fn messenger_for_mut<'a>(
-        &'a mut self,
-        chat: &ChatId,
-    ) -> Option<&'a mut (dyn Messenger + 'static)> {
+    fn chat_owner_mut(&mut self, chat: &ChatId) -> Option<&mut MessengerKind> {
+        let target = match chat {
+            ChatId::Telegram(_) => Provider::Telegram,
+            ChatId::WhatsApp(_) => Provider::WhatsApp,
+            ChatId::Myself => return None,
+        };
+        self.messengers.iter_mut().find(|m| m.provider() == target)
+    }
+
+    pub(crate) fn provider_to_messenger(&self, provider: Provider) -> Option<&MessengerKind> {
+        self.messengers.iter().find(|m| m.provider() == provider)
+    }
+
+    fn provider_to_messenger_mut(&mut self, provider: Provider) -> Option<&mut MessengerKind> {
         self.messengers
             .iter_mut()
-            .find(|m| m.platform() == chat.platform())
-            .map(|m| m.as_mut())
+            .find(|m| m.provider() == provider)
     }
 
-    pub async fn toggle_provider(&mut self, provider_index: usize) {
-        let name = match provider_index {
-            0 => "Telegram",
-            1 => "WhatsApp",
-            _ => return,
-        };
-        let enabled = match provider_index {
-            0 => {
-                self.config.providers.telegram = !self.config.providers.telegram;
-                self.config.providers.telegram
-            }
-            1 => {
-                self.config.providers.whatsapp = !self.config.providers.whatsapp;
-                self.config.providers.whatsapp
-            }
-            _ => return,
-        };
-        match self.config.save() {
-            Ok(()) => {
-                let errors = self.rebuild_chats().await;
-                if enabled {
-                    self.create_popup(PopupKind::Info(format!("{name} enabled (mock connection)")));
-                } else {
+    pub async fn toggle_provider(&mut self, provider: Provider) {
+        let name = provider.name();
+
+        // --- Disabling is always straightforward ---
+        if provider.is_enabled(&self.config.providers) {
+            provider.toggle_enabled(&mut self.config.providers);
+            match self.config.save() {
+                Ok(()) => {
+                    let _ = self.rebuild_chats().await;
                     self.create_popup(PopupKind::Info(format!("{name} disabled")));
                 }
-                if !errors.is_empty() {
-                    self.create_popup(PopupKind::Error(errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n")));
+                Err(e) => {
+                    self.create_popup(PopupKind::Error(format!("could not save config: {e}")))
                 }
             }
-            Err(e) => self.create_popup(PopupKind::Error(format!("could not save config: {e}"))),
+            return;
+        }
+
+        // --- Enabling ---
+        // Verify API credentials exist
+        if !provider.has_credentials(&self.config.providers) {
+            self.create_popup(PopupKind::Error(format!(
+                "{}: configure credentials in config.toml first",
+                provider.name(),
+            )));
+            return;
+        }
+
+        // Verify messenger was initialized
+        let messenger = match self.provider_to_messenger(provider) {
+            Some(m) => m,
+            None => {
+                self.create_popup(PopupKind::Error(format!(
+                    "{name}: messenger could not be initialized"
+                )));
+                return;
+            }
+        };
+
+        // Check if already authenticated — if so, just enable
+        if messenger.is_authenticated().await {
+            provider.toggle_enabled(&mut self.config.providers);
+            match self.config.save() {
+                Ok(()) => {
+                    let errors = self.rebuild_chats().await;
+                    self.create_popup(PopupKind::Info(format!("{name} enabled")));
+                    if !errors.is_empty() {
+                        self.create_popup(PopupKind::Error(
+                            errors
+                                .iter()
+                                .map(|e| e.to_string())
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    self.create_popup(PopupKind::Error(format!("could not save config: {e}")))
+                }
+            }
+            return;
+        }
+
+        // Not authenticated — check if provider supports login steps
+        let steps = messenger.login_steps();
+        if steps.is_empty() {
+            self.create_popup(PopupKind::Error(format!(
+                "{name}: not authenticated and no login flow available"
+            )));
+            return;
+        }
+
+        // Navigate to login screen
+        // TODO: handle error
+        let _ = self.start_login(provider);
+    }
+
+    pub fn start_login(&mut self, provider: Provider) -> Result<()> {
+        let mut input = TextArea::default();
+        input.set_cursor_style(Style::default().fg(Color::Yellow));
+
+        self.login_state = Some(LoginState {
+            provider,
+            step: 0,
+            error: None,
+            login_input: input,
+        });
+        self.screen = Screen::Login;
+        Ok(())
+    }
+
+    pub async fn submit_login(&mut self) {
+        let Some(ref login) = self.login_state else {
+            return;
+        };
+        let provider = login.provider;
+        let step = login.step;
+        let input = login.login_input.lines().join("\n").trim().to_string();
+
+        if input.is_empty() {
+            if let Some(ref mut ls) = self.login_state {
+                ls.error = Some("input is empty".into());
+            }
+            return;
+        }
+
+        let result = {
+            let messenger = self.provider_to_messenger_mut(provider).unwrap();
+            messenger.login_step(step, &input).await
+        };
+
+        match result {
+            Ok(LoginStepState::Done) => {
+                let provider = self.login_state.as_ref().map(|s| s.provider);
+
+                // Enable the provider in config and save
+                if let Some(p) = provider {
+                    p.toggle_enabled(&mut self.config.providers);
+                    match self.config.save() {
+                        Ok(()) => {}
+                        Err(e) => {
+                            self.create_popup(PopupKind::Warn(format!(
+                                "Error saving config after submit: {e} - Check your config file"
+                            )));
+                        }
+                    };
+                }
+
+                self.login_state = None;
+                self.screen = Screen::Main;
+
+                self.create_popup(PopupKind::Info(String::from("Logged in successfully")));
+
+                // TODO: error is ignored, make error explicit
+                let _ = self.rebuild_chats().await;
+            }
+            Ok(LoginStepState::NextStep) => {
+                if let Some(ref mut ls) = self.login_state {
+                    ls.step += 1;
+                    ls.error = None;
+                    ls.login_input.clear();
+                }
+            }
+            Err(e) => {
+                if let Some(ref mut ls) = self.login_state {
+                    ls.error = Some(e.to_string());
+                }
+            }
         }
     }
 
-    pub fn handle_backend_event(&mut self, _messenger_index: usize, event: BackendEvent) {
+    pub async fn cancel_login(&mut self) {
+        if let Some(login) = self.login_state.take()
+            && let Some(messenger) = self.provider_to_messenger_mut(login.provider)
+        {
+            messenger.cancel_login().await;
+        }
+        self.screen = Screen::Main;
+    }
+
+    pub fn handle_backend_event(&mut self, _provider: Provider, event: BackendEvent) {
         match event {
             BackendEvent::Connected => {}
             BackendEvent::Disconnected(message) => self.create_popup(PopupKind::Error(message)),
@@ -383,17 +549,17 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::Message;
     use crate::backend::mock::MockMessenger;
+    use crate::backend::{Message, Messenger};
     use tokio::sync::broadcast;
 
     async fn app_state() -> AppState {
         let mut config = Config::default();
-        config.providers.telegram = true;
+        config.providers.telegram.enabled = true;
         let keymap = config.keys.parse().unwrap();
         let mock = MockMessenger::new("Telegram");
         mock.spawn_incoming_messages();
-        let messengers: Vec<Box<dyn Messenger>> = vec![Box::new(mock)];
+        let messengers = vec![MessengerKind::Stub(Box::new(mock))];
         AppState::new(config, keymap, messengers, false).await
     }
 
@@ -480,7 +646,7 @@ mod tests {
         assert!(!state.chat_state.chats[0].unread);
 
         state.handle_backend_event(
-            0,
+            Provider::Telegram,
             BackendEvent::MessageReceived(Message {
                 id: "incoming".into(),
                 chat: ChatId::Telegram(101),
@@ -510,7 +676,7 @@ mod tests {
         state.select_chat(0).await;
 
         state.handle_backend_event(
-            0,
+            Provider::Telegram,
             BackendEvent::MessageReceived(Message {
                 id: "incoming".into(),
                 chat: ChatId::Telegram(103),
@@ -762,10 +928,13 @@ mod tests {
         let bad = StubMessenger::new("WhatsApp")
             .with_chats_error(BackendError::Other("connection refused".into()));
         let mut config = Config::default();
-        config.providers.telegram = true;
+        config.providers.telegram.enabled = true;
         config.providers.whatsapp = true;
         let keymap = config.keys.parse().unwrap();
-        let messengers: Vec<Box<dyn Messenger>> = vec![Box::new(good), Box::new(bad)];
+        let messengers = vec![
+            MessengerKind::Stub(Box::new(good)),
+            MessengerKind::Stub(Box::new(bad)),
+        ];
         let state = AppState::new(config, keymap, messengers, false).await;
         assert_eq!(
             state.chat_state.chats.len(),
@@ -790,9 +959,15 @@ mod tests {
             .with_chats(vec![chat])
             .with_send_error(BackendError::Other("rate limited".into()));
         let mut config = Config::default();
-        config.providers.telegram = true;
+        config.providers.telegram.enabled = true;
         let keymap = config.keys.parse().unwrap();
-        let mut state = AppState::new(config, keymap, vec![Box::new(stub)], false).await;
+        let mut state = AppState::new(
+            config,
+            keymap,
+            vec![MessengerKind::Stub(Box::new(stub))],
+            false,
+        )
+        .await;
         state.chat_state.chat_list_state.select(Some(0));
         state.write.insert_str("hello");
         state.send_message().await;
@@ -820,9 +995,15 @@ mod tests {
             .with_chats(vec![chat])
             .with_history_error(BackendError::Other("timeout".into()));
         let mut config = Config::default();
-        config.providers.telegram = true;
+        config.providers.telegram.enabled = true;
         let keymap = config.keys.parse().unwrap();
-        let mut state = AppState::new(config, keymap, vec![Box::new(stub)], false).await;
+        let mut state = AppState::new(
+            config,
+            keymap,
+            vec![MessengerKind::Stub(Box::new(stub))],
+            false,
+        )
+        .await;
         state.chat_state.chat_list_state.select(Some(0));
         state.select_chat(0).await;
         let popup = state
@@ -849,9 +1030,15 @@ mod tests {
             .with_chats(vec![chat])
             .with_set_read_error(BackendError::Other("permission denied".into()));
         let mut config = Config::default();
-        config.providers.telegram = true;
+        config.providers.telegram.enabled = true;
         let keymap = config.keys.parse().unwrap();
-        let mut state = AppState::new(config, keymap, vec![Box::new(stub)], false).await;
+        let mut state = AppState::new(
+            config,
+            keymap,
+            vec![MessengerKind::Stub(Box::new(stub))],
+            false,
+        )
+        .await;
         state.chat_state.chat_list_state.select(Some(0));
         state.select_chat(0).await;
         let popup = state
@@ -871,11 +1058,17 @@ mod tests {
     async fn backend_error_event_shows_overlay() {
         let stub = StubMessenger::new("Telegram");
         let mut config = Config::default();
-        config.providers.telegram = true;
+        config.providers.telegram.enabled = true;
         let keymap = config.keys.parse().unwrap();
-        let mut state = AppState::new(config, keymap, vec![Box::new(stub)], false).await;
+        let mut state = AppState::new(
+            config,
+            keymap,
+            vec![MessengerKind::Stub(Box::new(stub))],
+            false,
+        )
+        .await;
         state.handle_backend_event(
-            0,
+            Provider::Telegram,
             BackendEvent::Error(
                 "Telegram subscription failed".into(),
                 BackendError::Other("stream closed".into()),
@@ -904,10 +1097,13 @@ mod tests {
         let bad_wa = StubMessenger::new("WhatsApp")
             .with_chats_error(BackendError::Other("connection refused".into()));
         let mut config = Config::default();
-        config.providers.telegram = true;
+        config.providers.telegram.enabled = true;
         config.providers.whatsapp = true;
         let keymap = config.keys.parse().unwrap();
-        let messengers: Vec<Box<dyn Messenger>> = vec![Box::new(bad_tg), Box::new(bad_wa)];
+        let messengers = vec![
+            MessengerKind::Stub(Box::new(bad_tg)),
+            MessengerKind::Stub(Box::new(bad_wa)),
+        ];
         let state = AppState::new(config, keymap, messengers, false).await;
         assert!(state.chat_state.chats.is_empty());
         let popup = state
@@ -916,8 +1112,14 @@ mod tests {
             .expect("combined error popup should exist");
         match &popup.popup_type {
             PopupKind::Error(msg) => {
-                assert!(msg.contains("auth failed"), "should mention auth failed: {msg}");
-                assert!(msg.contains("connection refused"), "should mention connection refused: {msg}");
+                assert!(
+                    msg.contains("auth failed"),
+                    "should mention auth failed: {msg}"
+                );
+                assert!(
+                    msg.contains("connection refused"),
+                    "should mention connection refused: {msg}"
+                );
             }
             other => panic!("expected Error popup, got {other:?}"),
         }

@@ -8,13 +8,26 @@ anyhow = "1"
 async-trait = "0.1"
 ratatui = "0.30"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "sync",
+  "time",
+] }
 
 grammers-client = "0.10"
+grammers-session = { version = "0.10", features = ["sqlite-storage"] }
 
-whatsapp-rust = { git = "https://github.com/jlucaso1/whatsapp-rust", tag = "v0.7.0", default-features = false, features = ["sqlite-storage", "tokio-transport", "tokio-runtime", "ureq-client", "tokio-native"] }
-whatsapp-rust-sqlite-storage = { git = "https://github.com/jlucaso1/whatsapp-rust", tag = "v0.7.0" }
-whatsapp-rust-chat-store = { git = "https://github.com/jlucaso1/whatsapp-rust", tag = "v0.7.0" }
+# BUG: whatsapp-rust's internal dep on whatsapp-rust-sqlite-storage forces
+# bundled-sqlite even with default-features = false on our direct dependency.
+# This conflicts with grammers-session's libsql-ffi at link time (duplicate
+# sqlite3 symbols). Re-enable when whatsapp-rust adds a no-bundled feature.
+whatsapp-rust = { git = "https://github.com/jlucaso1/whatsapp-rust", tag = "v0.7.0", default-features = false, features = [
+  "tokio-transport",
+  "tokio-runtime",
+  "ureq-client",
+  "tokio-native",
+] }
 
 qrcode = "0.14"
 notify-rust = "4"

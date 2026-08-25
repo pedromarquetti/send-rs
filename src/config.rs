@@ -24,8 +24,22 @@ impl Default for Config {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ProvidersConfig {
-    pub telegram: bool,
+    pub telegram: TelegramConfig,
     pub whatsapp: bool,
+}
+
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TelegramConfig {
+    pub enabled: bool,
+    pub api_id: u32,
+    pub api_hash: String,
+}
+
+impl TelegramConfig {
+    pub fn has_credentials(&self) -> bool {
+        self.api_id != 0 && !self.api_hash.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -130,6 +144,7 @@ impl Config {
         Ok(Some(config))
     }
 
+    /// main func to save data to config
     pub fn save(&self) -> Result<()> {
         let path = Self::config_path()?;
         if let Some(parent) = path.parent() {
@@ -259,11 +274,11 @@ mod tests {
     #[test]
     fn config_round_trips_through_toml() {
         let mut config = Config::default();
-        config.providers.telegram = true;
+        config.providers.telegram.enabled = true;
         config.max_write_lines = 3;
         let raw = toml::to_string_pretty(&config).unwrap();
         let back: Config = toml::from_str(&raw).unwrap();
-        assert!(back.providers.telegram);
+        assert!(back.providers.telegram.enabled);
         assert!(!back.providers.whatsapp);
         assert_eq!(back.keys.send, "enter");
         assert_eq!(back.max_write_lines, 3);
@@ -274,7 +289,7 @@ mod tests {
         let raw = "[providers]\nwhatsapp = true\n";
         let config: Config = toml::from_str(raw).unwrap();
         assert_eq!(config.keys.send, "enter");
-        assert!(!config.providers.telegram);
+        assert!(!config.providers.telegram.enabled);
         assert!(config.providers.whatsapp);
         assert_eq!(config.max_write_lines, 5);
     }

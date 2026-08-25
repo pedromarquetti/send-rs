@@ -32,8 +32,8 @@ impl StatefulWidget for ChatList<'_> {
         let block = Block::bordered().title(" Chats ").border_style(border);
 
         if self.chats.is_empty() {
-            let message = Paragraph::new("No chats yet.\nPress s to enable a provider.")
-                .block(block);
+            let message =
+                Paragraph::new("No chats yet.\nPress s to enable a provider.").block(block);
             message.render(area, buf);
             return;
         }

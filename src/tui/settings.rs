@@ -1,6 +1,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, StatefulWidget, Widget};
 
+use crate::backend::Provider;
 use crate::config::ProvidersConfig;
 
 pub struct Settings<'a> {
@@ -22,18 +23,22 @@ impl StatefulWidget for Settings<'_> {
             .title(" Settings ")
             .border_style(Style::default().fg(Color::Yellow));
 
-        let providers = [
-            ("Telegram", self.providers.telegram),
-            ("WhatsApp", self.providers.whatsapp),
-        ];
+        let providers: Vec<Provider> = Provider::all().to_vec();
+
         let items: Vec<ListItem> = providers
             .iter()
-            .map(|(name, enabled)| {
-                let marker = if *enabled { "[x]" } else { "[ ]" };
-                let status = if *enabled { "enabled" } else { "disabled" };
-                ListItem::new(Line::from(Span::raw(format!(
-                    "{marker} {name} — {status} (Enter toggles, connect is mocked)"
-                ))))
+            .map(|p| {
+                let name = p.name();
+                let enabled = p.is_enabled(self.providers);
+                let has_creds = p.has_credentials(self.providers);
+                let (marker, status) = if enabled {
+                    ("[x]", "enabled")
+                } else if has_creds {
+                    ("[ ]", "disabled — Enter to enable")
+                } else {
+                    ("[-]", "no credentials")
+                };
+                ListItem::new(Line::from(Span::raw(format!("{marker} {name} — {status}"))))
             })
             .collect();
         let list = List::new(items)
