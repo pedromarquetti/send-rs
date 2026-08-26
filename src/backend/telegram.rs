@@ -77,8 +77,9 @@ impl Messenger for TelegramMessenger {
     }
 
     async fn chats(&self) -> Result<Vec<Chat>, BackendError> {
-        // Phase 2: will iterate dialogs and map to Chat
+        info!("Fetching Telegram dialogs...");
         Err(BackendError::Other("not implemented yet".into()))
+        info!("Loaded {} Telegram dialogs", chats.len());
     }
 
     async fn set_read(&mut self, _chat: &ChatId) -> Result<(), BackendError> {
@@ -144,6 +145,7 @@ impl Messenger for TelegramMessenger {
     ) -> Result<LoginStepState, BackendError> {
         match step {
             0 => {
+                info!(phone = input, "Telegram login: requesting code");
                 let token = self
                     .client
                     .request_login_code(input, &self.api_hash)
@@ -158,9 +160,14 @@ impl Messenger for TelegramMessenger {
 
                 match token {
                     LoginToken::CodeRequested { token } => {
+                        info!("Telegram login: submitting code");
                         match self.client.sign_in(&token, input).await {
-                            Ok(_user) => Ok(LoginStepState::Done),
+                            Ok(_user) => {
+                                info!("Telegram login: success");
+                                Ok(LoginStepState::Done)
+                            }
                             Err(SignInError::PasswordRequired(password_token)) => {
+                                info!("Telegram login: 2FA password required");
                                 *self.login_token.write().await =
                                     Some(LoginToken::PasswordRequired {
                                         token: password_token,
@@ -168,13 +175,18 @@ impl Messenger for TelegramMessenger {
                                 Ok(LoginStepState::NextStep)
                             }
                             Err(SignInError::InvalidCode) => {
+                                warn!("Telegram login: invalid code");
                                 Err(BackendError::Other("invalid code".into()))
                             }
-                            Err(SignInError::SignUpRequired) => Err(BackendError::Other(
+                            Err(SignInError::SignUpRequired) => {
+                                warn!("Telegram login: sign-up required");
+                                Err(BackendError::Other(
                                 "sign-up required – create an account with an official Telegram client first"
                                     .into(),
-                            )),
+                            ))
+                            }
                             Err(other) => {
+                                error!("Telegram login failed: {other}");
                                 Err(BackendError::Other(format!("sign-in failed: {other}")))
                             }
                         }
@@ -194,14 +206,22 @@ impl Messenger for TelegramMessenger {
 
                 match token {
                     LoginToken::PasswordRequired { token } => {
+                        info!("Telegram login: submitting 2FA password");
                         match self.client.check_password(token, input.as_bytes()).await {
-                            Ok(_user) => Ok(LoginStepState::Done),
+                            Ok(_user) => {
+                                info!("Telegram login: 2FA success");
+                                Ok(LoginStepState::Done)
+                            }
                             Err(SignInError::InvalidPassword(_)) => {
+                                warn!("Telegram login: invalid password");
                                 Err(BackendError::Other("invalid password".into()))
                             }
-                            Err(other) => Err(BackendError::Other(format!(
-                                "password check failed: {other}"
-                            ))),
+                            Err(other) => {
+                                error!("Telegram password check failed: {other}");
+                                Err(BackendError::Other(format!(
+                                    "password check failed: {other}"
+                                )))
+                            }
                         }
                     }
                     LoginToken::CodeRequested { .. } => Err(BackendError::Other(

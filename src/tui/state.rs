@@ -5,11 +5,12 @@ use ratatui_textarea::{TextArea, WrapMode};
 use std::collections::HashMap;
 
 use crate::backend::{
-    BackendError, BackendEvent, Chat, ChatId, LoginStepState, MessengerKind, Provider,
+    BackendError, BackendEvent, Chat, ChatId, LoginStepState, Message, MessengerKind, Provider,
 };
 use crate::config::{Config, Keymap};
 use crate::tui::chat::{ChatState, OpenChat};
 use crate::tui::popup::PopupKind;
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -121,6 +122,7 @@ impl AppState {
     }
 
     pub async fn rebuild_chats(&mut self) -> Vec<BackendError> {
+        debug!("Rebuilding chat list from all providers");
         let saved_scrolls: HashMap<ChatId, usize> = self
             .chat_state
             .chats
@@ -142,6 +144,7 @@ impl AppState {
                     }
                 }
                 Err(e) => {
+                    warn!(provider = provider.name(), error = %e, "Failed to fetch chats");
                     errors.push(e);
                 }
             }
@@ -157,6 +160,7 @@ impl AppState {
                 .map(|i| i.min(len - 1))
         };
         self.chat_state.chat_list_state.select(index);
+        debug!(total = len, "Chat list rebuilt");
         errors
     }
 
@@ -223,6 +227,8 @@ impl AppState {
             return;
         };
 
+        debug!(chat = %chat.contact_name, id = ?chat.id, "Opening chat");
+
         // Save current draft and message selection before switching
         if let Some(current_chat_id) = self
             .chat_state
@@ -242,6 +248,7 @@ impl AppState {
             None => Ok(()),
         };
         if let Err(e) = read_result {
+            warn!(chat = %chat.contact_name, error = %e, "Failed to mark chat as read");
             self.create_popup(PopupKind::Error(format!(
                 "{} failed to mark chat as read: {e}",
                 chat.id.platform()
@@ -256,6 +263,7 @@ impl AppState {
         match history_result {
             Ok(messages) => {
                 let history_len = messages.len();
+                debug!(chat = %chat.contact_name, messages = history_len, "History loaded");
                 self.chat_state.open_chat = Some(OpenChat {
                     chat: chat.clone(),
                     history: messages,
@@ -263,6 +271,7 @@ impl AppState {
                 self.chat_state.restore_message_selection(history_len);
             }
             Err(e) => {
+                error!(chat = %chat.contact_name, error = %e, "Failed to load history");
                 self.chat_state.open_chat = None;
                 self.create_popup(PopupKind::Error(format!(
                     "{} failed to load history for {}: {e}",
@@ -511,9 +520,13 @@ impl AppState {
 
     pub fn handle_backend_event(&mut self, _provider: Provider, event: BackendEvent) {
         match event {
-            BackendEvent::Connected => {}
-            BackendEvent::Disconnected(message) => self.create_popup(PopupKind::Error(message)),
+            BackendEvent::Connected => info!("Backend connected"),
+            BackendEvent::Disconnected(message) => {
+                warn!(message, "Backend disconnected");
+                self.create_popup(PopupKind::Error(message));
+            }
             BackendEvent::Error(context, err) => {
+                error!(context, error = %err, "Backend error");
                 self.create_popup(PopupKind::Error(format!("{context}: {err}")))
             }
             BackendEvent::MessageReceived(message) => {
@@ -522,24 +535,49 @@ impl AppState {
                     .selected_chat_idx()
                     .and_then(|i| self.chat_state.chats.get(i))
                     .map(|c| c.id.clone());
-                if let Some((_, chat)) = self.chat_state.find_mut(&message.chat) {
+                let open_chat_id = self
+                    .chat_state
+                    .open_chat
+                    .as_ref()
+                    .map(|o| o.chat.id.clone());
+                let found = self.chat_state.find_mut(&message.chat);
+                debug!(
+                    chat = ?message.chat,
+                    from_me = message.from_me,
+                    is_open,
+                    sidebar_found = found.is_some(),
+                    open_chat_id = ?open_chat_id,
+                    text_preview = &message.text[..message.text.len().min(60)],
+                    "TUI MessageReceived",
+                );
+                if let Some((_, chat)) = found {
                     chat.last_message = Some(format!("{}: {}", message.sender, message.text));
                     if !message.from_me && !is_open && selected_id.as_ref() != Some(&message.chat) {
                         chat.unread = true;
                         chat.unread_count = chat.unread_count.saturating_add(1);
+                        debug!(chat = ?message.chat, "TUI set unread");
                     }
+                } else {
+                    debug!(chat = ?message.chat, "TUI MessageReceived: chat not found in sidebar");
                 }
             }
 
             BackendEvent::ChatUpdated(chat) => {
-                if let Some(entry) = self
+                let found = self
                     .chat_state
                     .chats
                     .iter_mut()
-                    .find(|entry| entry.id == chat.id)
-                {
+                    .find(|entry| entry.id == chat.id);
+                debug!(
+                    chat = ?chat.id,
+                    sidebar_found = found.is_some(),
+                    "TUI ChatUpdated",
+                );
+                if let Some(entry) = found {
                     entry.contact_name = chat.contact_name;
                     entry.last_message = chat.last_message;
+                    entry.unread = chat.unread;
+                    entry.unread_count = chat.unread_count;
                 }
             }
         }

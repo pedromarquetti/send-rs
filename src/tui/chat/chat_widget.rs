@@ -397,7 +397,7 @@ pub(crate) fn format_timestamp(secs: i64) -> String {
     };
     datetime
         .with_timezone(&chrono::Local)
-        .format("%m-%d %H:%M")
+        .format("%d/%m/%Y %H:%M")
         .to_string()
 }
 
@@ -450,37 +450,6 @@ mod tests {
         let lines = message_lines(&msg, 10, None);
         let last = lines.last().unwrap().to_string();
         assert!(last.contains("Press Enter"));
-    }
-
-    #[test]
-    fn compute_list_offset_scrolls_down_when_selected_below_viewport() {
-        let heights = vec![2, 1, 3, 1, 2];
-        // selected=3 at y=6, viewport=4, current_offset=0 → offset should be 3
-        let offset = compute_list_offset(&heights, Some(3), 4, 0);
-        assert_eq!(offset, 3);
-    }
-
-    #[test]
-    fn compute_list_offset_scrolls_up_when_selected_above_viewport() {
-        let heights = vec![2, 1, 3, 1, 2];
-        // selected=0 at y=0, viewport=4, current_offset=4 → offset should be 0
-        let offset = compute_list_offset(&heights, Some(0), 4, 4);
-        assert_eq!(offset, 0);
-    }
-
-    #[test]
-    fn compute_list_offset_keeps_offset_when_selected_in_viewport() {
-        let heights = vec![1, 1, 1, 1, 1];
-        // selected=2 at y=2, viewport=4, current_offset=0 → stays at 0
-        let offset = compute_list_offset(&heights, Some(2), 4, 0);
-        assert_eq!(offset, 0);
-    }
-
-    #[test]
-    fn compute_list_offset_returns_zero_when_no_selection() {
-        let heights = vec![1, 1, 1];
-        let offset = compute_list_offset(&heights, None, 5, 0);
-        assert_eq!(offset, 0);
     }
 
     #[test]

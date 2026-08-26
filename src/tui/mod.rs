@@ -7,8 +7,10 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::widgets::{StatefulWidget, Widget};
 use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc;
+use tokio::time::{Duration, MissedTickBehavior};
+use tracing::{debug, error, info};
 
-use crate::backend::{AuthSteps, BackendEvent, MessageAction, MessengerKind, Provider};
+use crate::backend::{AuthSteps, BackendEvent, ChatId, MessageAction, MessengerKind, Provider};
 use crate::config::{Config, Keymap};
 use crate::tui::chat::chat_list::ChatList;
 use crate::tui::chat::chat_widget::ChatWidget;
@@ -72,6 +74,7 @@ async fn run_app(
     }
 
     let mut app = App::new(config, keymap, messengers, open_settings).await;
+    info!("TUI started");
 
     loop {
         terminal.draw(|frame| app.draw(frame))?;
@@ -453,5 +456,14 @@ impl App {
             .selected_chat()
             .map(|c| c.contact_name.clone());
         StatusBarWidget::new(name, self.state.focus).render(vertical[1], frame.buffer_mut());
+
+        if let Some(open) = &self.state.chat_state.open_chat {
+            debug!(
+                chat = %open.chat.contact_name,
+                history_len = open.history.len(),
+                focus = ?self.state.focus,
+                "TUI render complete"
+            );
+        }
     }
 }

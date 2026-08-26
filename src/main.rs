@@ -9,9 +9,35 @@ mod tui;
 use anyhow::Result;
 use backend::MessengerKind;
 use backend::mock::MockMessenger;
+use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let log_path = dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("sender")
+        .join("sender.log");
+
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .with_ansi(false)
+        .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new(
+            "%Y-%m-%dT%H:%M:%S%.6f".to_string(),
+        ))
+        .with_writer(std::sync::Mutex::new(log_file))
+        .init();
+
     let first_boot = !config::Config::exists();
     let config = config::Config::load()?.unwrap_or_default();
     let keymap = config.keys.parse()?;
@@ -19,6 +45,8 @@ async fn main() -> Result<()> {
     if first_boot {
         config.save()?;
     }
+
+    info!("sender v{} starting", env!("CARGO_PKG_VERSION"));
 
     let mut messengers: Vec<MessengerKind> = Vec::new();
 
@@ -33,9 +61,16 @@ async fn main() -> Result<()> {
         )
         .await
         {
-            Ok(tg) => messengers.push(MessengerKind::Telegram(tg)),
-            Err(e) => eprintln!("Telegram init failed: {e}"),
+            Ok(tg) => {
+                info!("Telegram messenger initialized");
+                messengers.push(MessengerKind::Telegram(tg));
+            }
+            Err(e) => {
+                tracing::error!("Telegram init failed: {e}");
+            }
         }
+    } else {
+        info!("Telegram: no credentials configured, skipping");
     }
 
     // TODO: replace MockMessenger with real WhatsApp backend.
