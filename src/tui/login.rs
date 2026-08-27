@@ -57,6 +57,7 @@ impl StatefulWidget for LoginScreen<'_> {
                 spans
             })
             .collect();
+
         let progress_line = Line::from(progress);
 
         // Error message

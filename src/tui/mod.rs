@@ -14,12 +14,14 @@ use crate::backend::{AuthSteps, BackendEvent, ChatId, MessageAction, MessengerKi
 use crate::config::{Config, Keymap};
 use crate::tui::chat::chat_list::ChatList;
 use crate::tui::chat::chat_widget::ChatWidget;
+use crate::tui::loading::{LoadingSpinner, LoadingWidget};
 use crate::tui::popup::PopupKind;
 use crate::tui::settings::Settings;
 use crate::tui::state::{AppState, Focus, Screen};
 use crate::tui::status_bar::StatusBarWidget;
 
 mod chat;
+mod loading;
 mod login;
 mod popup;
 mod settings;
@@ -32,6 +34,10 @@ enum UiEvent {
     Backend(Provider, BackendEvent),
     Resize(u16, u16),
     HistoryRefresh(ChatId, Vec<crate::backend::Message>),
+    ChatsLoaded {
+        chats: Vec<crate::backend::Chat>,
+        errors: Vec<crate::backend::BackendError>,
+    },
 }
 
 pub async fn run(
@@ -43,9 +49,9 @@ pub async fn run(
     let mut terminal = ratatui::init();
     // Let the terminal send pasted text as a single bracketed-paste event instead of a stream of
     // raw keys, so multi-line paste cannot trigger Enter=send mid-paste.
-    let _ = std::io::stdout().execute(EnableBracketedPaste)?;
+    std::io::stdout().execute(EnableBracketedPaste)?;
     let result = run_app(&mut terminal, config, keymap, messengers, open_settings).await;
-    let _ = std::io::stdout().execute(DisableBracketedPaste)?;
+    let _ = std::io::stdout().execute(DisableBracketedPaste);
     ratatui::restore();
     result
 }
@@ -76,6 +82,18 @@ async fn run_app(
 
     let mut app = App::new(config, keymap, messengers, open_settings).await;
     info!("TUI started");
+
+    // Kick off the initial chat list fetch in the background so the UI renders
+    // immediately (non-blocking startup). Results arrive via `ChatsLoaded`.
+    let chat_loader_tx = tx.clone();
+    let loader_messengers = app.state.messengers.clone();
+    let loader_providers = app.state.config.providers.clone();
+
+    tokio::spawn(async move {
+        let (chats, errors) =
+            crate::tui::state::fetch_all_chats(&loader_messengers, &loader_providers).await;
+        let _ = chat_loader_tx.send(UiEvent::ChatsLoaded { chats, errors });
+    });
 
     let mut chat_poll_interval = tokio::time::interval(Duration::from_secs(
         app.state.config.chat_poll_interval_secs,
@@ -174,6 +192,14 @@ async fn run_app(
                         app.state.update_sidebar_from_poll(&chat_id, &history);
                         app.state.chat_state.refresh_chat_history(&chat_id, history);
                     }
+                    UiEvent::ChatsLoaded { chats, errors } => {
+                        debug!(
+                            chats = chats.len(),
+                            errors = errors.len(),
+                            "ChatsLoaded applied"
+                        );
+                        app.state.apply_fetched(chats, errors);
+                    }
                 }
                 if !app.state.running {
                     break;
@@ -212,6 +238,7 @@ fn spawn_terminal_reader(tx: mpsc::UnboundedSender<UiEvent>) {
 
 struct App {
     state: AppState,
+    loading_spinner: LoadingSpinner,
 }
 
 impl App {
@@ -223,11 +250,14 @@ impl App {
     ) -> Self {
         Self {
             state: AppState::new(config, keymap, messengers, open_settings).await,
+            loading_spinner: LoadingSpinner::new(),
         }
     }
 
     async fn handle_key(&mut self, key: KeyEvent) {
         // TODO: add a overlay menu / screen to display all the keymappings
+        // TODO: Add a graceful shutdown? all messages should be sent before shutting down the
+        // app - verify if possible
         if key == self.state.keymap.quit {
             self.state.running = false;
             return;
@@ -463,6 +493,7 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut Frame) {
+        self.loading_spinner.tick();
         match self.state.screen {
             Screen::Main => self.draw_main(frame),
             Screen::Settings => {
@@ -482,7 +513,22 @@ impl App {
                         let masked = steps.get(step) == Some(&AuthSteps::Password);
 
                         if let Some(ls) = self.state.login_state.as_mut() {
+                            // BUG: this is not working: pressing enter to go to next
+                            // step is not triggering a loading widget
+                            if ls.submitting {
+                                let step_label =
+                                    steps.get(step).map(|s| s.to_string()).unwrap_or_default();
+                                LoadingWidget::new(
+                                    &format!(" {} — {} ", provider.name(), step_label),
+                                    Some(format!("Waiting for {} ...", provider.name())),
+                                    &mut self.loading_spinner,
+                                )
+                                .render(frame.area(), frame.buffer_mut());
+                                return;
+                            }
+
                             ls.login_input.set_placeholder_text(placeholder);
+
                             if masked {
                                 ls.login_input.set_mask_char('●');
                             } else {
@@ -513,6 +559,7 @@ impl App {
     fn draw_main(&mut self, frame: &mut Frame) {
         let area = frame.area();
         let vertical = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(area);
+
         let horizontal =
             Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)])
                 .split(vertical[0]);
@@ -527,6 +574,15 @@ impl App {
             frame.buffer_mut(),
             &mut self.state.chat_state.chat_list_state,
         );
+
+        if !self.state.chats_loaded && self.state.chat_state.chats.is_empty() {
+            LoadingWidget::new(
+                " Sender ",
+                Some("Fetching chats...".to_string()),
+                &mut self.loading_spinner,
+            )
+            .render(horizontal[0], frame.buffer_mut());
+        }
 
         ChatWidget::new(
             self.state.focus,

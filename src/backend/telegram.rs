@@ -29,13 +29,13 @@ pub enum LoginToken {
     },
 }
 
+#[derive(Clone)]
 pub struct TelegramMessenger {
     client: Client,
     api_hash: String,
     tx: broadcast::Sender<BackendEvent>,
     login_token: Arc<RwLock<Option<LoginToken>>>,
-    updates: Mutex<Option<mpsc::UnboundedReceiver<UpdatesLike>>>,
-    cached_dialogs: Mutex<Vec<Dialog>>,
+    cached_dialogs: Arc<Mutex<Vec<Dialog>>>,
     sync_update_state_secs: u64,
 }
 
@@ -73,20 +73,15 @@ impl TelegramMessenger {
             api_hash: api_hash.to_string(),
             tx,
             login_token: Arc::new(RwLock::new(None)),
-            updates: Mutex::new(Some(updates)),
-            cached_dialogs: Mutex::new(Vec::new()),
+            cached_dialogs: Arc::new(Mutex::new(Vec::new())),
             sync_update_state_secs,
         };
 
-        messenger.spawn_update_listener();
+        messenger.spawn_update_listener(updates);
         Ok(messenger)
     }
 
-    fn spawn_update_listener(&self) {
-        let updates = match self.updates.lock().unwrap().take() {
-            Some(u) => u,
-            None => return,
-        };
+    fn spawn_update_listener(&self, updates: mpsc::UnboundedReceiver<UpdatesLike>) {
         let client = self.client.clone();
         let tx = self.tx.clone();
         let sync_secs = self.sync_update_state_secs;
@@ -336,7 +331,6 @@ impl Messenger for TelegramMessenger {
 
         let mut messages_rev = Vec::new();
         let mut msg_iter = self.client.iter_messages(peer_ref).limit(100);
-
         while let Some(msg) = msg_iter.next().await? {
             let sender = if msg.outgoing() {
                 "You".to_string()
@@ -347,18 +341,11 @@ impl Messenger for TelegramMessenger {
                     .to_string()
             };
 
-            let text = if msg.media().is_some() {
-                //TODO: implement media handling
-                "[media]".to_string()
-            } else {
-                msg.text().to_string()
-            };
-
             messages_rev.push(Message {
                 id: msg.id().to_string(),
                 chat: chat.clone(),
                 sender,
-                text,
+                text: msg.text().to_string(),
                 timestamp: msg.date().timestamp(),
                 from_me: msg.outgoing(),
                 options: Vec::new(),

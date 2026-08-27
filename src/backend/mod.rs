@@ -248,6 +248,17 @@ pub enum MessengerKind {
     Stub(Box<dyn Messenger>),
 }
 
+impl Clone for MessengerKind {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Telegram(m) => Self::Telegram(m.clone()),
+            Self::WhatsApp(m) => Self::WhatsApp(m.clone()),
+            #[cfg(test)]
+            Self::Stub(_) => panic!("MessengerKind::Stub is not cloneable"),
+        }
+    }
+}
+
 macro_rules! delegate_match {
     ($self:expr, $name:ident, ($($args:expr),*), async) => {
         match $self {

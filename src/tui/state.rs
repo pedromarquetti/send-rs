@@ -48,6 +48,11 @@ pub struct AppState {
 
     /// Active login session, if any.
     pub login_state: Option<LoginState>,
+
+    /// True once the initial chat list has finished loading from all providers.
+    /// While false, the chat pane shows the loading widget instead of a blank
+    /// terminal (non-blocking startup).
+    pub chats_loaded: bool,
 }
 
 pub struct LoginState {
@@ -59,6 +64,8 @@ pub struct LoginState {
     pub error: Option<String>,
     /// Text input reused by the generic login screen.
     pub login_input: TextArea<'static>,
+    /// True while an auth step RPC is in flight (drives the loading widget).
+    pub submitting: bool,
 }
 
 pub struct PopupState {
@@ -99,16 +106,9 @@ impl AppState {
             chat_state: Default::default(),
             running: true,
             login_state: None,
+            chats_loaded: false,
         };
-        let errors = app.rebuild_chats().await;
-        if !errors.is_empty() {
-            let msg = errors
-                .iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-                .join("\n");
-            app.create_popup(PopupKind::Error(msg));
-        }
+
         if open_settings {
             app.create_popup(PopupKind::Info(String::from(
                 "Welcome! Press Enter on a provider to enable it.",
@@ -121,34 +121,22 @@ impl AppState {
         self.chat_state.chat_list_state.selected()
     }
 
-    pub async fn rebuild_chats(&mut self) -> Vec<BackendError> {
-        debug!("Rebuilding chat list from all providers");
+    /// Apply a previously fetched chat list to the TUI chat state, preserving
+    /// each chat's saved scroll position.
+    pub fn apply_chats(&mut self, chats: Vec<Chat>) {
         let saved_scrolls: HashMap<ChatId, usize> = self
             .chat_state
             .chats
             .iter()
             .map(|chat| (chat.id.clone(), chat.scroll))
             .collect();
-        let mut chat_list = Vec::new();
-        let mut errors: Vec<BackendError> = Vec::new();
-        for messenger in &self.messengers {
-            let provider = messenger.provider();
-            if !provider.is_enabled(&self.config.providers) {
-                continue;
-            }
-            match messenger.chats().await {
-                Ok(chats) => {
-                    for chat in chats {
-                        let scroll = saved_scrolls.get(&chat.id).copied().unwrap_or(0);
-                        chat_list.push(Chat { scroll, ..chat });
-                    }
-                }
-                Err(e) => {
-                    warn!(provider = provider.name(), error = %e, "Failed to fetch chats");
-                    errors.push(e);
-                }
-            }
-        }
+        let chat_list: Vec<Chat> = chats
+            .into_iter()
+            .map(|chat| {
+                let scroll = saved_scrolls.get(&chat.id).copied().unwrap_or(0);
+                Chat { scroll, ..chat }
+            })
+            .collect();
         self.chat_state.chats = chat_list;
         let len = self.chat_state.chats.len();
         let index = if len == 0 {
@@ -160,8 +148,32 @@ impl AppState {
                 .map(|i| i.min(len - 1))
         };
         self.chat_state.chat_list_state.select(index);
-        debug!(total = len, "Chat list rebuilt");
+        debug!(total = len, "Chat list applied");
+    }
+
+    pub async fn rebuild_chats(&mut self) -> Vec<BackendError> {
+        debug!("Rebuilding chat list from all providers");
+        let (chats, errors) = fetch_all_chats(&self.messengers, &self.config.providers).await;
+        self.apply_chats(chats);
         errors
+    }
+
+    /// Apply the result of a (background) chat fetch: populate the chat list,
+    /// mark loading as complete, and surface any provider errors as a popup.
+    /// Shared by the TUI event loop and tests so error-surfacing logic stays in
+    /// one place.
+    pub fn apply_fetched(&mut self, chats: Vec<Chat>, errors: Vec<BackendError>) {
+        self.apply_chats(chats);
+        self.chats_loaded = true;
+        if !errors.is_empty() {
+            self.create_popup(PopupKind::Error(
+                errors
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ));
+        }
     }
 
     /// Update the sidebar entry for `chat_id` after a poll refresh detected new messages.
@@ -377,8 +389,17 @@ impl AppState {
             provider.toggle_enabled(&mut self.config.providers);
             match self.config.save() {
                 Ok(()) => {
-                    let _ = self.rebuild_chats().await;
+                    let errors = self.rebuild_chats().await;
                     self.create_popup(PopupKind::Info(format!("{name} disabled")));
+                    if !errors.is_empty() {
+                        self.create_popup(PopupKind::Error(
+                            errors
+                                .iter()
+                                .map(|e| e.to_string())
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        ));
+                    }
                 }
                 Err(e) => {
                     self.create_popup(PopupKind::Error(format!("could not save config: {e}")))
@@ -442,8 +463,9 @@ impl AppState {
         }
 
         // Navigate to login screen
-        // TODO: handle error
-        let _ = self.start_login(provider);
+        if let Err(e) = self.start_login(provider) {
+            self.create_popup(PopupKind::Error(format!("could not start login: {e}")));
+        }
     }
 
     pub fn start_login(&mut self, provider: Provider) -> Result<()> {
@@ -455,6 +477,7 @@ impl AppState {
             step: 0,
             error: None,
             login_input: input,
+            submitting: false,
         });
         self.screen = Screen::Login;
         Ok(())
@@ -475,10 +498,18 @@ impl AppState {
             return;
         }
 
+        if let Some(ref mut ls) = self.login_state {
+            ls.submitting = true;
+        }
+
         let result = {
             let messenger = self.provider_to_messenger_mut(provider).unwrap();
             messenger.login_step(step, &input).await
         };
+
+        if let Some(ref mut ls) = self.login_state {
+            ls.submitting = false;
+        }
 
         match result {
             Ok(LoginStepState::Done) => {
@@ -502,9 +533,18 @@ impl AppState {
 
                 self.create_popup(PopupKind::Info(String::from("Logged in successfully")));
 
-                // TODO: error is ignored, make error explicit
-                let _ = self.rebuild_chats().await;
+                let errors = self.rebuild_chats().await;
+                if !errors.is_empty() {
+                    self.create_popup(PopupKind::Error(
+                        errors
+                            .iter()
+                            .map(|e| e.to_string())
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    ));
+                }
             }
+
             Ok(LoginStepState::NextStep) => {
                 if let Some(ref mut ls) = self.login_state {
                     ls.step += 1;
@@ -598,6 +638,35 @@ impl AppState {
     }
 }
 
+/// Fetch the chat list from all enabled providers, returning raw chats and any
+/// per-provider errors. Does not mutate any state and does not borrow [`AppState`],
+/// so it may be driven from a background task that owns its own messenger/config
+/// clones (used for non-blocking startup).
+pub async fn fetch_all_chats(
+    messengers: &[MessengerKind],
+    providers: &crate::config::ProvidersConfig,
+) -> (Vec<Chat>, Vec<BackendError>) {
+    let mut chat_list = Vec::new();
+    let mut errors: Vec<BackendError> = Vec::new();
+
+    for messenger in messengers {
+        let provider = messenger.provider();
+
+        if !provider.is_enabled(providers) {
+            continue;
+        }
+
+        match messenger.chats().await {
+            Ok(chats) => chat_list.extend(chats),
+            Err(e) => {
+                warn!(provider = provider.name(), error = %e, "Failed to fetch chats");
+                errors.push(e);
+            }
+        }
+    }
+    (chat_list, errors)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -612,7 +681,19 @@ mod tests {
         let mock = MockMessenger::new("Telegram");
         mock.spawn_incoming_messages();
         let messengers = vec![MessengerKind::Stub(Box::new(mock))];
-        AppState::new(config, keymap, messengers, false).await
+        let mut app = AppState::new(config, keymap, messengers, false).await;
+        // Mirror non-blocking startup: independently fetch and apply chats.
+        let (chats, _) = fetch_all_chats(&app.messengers, &app.config.providers).await;
+        app.apply_chats(chats);
+        app.chats_loaded = true;
+        app
+    }
+
+    /// Fetch chats from the state's messengers and apply them (plus any errors),
+    /// as the TUI event loop does on `ChatsLoaded`.
+    async fn fetch_and_apply(state: &mut AppState) {
+        let (chats, errors) = fetch_all_chats(&state.messengers, &state.config.providers).await;
+        state.apply_fetched(chats, errors);
     }
 
     #[tokio::test]
@@ -987,7 +1068,8 @@ mod tests {
             MessengerKind::Stub(Box::new(good)),
             MessengerKind::Stub(Box::new(bad)),
         ];
-        let state = AppState::new(config, keymap, messengers, false).await;
+        let mut state = AppState::new(config, keymap, messengers, false).await;
+        fetch_and_apply(&mut state).await;
         assert_eq!(
             state.chat_state.chats.len(),
             4,
@@ -1020,6 +1102,7 @@ mod tests {
             false,
         )
         .await;
+        fetch_and_apply(&mut state).await;
         state.chat_state.chat_list_state.select(Some(0));
         state.write.insert_str("hello");
         state.send_message().await;
@@ -1056,6 +1139,7 @@ mod tests {
             false,
         )
         .await;
+        fetch_and_apply(&mut state).await;
         state.chat_state.chat_list_state.select(Some(0));
         state.select_chat(0).await;
         let popup = state
@@ -1091,6 +1175,7 @@ mod tests {
             false,
         )
         .await;
+        fetch_and_apply(&mut state).await;
         state.chat_state.chat_list_state.select(Some(0));
         state.select_chat(0).await;
         let popup = state
@@ -1156,7 +1241,8 @@ mod tests {
             MessengerKind::Stub(Box::new(bad_tg)),
             MessengerKind::Stub(Box::new(bad_wa)),
         ];
-        let state = AppState::new(config, keymap, messengers, false).await;
+        let mut state = AppState::new(config, keymap, messengers, false).await;
+        fetch_and_apply(&mut state).await;
         assert!(state.chat_state.chats.is_empty());
         let popup = state
             .pop_up

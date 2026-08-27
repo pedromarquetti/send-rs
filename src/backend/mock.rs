@@ -11,6 +11,7 @@ const ALICE_ID: ChatId = ChatId::Telegram(103);
 const ECHO_ID: ChatId = ChatId::Telegram(104);
 const ECHO_SENDER: &str = "Echo Bot";
 
+#[derive(Clone)]
 pub struct MockMessenger {
     name: &'static str,
     state: Arc<Mutex<State>>,
