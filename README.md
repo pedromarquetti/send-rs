@@ -36,28 +36,51 @@ land.
 
 ```toml
 max_write_lines = 5
+chat_poll_interval_secs = 2
+sync_update_state_secs = 60
+sidebar_sync_secs = 10
 
 [keys]
-up = "k"
-down = "j"
+scroll_up = "k"
+scroll_down = "j"
 select = "enter"
 pane_next = "tab"
+pane_prev = "shift+tab"
 dismiss = "esc"
 quit = "ctrl+c"
 open_settings = "s"
 focus_write = "i"
+scroll_to_bottom = "G"
 send = "enter"
 newline = "shift+enter"
 
+[providers.telegram]
+enabled = true
+api_id = 12345678
+api_hash = "your_api_hash_here"
+
 [providers]
-telegram = true
 whatsapp = false
 ```
 
-Key values are written as `key` or `modifier+key` (`ctrl+c`, `alt+enter`,
-`shift+tab`, `pgup`, `f1`, ...). Omitted keys fall back to the defaults above.
-`max_write_lines` controls how many text lines the Write box can grow to
-(default `5`); the input wraps long lines and scrolls once it exceeds that.
+> [!NOTE]
+> Key values are written as `key` or `modifier+key` (`ctrl+c`, `alt+enter`,
+> `shift+tab`, `pgup`, `f1`, ...). Omitted keys fall back to the defaults above.
+
+#### Top-level options
+
+| Key                      | Default | Description                                                                                                                                                                                                                                                                                                   |
+| ------------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `max_write_lines`        | `5`     | How many text lines the Write box can grow to. The input wraps long lines and scrolls once it exceeds that.                                                                                                                                                                                                   |
+| `chat_poll_interval_secs`     | `2`     | How often (in seconds) the TUI polls for new messages in the **currently open** chat. Lower values feel more responsive but use more resources.                                                                                                                                                               |
+| `sync_update_state_secs` | `60`   | How often (in seconds) the Telegram client persists its internal update-state (pts/qts/seq) to the session file. This does **not** call any Telegram API — it only saves local state so that `catch_up` on restart is faster.                                                                                 |
+| `sidebar_sync_secs`      | `10`    | How often (in seconds) the TUI fetches the full dialog list from Telegram to detect **unread-count changes across all chats**. This is the mechanism that updates unread indicators on chats you are not currently viewing. Increase this if you notice high CPU usage; decrease it for snappier unread dots. |
+
+#### Providers
+
+Telegram credentials are stored under `[providers.telegram]`. You can toggle
+`enabled` from the settings screen, but `api_id` / `api_hash` must be set in the
+config file first (see [Telegram Setup](#telegram-setup)).
 
 ### Telegram Setup
 
@@ -68,6 +91,19 @@ You need to get API credentials from my.telegram.org:
 3. Go to "API development tools"
 4. Fill in the form (App title, Short name, etc. — can be anything)
 5. You'll receive an App api_id (number) and App api_hash (string)
+
+Add them to your `config.toml`:
+
+```toml
+[providers.telegram]
+enabled = true
+api_id = 12345678
+api_hash = "your_api_hash_here"
+```
+
+On first launch the app will prompt you for your Telegram phone number and a
+verification code. After a successful login the session is stored locally so you
+won't need to log in again.
 
 ## Controls
 

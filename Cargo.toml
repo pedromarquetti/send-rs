@@ -17,6 +17,7 @@ tokio = { version = "1", features = [
 
 grammers-client = "0.10"
 grammers-session = { version = "0.10", features = ["sqlite-storage"] }
+grammers-tl-types = "0.10"
 
 # BUG: whatsapp-rust's internal dep on whatsapp-rust-sqlite-storage forces
 # bundled-sqlite even with default-features = false on our direct dependency.

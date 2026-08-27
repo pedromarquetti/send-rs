@@ -164,6 +164,16 @@ impl AppState {
         errors
     }
 
+    /// Update the sidebar entry for `chat_id` after a poll refresh detected new messages.
+    /// Updates the last_message preview from the newest message in `history`.
+    pub fn update_sidebar_from_poll(&mut self, chat_id: &ChatId, history: &[Message]) {
+        if let Some(chat) = self.chat_state.chats.iter_mut().find(|c| c.id == *chat_id)
+            && let Some(newest) = history.last()
+        {
+            chat.last_message = Some(format!("{}: {}", newest.sender, newest.text));
+        }
+    }
+
     pub fn create_popup(&mut self, popup_type: PopupKind) {
         self.pop_up = Some(PopupState {
             popup_type,
@@ -241,8 +251,6 @@ impl AppState {
             self.chat_state.save_message_selection();
         }
 
-        self.chat_state.chats[index].unread = false;
-        self.chat_state.chats[index].unread_count = 0;
         let read_result = match self.chat_owner_mut(&chat.id) {
             Some(messenger) => messenger.set_read(&chat.id).await,
             None => Ok(()),
@@ -255,6 +263,9 @@ impl AppState {
             )));
             return;
         }
+
+        self.chat_state.chats[index].unread = false;
+        self.chat_state.chats[index].unread_count = 0;
 
         let history_result = match self.chat_owner(&chat.id) {
             Some(messenger) => messenger.history(&chat.id).await,
@@ -531,10 +542,11 @@ impl AppState {
             }
             BackendEvent::MessageReceived(message) => {
                 let is_open = self.chat_state.push_incoming(message.clone());
-                let selected_id = self
-                    .selected_chat_idx()
-                    .and_then(|i| self.chat_state.chats.get(i))
-                    .map(|c| c.id.clone());
+                if is_open
+                    && let Some(len) = self.chat_state.open_chat.as_ref().map(|o| o.history.len())
+                {
+                    self.chat_state.message_list_state.select(Some(len - 1));
+                }
                 let open_chat_id = self
                     .chat_state
                     .open_chat
@@ -552,7 +564,7 @@ impl AppState {
                 );
                 if let Some((_, chat)) = found {
                     chat.last_message = Some(format!("{}: {}", message.sender, message.text));
-                    if !message.from_me && !is_open && selected_id.as_ref() != Some(&message.chat) {
+                    if !message.from_me && !is_open {
                         chat.unread = true;
                         chat.unread_count = chat.unread_count.saturating_add(1);
                         debug!(chat = ?message.chat, "TUI set unread");
@@ -574,7 +586,9 @@ impl AppState {
                     "TUI ChatUpdated",
                 );
                 if let Some(entry) = found {
-                    entry.contact_name = chat.contact_name;
+                    if !chat.contact_name.is_empty() {
+                        entry.contact_name = chat.contact_name;
+                    }
                     entry.last_message = chat.last_message;
                     entry.unread = chat.unread;
                     entry.unread_count = chat.unread_count;

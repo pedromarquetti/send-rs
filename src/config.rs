@@ -9,6 +9,13 @@ pub struct Config {
     pub keys: KeymapConfig,
     pub providers: ProvidersConfig,
     pub max_write_lines: usize,
+    /// How often (seconds) the TUI polls for new messages in the open chat.
+    pub chat_poll_interval_secs: u64,
+    /// How often (seconds) the Telegram client calls `sync_update_state`.
+    /// This call saves chat data to the local Telegram DB
+    pub sync_update_state_secs: u64,
+    /// How often (seconds) the TUI polls for unread-count changes across all chats.
+    pub sidebar_sync_secs: u64,
 }
 
 impl Default for Config {
@@ -17,6 +24,9 @@ impl Default for Config {
             keys: KeymapConfig::default(),
             providers: ProvidersConfig::default(),
             max_write_lines: 5,
+            chat_poll_interval_secs: 2,
+            sync_update_state_secs: 60,
+            sidebar_sync_secs: 10,
         }
     }
 }

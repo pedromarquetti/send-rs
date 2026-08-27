@@ -103,6 +103,16 @@ pub struct Chat {
 }
 
 impl ChatId {
+    pub fn to_provider(&self) -> Provider {
+        match &self {
+            ChatId::Telegram(_) => Provider::Telegram,
+            ChatId::WhatsApp(_) => Provider::WhatsApp,
+            ChatId::Myself => {
+                panic!("ChatId does not have a Provider")
+            }
+        }
+    }
+
     /// The provider platform this chat belongs to.
     pub fn platform(&self) -> &'static str {
         match self {

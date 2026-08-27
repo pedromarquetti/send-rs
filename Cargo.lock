@@ -2783,6 +2783,7 @@ dependencies = [
  "dirs",
  "grammers-client",
  "grammers-session",
+ "grammers-tl-types",
  "notify-rust",
  "qrcode",
  "ratatui",

@@ -58,6 +58,7 @@ async fn main() -> Result<()> {
             session_dir,
             config.providers.telegram.api_id,
             &config.providers.telegram.api_hash,
+            config.sync_update_state_secs,
         )
         .await
         {

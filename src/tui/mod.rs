@@ -31,6 +31,7 @@ enum UiEvent {
     Paste(String),
     Backend(Provider, BackendEvent),
     Resize(u16, u16),
+    HistoryRefresh(ChatId, Vec<crate::backend::Message>),
 }
 
 pub async fn run(
@@ -76,21 +77,108 @@ async fn run_app(
     let mut app = App::new(config, keymap, messengers, open_settings).await;
     info!("TUI started");
 
+    let mut chat_poll_interval = tokio::time::interval(Duration::from_secs(
+        app.state.config.chat_poll_interval_secs,
+    ));
+    chat_poll_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    let mut sidebar_sync_interval =
+        tokio::time::interval(Duration::from_secs(app.state.config.sidebar_sync_secs));
+    sidebar_sync_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
     loop {
         terminal.draw(|frame| app.draw(frame))?;
-        let Some(event) = rx.recv().await else {
-            break;
-        };
-        match event {
-            UiEvent::Key(key) => app.handle_key(key).await,
-            UiEvent::Paste(text) => app.state.handle_paste(text),
-            UiEvent::Backend(provider, backend_event) => {
-                app.state.handle_backend_event(provider, backend_event);
+
+        tokio::select! {
+            biased;
+
+            _ = chat_poll_interval.tick() => {
+                let chat_id = match app.state.chat_state.open_chat.as_ref() {
+                    Some(open) => open.chat.id.clone(),
+                    None => continue,
+                };
+
+            let messenger_idx = app.state.messengers.iter().position(|m| {
+                m.provider() == chat_id.to_provider()
+                    });
+
+                if let Some(idx) = messenger_idx {
+                    match app.state.messengers[idx].history(&chat_id).await {
+                        Ok(history) => {
+                            debug!(chat = ?chat_id, msgs = history.len(), "Poll refresh OK");
+                            app.state.update_sidebar_from_poll(&chat_id, &history);
+                            app.state.chat_state.refresh_chat_history(&chat_id, history);
+                        }
+                        Err(e) => {
+                            error!(chat = ?chat_id, error = %e, "Poll refresh failed");
+                        }
+                    }
+                }
             }
-            UiEvent::Resize(..) => {}
-        }
-        if !app.state.running {
-            break;
+
+            _ = sidebar_sync_interval.tick() => {
+                for messenger in app.state.messengers.iter() {
+                    match messenger.chats().await {
+                        Ok(chats) => {
+                            for chat in &chats {
+                                if let Some(entry) = app.state.chat_state.chats.iter_mut().find(|e| e.id == chat.id) {
+                                    let changed = entry.unread != chat.unread
+                                        || entry.unread_count != chat.unread_count;
+                                    if changed {
+                                        debug!(
+                                            chat = ?chat.id,
+                                            old_unread = entry.unread,
+                                            new_unread = chat.unread,
+                                            old_count = entry.unread_count,
+                                            new_count = chat.unread_count,
+                                            "Sidebar sync: unread changed"
+                                        );
+                                        entry.unread = chat.unread;
+                                        entry.unread_count = chat.unread_count;
+                                    }
+                                    if let Some(ref lm) = chat.last_message {
+                                        entry.last_message = Some(lm.clone());
+                                    }
+                                }
+                            }
+                            debug!(provider = ?messenger.provider(), chats = chats.len(), "Sidebar sync OK");
+                        }
+                        Err(e) => {
+                            error!(provider = ?messenger.provider(), error = %e, "Sidebar sync failed");
+                        }
+                    }
+                }
+            }
+            event = rx.recv() => {
+                let Some(event) = event else {
+                    break;
+                };
+                match event {
+                    UiEvent::Key(key) => app.handle_key(key).await,
+                    UiEvent::Paste(text) => app.state.handle_paste(text),
+                    UiEvent::Backend(provider, backend_event) => {
+                        debug!(
+                            provider = ?provider,
+                            event = ?std::mem::discriminant(&backend_event),
+                            "TUI processing backend event, pending render"
+                        );
+                        app.state.handle_backend_event(provider, backend_event);
+                    }
+                    UiEvent::Resize(..) => {}
+                    UiEvent::HistoryRefresh(chat_id, history) => {
+                        debug!(
+                            chat = ?chat_id,
+                            messages = history.len(),
+                            "HistoryRefresh applied"
+                        );
+                        app.state.update_sidebar_from_poll(&chat_id, &history);
+                        app.state.chat_state.refresh_chat_history(&chat_id, history);
+                    }
+                }
+                if !app.state.running {
+                    break;
+                }
+            }
         }
     }
     Ok(())
@@ -282,6 +370,17 @@ impl App {
                         .message_list_state
                         .selected()
                         .unwrap_or(0);
+                    let new = current.saturating_sub(page);
+                    self.state.chat_state.message_list_state.select(Some(new));
+                } else if key.code == KeyCode::PageDown {
+                    // TODO: use scroll_up_by/ scroll_down_by here
+                    let page = self.state.chat_state.visible_page;
+                    let current = self
+                        .state
+                        .chat_state
+                        .message_list_state
+                        .selected()
+                        .unwrap_or(0);
                     let new = current.saturating_add(page);
                     let max = self
                         .state
@@ -294,16 +393,6 @@ impl App {
                         .chat_state
                         .message_list_state
                         .select(Some(new.min(max)));
-                } else if key.code == KeyCode::PageDown {
-                    let page = self.state.chat_state.visible_page;
-                    let current = self
-                        .state
-                        .chat_state
-                        .message_list_state
-                        .selected()
-                        .unwrap_or(0);
-                    let new = current.saturating_sub(page);
-                    self.state.chat_state.message_list_state.select(Some(new));
                 } else if key == km.select
                     && let Some(idx) = self.state.chat_state.message_list_state.selected()
                     && let Some(open) = &self.state.chat_state.open_chat

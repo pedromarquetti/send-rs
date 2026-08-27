@@ -91,13 +91,7 @@ impl StatefulWidget for ChatWidget<'_> {
             let total_lines: usize = item_heights.iter().sum();
 
             let visible = inner.height as usize;
-
-            let current_offset = state.message_list_state.offset();
-            let selected = state.message_list_state.selected();
-            let offset = compute_list_offset(&item_heights, selected, visible, current_offset);
-
             state.visible_page = visible;
-            *state.message_list_state.offset_mut() = offset;
 
             let items: Vec<ListItem> = history
                 .iter()
@@ -131,9 +125,11 @@ impl StatefulWidget for ChatWidget<'_> {
             StatefulWidget::render(list, content, buf, &mut state.message_list_state);
 
             if total_lines > visible {
+                let first_visible_item = state.message_list_state.offset();
+                let scrollbar_position: usize = item_heights[..first_visible_item].iter().sum();
                 let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
                 let mut scrollbar_state = ScrollbarState::new(total_lines.saturating_sub(visible))
-                    .position(offset)
+                    .position(scrollbar_position)
                     .viewport_content_length(visible);
                 StatefulWidget::render(scrollbar, scrollbar_col, buf, &mut scrollbar_state);
             }
@@ -343,33 +339,6 @@ fn message_line_count(message: &Message, width: u16, max_lines: Option<usize>) -
     }
 
     (count, any_truncated)
-}
-
-/// Computes the offset for a List so that the selected item is visible in the viewport.
-fn compute_list_offset(
-    item_heights: &[usize],
-    selected: Option<usize>,
-    viewport_height: usize,
-    current_offset: usize,
-) -> usize {
-    let Some(selected) = selected else {
-        return 0;
-    };
-
-    if selected >= item_heights.len() {
-        return 0;
-    }
-
-    let selected_top: usize = item_heights[..selected].iter().sum();
-    let selected_height = item_heights[selected];
-
-    if selected_top < current_offset {
-        selected_top
-    } else if selected_top + selected_height > current_offset + viewport_height {
-        selected_top + selected_height - viewport_height
-    } else {
-        current_offset
-    }
 }
 
 /// Number of visual rows the Write box needs for the given text at `width` columns, counting
