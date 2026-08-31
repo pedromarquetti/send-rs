@@ -96,6 +96,19 @@ async fn run_app(
     let mut app = App::new(config, keymap, messengers, open_settings, tx.clone()).await;
     info!("TUI started");
 
+    let telegram_needs_login = if app.state.config.providers.telegram.enabled {
+        match app.state.provider_to_messenger(Provider::Telegram) {
+            Some(messenger) => !messenger.is_authenticated().await,
+            None => false,
+        }
+    } else {
+        false
+    };
+
+    if telegram_needs_login {
+        app.state.start_login(Provider::Telegram)?;
+    }
+
     // Kick off the initial chat list fetch in the background so the UI renders
     // immediately (non-blocking startup). Results arrive via `ChatsLoaded`.
     let chat_loader_tx = tx.clone();
@@ -150,6 +163,9 @@ async fn run_app(
             }
 
             _ = sidebar_sync_interval.tick() => {
+                if !app.state.chats_loaded {
+                    continue;
+                }
                 if app.state.sidebar_sync_in_flight {
                     continue;
                 }

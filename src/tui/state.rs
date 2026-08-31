@@ -167,6 +167,7 @@ impl AppState {
         debug!("Rebuilding chat list from all providers");
         let (chats, errors) = fetch_all_chats(&self.messengers, &self.config.providers).await;
         self.apply_chats(chats);
+        self.chats_loaded = true;
         errors
     }
 
@@ -774,8 +775,10 @@ impl AppState {
                 let provider = self.login_state.as_ref().map(|s| s.provider);
 
                 // Enable the provider in config and save
-                if let Some(p) = provider {
-                    p.toggle_enabled(&mut self.config.providers);
+                if let Some(provider) = provider {
+                    if !provider.is_enabled(&self.config.providers) {
+                        provider.toggle_enabled(&mut self.config.providers);
+                    }
                     match self.config.save() {
                         Ok(()) => {}
                         Err(e) => {
@@ -922,6 +925,14 @@ pub async fn fetch_all_chats(
         let provider = messenger.provider();
 
         if !provider.is_enabled(providers) {
+            continue;
+        }
+
+        if !messenger.is_authenticated().await {
+            warn!(
+                provider = provider.name(),
+                "Skipping chat fetch for unauthorized provider"
+            );
             continue;
         }
 
