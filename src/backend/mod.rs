@@ -225,6 +225,10 @@ pub enum BackendEvent {
     Status(String),
     MessageReceived(Message),
     MessageUpdated(Message),
+    MessageDeleted {
+        chat: Option<ChatId>,
+        message_ids: Vec<MessageId>,
+    },
     ChatUpdated(Chat),
     Error(String, BackendError),
 }

@@ -189,6 +189,47 @@ impl ChatState {
             .find(|(_, chat)| chat.id == *id)
     }
 
+    /// Insert or update a sidebar chat entry from a push update while keeping
+    /// the existing order intact and preserving user-visible scroll state.
+    pub fn upsert_chat(&mut self, chat: Chat) -> bool {
+        if let Some((pos, entry)) = self.find_mut(&chat.id) {
+            if !chat.contact_name.is_empty()
+                && chat.contact_name != "Unknown"
+                && chat.contact_name != "You"
+            {
+                entry.contact_name = chat.contact_name;
+            }
+
+            let should_bump = chat.last_message.is_some();
+            let has_last_message = chat.last_message.is_some();
+
+            if let Some(last_message) = chat.last_message {
+                entry.last_message = Some(last_message);
+            }
+
+            if chat.unread || chat.unread_count > 0 {
+                entry.unread = chat.unread || chat.unread_count > 0;
+            } else if !has_last_message {
+                entry.unread = false;
+            }
+
+            if chat.unread_count > 0 || !has_last_message {
+                entry.unread_count = chat.unread_count;
+            }
+
+            if pos > 0 && should_bump {
+                let item = self.chats.remove(pos);
+                self.chats.insert(0, item);
+            }
+            return true;
+        }
+
+        let mut chat = chat;
+        chat.scroll = 0;
+        self.chats.insert(0, chat);
+        true
+    }
+
     /// Replace the open chat's history with freshly fetched data, preserving the
     /// current scroll position.
     pub fn refresh_chat_history(&mut self, chat_id: &ChatId, history: Vec<Message>) {
@@ -350,6 +391,32 @@ mod tests {
         assert_eq!(index, 1);
         assert_eq!(entry.contact_name, "B");
         assert!(state.find_mut(&ChatId::Telegram(99)).is_none());
+    }
+
+    #[test]
+    fn upsert_does_not_replace_known_name_with_unknown() {
+        let id = ChatId::Telegram(1);
+        let mut state = ChatState {
+            chats: vec![chat(id.clone(), "Teste 1")],
+            ..Default::default()
+        };
+
+        state.upsert_chat(chat(id, "Unknown"));
+
+        assert_eq!(state.chats[0].contact_name, "Teste 1");
+    }
+
+    #[test]
+    fn upsert_does_not_replace_private_contact_with_you() {
+        let id = ChatId::Telegram(1);
+        let mut state = ChatState {
+            chats: vec![chat(id.clone(), "Chat1")],
+            ..Default::default()
+        };
+
+        state.upsert_chat(chat(id, "You"));
+
+        assert_eq!(state.chats[0].contact_name, "Chat1");
     }
 
     #[test]

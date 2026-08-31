@@ -255,6 +255,7 @@ fn message_lines(message: &Message, width: u16, max_lines: Option<usize>) -> Vec
     } else {
         message.sender.clone()
     };
+
     let mut result: Vec<Line> = Vec::new();
 
     if message.reply_to_id.is_some() {
@@ -364,14 +365,17 @@ fn message_lines(message: &Message, width: u16, max_lines: Option<usize>) -> Vec
         result.push(hint_line);
     }
 
-    if message.from_me {
-        result
-            .into_iter()
-            .map(|line| line.alignment(Alignment::Right))
-            .collect()
-    } else {
-        result
-    }
+    result
+    // TODO:  make this better, 'right align' was not looking good
+    //
+    // if message.from_me {
+    //     result
+    //         // .into_iter()
+    //         // .map(|line| line.alignment(Alignment::Right))
+    //         // .collect()
+    // } else {
+    //     result
+    // }
 }
 
 /// Counts the number of visual lines a message occupies at a given width, accounting for

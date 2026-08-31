@@ -101,10 +101,12 @@ impl AppState {
         let mut write = TextArea::default();
         write.set_placeholder_text("Write a message...");
         write.set_cursor_style(Style::default().fg(Color::Yellow));
+        write.set_cursor_line_style(Style::default());
         write.set_wrap_mode(WrapMode::WordOrGlyph);
 
         let mut login_input = TextArea::default();
         login_input.set_cursor_style(Style::default().fg(Color::Yellow));
+        login_input.set_cursor_line_style(Style::default());
         login_input.set_wrap_mode(WrapMode::WordOrGlyph);
 
         let mut app = Self {
@@ -691,6 +693,7 @@ impl AppState {
     pub fn start_login(&mut self, provider: Provider) -> Result<()> {
         let mut input = TextArea::default();
         input.set_cursor_style(Style::default().fg(Color::Yellow));
+        input.set_cursor_line_style(Style::default());
 
         self.login_state = Some(LoginState {
             provider,
@@ -828,47 +831,80 @@ impl AppState {
                     "TUI MessageReceived",
                 );
                 if let Some((_, chat)) = found {
-                    chat.last_message = Some(format!("{}: {}", message.sender, message.text));
+                    chat.last_message = Some(crate::helpers::message_preview(
+                        &message.sender,
+                        &message.text,
+                    ));
+
                     if !message.from_me && !is_open {
                         chat.unread = true;
                         chat.unread_count = chat.unread_count.saturating_add(1);
                         debug!(chat = ?message.chat, "TUI set unread");
                     }
                 } else {
-                    debug!(chat = ?message.chat, "TUI MessageReceived: chat not found in sidebar");
+                    let preview = crate::helpers::message_preview(&message.sender, &message.text);
+                    let mut new_chat = Chat {
+                        id: message.chat.clone(),
+                        contact_name: message.sender.clone(),
+                        last_message: Some(preview.clone()),
+                        unread: !message.from_me,
+                        unread_count: if message.from_me { 0 } else { 1 },
+                        ..Default::default()
+                    };
+                    if message.from_me {
+                        new_chat.unread = false;
+                    }
+                    self.chat_state.upsert_chat(new_chat);
+                    debug!(chat = ?message.chat, "TUI MessageReceived: inserted sidebar chat from push event");
                 }
             }
 
             BackendEvent::MessageUpdated(message) => {
                 self.chat_state.update_message(message.clone());
+                let preview = crate::helpers::message_preview(&message.sender, &message.text);
+
                 if let Some((_, chat)) = self.chat_state.find_mut(&message.chat) {
-                    chat.last_message = Some(format!("{}: {}", message.sender, message.text));
+                    chat.last_message = Some(preview.clone());
+                } else {
+                    self.chat_state.upsert_chat(Chat {
+                        id: message.chat.clone(),
+                        contact_name: message.sender.clone(),
+                        last_message: Some(preview),
+                        unread: false,
+                        unread_count: 0,
+                        ..Default::default()
+                    });
+                }
+            }
+
+            BackendEvent::MessageDeleted { chat, message_ids } => {
+                let Some(chat) = chat else {
+                    return;
+                };
+                for message_id in message_ids {
+                    self.chat_state.remove_message(&message_id);
+                }
+                if let Some(open) = self.chat_state.open_chat.as_ref()
+                    && open.chat.id == chat
+                {
+                    self.chat_state.message_list_state.select(None);
+                    let len = self
+                        .chat_state
+                        .open_chat
+                        .as_ref()
+                        .map(|o| o.history.len())
+                        .unwrap_or(0);
+                    if len > 0 {
+                        self.chat_state
+                            .message_list_state
+                            .select(Some(len.saturating_sub(1)));
+                    }
                 }
             }
 
             BackendEvent::ChatUpdated(chat) => {
-                let found = self
-                    .chat_state
-                    .chats
-                    .iter_mut()
-                    .find(|entry| entry.id == chat.id);
-                debug!(
-                    chat = ?chat.id,
-                    sidebar_found = found.is_some(),
-                    "TUI ChatUpdated",
-                );
-                if let Some(entry) = found {
-                    if !chat.contact_name.is_empty() {
-                        entry.contact_name = chat.contact_name;
-                    }
-
-                    if chat.last_message.is_some() {
-                        entry.last_message = chat.last_message;
-                    }
-
-                    entry.unread = chat.unread;
-                    entry.unread_count = chat.unread_count;
-                }
+                debug!(chat = ?chat.id, "TUI ChatUpdated");
+                self.chat_state.upsert_chat(chat);
             }
         }
     }
@@ -1075,6 +1111,72 @@ mod tests {
 
         assert!(state.chat_state.chats[2].unread);
         assert_eq!(state.chat_state.chats[2].unread_count, 1);
+    }
+
+    #[tokio::test]
+    async fn incoming_message_to_unknown_chat_inserts_sidebar_entry() {
+        let mut state = app_state().await;
+        let before = state.chat_state.chats.len();
+
+        state.handle_backend_event(
+            Provider::Telegram,
+            BackendEvent::MessageReceived(Message {
+                message_id: "new-chat".into(),
+                chat: ChatId::Telegram(999),
+                sender: "New contact".into(),
+                text: "hello there".into(),
+                timestamp: 0,
+                from_me: false,
+                msg_actions: Vec::new(),
+                reply_to_id: None,
+                reply_ctx: None,
+                pending: false,
+                failed: false,
+            }),
+        );
+
+        assert_eq!(state.chat_state.chats.len(), before + 1);
+        assert_eq!(state.chat_state.chats[0].id, ChatId::Telegram(999));
+        assert_eq!(
+            state.chat_state.chats[0].last_message.as_deref(),
+            Some("New contact: hello there")
+        );
+        assert!(state.chat_state.chats[0].unread);
+        assert_eq!(state.chat_state.chats[0].unread_count, 1);
+    }
+
+    #[tokio::test]
+    async fn message_deleted_event_removes_open_history_message() {
+        let mut state = app_state().await;
+        state.chat_state.chat_list_state.select(Some(0));
+        state.select_chat(0).await;
+
+        let removed = state
+            .chat_state
+            .open_chat
+            .as_ref()
+            .and_then(|open| open.history.first())
+            .map(|message| message.message_id.clone())
+            .unwrap();
+
+        state.handle_backend_event(
+            Provider::Telegram,
+            BackendEvent::MessageDeleted {
+                chat: Some(ChatId::Telegram(101)),
+                message_ids: vec![removed.clone()],
+            },
+        );
+
+        assert!(
+            !state
+                .chat_state
+                .open_chat
+                .as_ref()
+                .unwrap()
+                .history
+                .iter()
+                .any(|message| message.message_id == removed)
+        );
     }
 
     #[tokio::test]

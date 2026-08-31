@@ -39,6 +39,21 @@ async fn self_user_id(client: &Client) -> Option<ChatId> {
         .and_then(|user| user.id().bare_id().map(ChatId::Telegram))
 }
 
+fn message_chat_id(msg: &grammers_client::message::Message) -> Option<ChatId> {
+    msg.peer()
+        .and_then(|peer| peer.id().bare_id())
+        .or_else(|| msg.peer_id().bare_id())
+        .filter(|id| *id != 0)
+        .map(ChatId::Telegram)
+}
+
+fn pretty_peer_name(msg: &grammers_client::message::Message, fallback: &str) -> String {
+    msg.peer()
+        .and_then(|peer| peer.name())
+        .map(str::to_string)
+        .unwrap_or_else(|| fallback.to_string())
+}
+
 /// The active login step. Stored between `request_code` and `sign_in` calls
 /// so the TUI can collect user input across multiple frames.
 ///
@@ -117,8 +132,10 @@ impl TelegramMessenger {
         let sync_secs = self.sync_update_state_secs;
 
         tokio::spawn(async move {
+            // Avoid eager bulk diffs on reconnects: live push updates are the
+            // authoritative path here, while dialog polling remains the fallback.
             let config = UpdatesConfiguration {
-                catch_up: true,
+                catch_up: false,
                 ..Default::default()
             };
             let mut stream = match client.stream_updates(updates, config).await {
@@ -147,13 +164,10 @@ impl TelegramMessenger {
                         match update {
                             Ok(update) => match update {
                                 Update::NewMessage(msg) => {
-                                    let peer = match msg.peer() {
-                                        Some(p) => p,
-                                        None => continue,
+                                    let Some(chat_id) = message_chat_id(&msg) else {
+                                        debug!(msg_id = msg.id(), "Skipping new message without usable peer metadata");
+                                        continue;
                                     };
-
-                                    let chat_id =
-                                        ChatId::Telegram(peer.id().bare_id().unwrap_or(0));
 
                                     if own_chat.is_none() {
                                         own_chat = self_user_id(&client).await;
@@ -173,6 +187,7 @@ impl TelegramMessenger {
                                     } else {
                                         msg.sender()
                                             .and_then(|p| p.name())
+                                            .or_else(|| msg.peer().and_then(|p| p.name()))
                                             .unwrap_or("Unknown")
                                             .to_string()
                                     };
@@ -187,8 +202,8 @@ impl TelegramMessenger {
 
                                     let message = Message {
                                         message_id: msg.id().to_string().into(),
-                                        chat: chat_id,
-                                        sender,
+                                        chat: chat_id.clone(),
+                                        sender: sender.clone(),
                                         text: text.clone(),
                                         timestamp: msg.date().timestamp(),
                                         from_me,
@@ -198,15 +213,22 @@ impl TelegramMessenger {
                                         pending: false,
                                         failed: false,
                                     };
-                                    let _ = tx.send(BackendEvent::MessageReceived(message));
+                                    let preview = crate::helpers::message_preview(&sender, &text);
+                                    let _ = tx.send(BackendEvent::MessageReceived(message.clone()));
+                                    let _ = tx.send(BackendEvent::ChatUpdated(Chat {
+                                        id: chat_id,
+                                        contact_name: pretty_peer_name(&msg, &sender),
+                                        last_message: Some(preview),
+                                        scroll: 0,
+                                        unread: false,
+                                        unread_count: 0,
+                                    }));
                                 }
                                 Update::MessageEdited(msg) => {
-                                    let peer = match msg.peer() {
-                                        Some(p) => p,
-                                        None => continue,
+                                    let Some(chat_id) = message_chat_id(&msg) else {
+                                        debug!(msg_id = msg.id(), "Skipping edited message without usable peer metadata");
+                                        continue;
                                     };
-                                    let chat_id =
-                                        ChatId::Telegram(peer.id().bare_id().unwrap_or(0));
 
                                     if own_chat.is_none() {
                                         own_chat = self_user_id(&client).await;
@@ -214,11 +236,19 @@ impl TelegramMessenger {
 
                                     let from_me =
                                         msg.outgoing() || own_chat.as_ref() == Some(&chat_id);
-                                    let name = peer.name().unwrap_or("Unknown").to_string();
-                                    let last_message = if msg.outgoing() {
-                                        Some(format!("You: {}", msg.text()))
+
+                                    let name = msg
+                                        .peer()
+                                        .and_then(|p| p.name())
+                                        .unwrap_or("Unknown")
+                                        .to_string();
+
+                                    let display_text = msg.text().to_string();
+
+                                    let last_message = if from_me {
+                                        Some(crate::helpers::message_preview("You", &display_text))
                                     } else {
-                                        Some(format!("{name}: {}", msg.text()))
+                                        Some(crate::helpers::message_preview(&name, &display_text))
                                     };
 
                                     let message = Message {
@@ -229,7 +259,7 @@ impl TelegramMessenger {
                                         } else {
                                             name.clone()
                                         },
-                                        text: msg.text().to_string(),
+                                        text: display_text.clone(),
                                         timestamp: msg.date().timestamp(),
                                         from_me,
                                         msg_actions: message_actions(from_me),
@@ -249,6 +279,19 @@ impl TelegramMessenger {
                                         unread: false,
                                         unread_count: 0,
                                     }));
+                                }
+                                Update::MessageDeleted(del) => {
+                                    let chat = del.channel_id().map(ChatId::Telegram);
+                                    let message_ids = del
+                                        .messages()
+                                        .iter()
+                                        .map(|id| id.to_string().into())
+                                        .collect::<Vec<_>>();
+                                    if message_ids.is_empty() {
+                                        continue;
+                                    }
+                                    debug!(chat = ?chat, ids = message_ids.len(), "MessageDeleted");
+                                    let _ = tx.send(BackendEvent::MessageDeleted { chat, message_ids });
                                 }
                                 Update::Raw(raw) => {
                                     if let tl::enums::Update::ReadHistoryInbox(ref u) = *raw {
@@ -329,7 +372,11 @@ impl TelegramMessenger {
 
         while let Some(dialog) = dialogs_iter.next().await? {
             let peer = dialog.peer();
-            let id = ChatId::Telegram(peer.id().bare_id().unwrap_or(0));
+            let Some(bare_id) = peer.id().bare_id().filter(|id| *id != 0) else {
+                debug!("Skipping Telegram dialog without usable peer id");
+                continue;
+            };
+            let id = ChatId::Telegram(bare_id);
             let contact_name = peer.name().unwrap_or("Unknown").to_string();
 
             let last_message = dialog.last_message.as_ref().map(|msg| {

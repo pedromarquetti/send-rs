@@ -13,6 +13,15 @@ pub fn available_message_actions(message: &crate::backend::Message) -> Vec<Messa
     actions
 }
 
+pub fn message_preview(sender: &str, text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        sender.to_string()
+    } else {
+        format!("{sender}: {trimmed}")
+    }
+}
+
 /// helper function to create a centered rect using up certain percentage of the available rect `r`
 pub fn popup_area(area: Rect, width: u16, height: u16) -> Rect {
     let vertical = Layout::vertical([Constraint::Length(height)]).flex(Flex::Center);
