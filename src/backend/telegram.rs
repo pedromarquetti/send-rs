@@ -20,6 +20,8 @@ use tokio::sync::Mutex;
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
+type CachedChats = Option<(Instant, Vec<Chat>)>;
+
 /// The active login step. Stored between `request_code` and `sign_in` calls
 /// so the TUI can collect user input across multiple frames.
 ///
@@ -42,7 +44,8 @@ pub struct TelegramMessenger {
     login_token: Arc<RwLock<Option<LoginToken>>>,
     cached_dialogs: Arc<StdMutex<Vec<Dialog>>>,
     chat_refresh: Arc<Mutex<()>>,
-    cached_chats: Arc<Mutex<Option<(Instant, Vec<Chat>)>>>,
+    cached_chats: Arc<Mutex<CachedChats>>,
+    flood_wait_until: Arc<Mutex<Option<Instant>>>,
     sync_update_state_secs: u64,
 }
 
@@ -83,6 +86,7 @@ impl TelegramMessenger {
             cached_dialogs: Arc::new(StdMutex::new(Vec::new())),
             chat_refresh: Arc::new(Mutex::new(())),
             cached_chats: Arc::new(Mutex::new(None)),
+            flood_wait_until: Arc::new(Mutex::new(None)),
             sync_update_state_secs,
         };
 
@@ -335,6 +339,14 @@ impl TelegramMessenger {
         self.cache_dialogs(raw_dialogs);
         Ok(chats)
     }
+
+    fn report_status(&self, status: String) {
+        let _ = self.tx.send(BackendEvent::Status(status));
+    }
+
+    fn clear_status(&self) {
+        let _ = self.tx.send(BackendEvent::Status(String::new()));
+    }
 }
 
 /// Fetches the quoted original message for an incoming reply and builds its
@@ -383,35 +395,73 @@ impl Messenger for TelegramMessenger {
     }
 
     async fn chats(&self) -> Result<Vec<Chat>, BackendError> {
-        let _refresh = self.chat_refresh.lock().await;
-        {
-            let cached = self.cached_chats.lock().await;
-            if let Some((loaded_at, chats)) = cached.as_ref()
-                && loaded_at.elapsed() < std::time::Duration::from_secs(5)
-            {
-                debug!("Using cached Telegram dialogs");
-                return Ok(chats.clone());
-            }
-        }
+        const MAX_REFRESH_WAIT: u64 = 120;
 
-        for attempt in 0..=1 {
+        loop {
+            let refresh = self.chat_refresh.lock().await;
+            {
+                let cached = self.cached_chats.lock().await;
+                if let Some((loaded_at, chats)) = cached.as_ref()
+                    && loaded_at.elapsed() < std::time::Duration::from_secs(5)
+                {
+                    debug!("Using cached Telegram dialogs");
+                    return Ok(chats.clone());
+                }
+            }
+
+            let cooldown = {
+                let mut wait_until = self.flood_wait_until.lock().await;
+                match *wait_until {
+                    Some(until) if until > Instant::now() => Some(until),
+                    Some(_) => {
+                        *wait_until = None;
+                        None
+                    }
+                    None => None,
+                }
+            };
+
+            if let Some(until) = cooldown {
+                let wait = until.saturating_duration_since(Instant::now());
+                drop(refresh);
+                self.report_status(format!(
+                    "Telegram rate limited; retrying in {}s",
+                    wait.as_secs().max(1)
+                ));
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+
             match self.fetch_chats_once().await {
                 Ok(chats) => {
                     *self.cached_chats.lock().await = Some((Instant::now(), chats.clone()));
+                    self.clear_status();
                     return Ok(chats);
                 }
-                Err(BackendError::FloodWait(seconds)) if attempt == 0 => {
-                    warn!(
-                        seconds,
-                        "Telegram rate limited while fetching dialogs; retrying"
-                    );
+
+                Err(BackendError::FloodWait(seconds)) if seconds <= MAX_REFRESH_WAIT => {
+                    let until = Instant::now() + std::time::Duration::from_secs(seconds);
+                    *self.flood_wait_until.lock().await = Some(until);
+                    drop(refresh);
+                    self.report_status(format!(
+                        "Telegram rate limited; retrying in {}s",
+                        seconds.max(1)
+                    ));
                     tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
                 }
-                Err(error) => return Err(error),
+                Err(BackendError::FloodWait(seconds)) => {
+                    drop(refresh);
+                    self.report_status(format!(
+                        "Telegram rate limited; retry deferred for {seconds}s"
+                    ));
+                    return Err(BackendError::FloodWait(seconds));
+                }
+                Err(error) => {
+                    drop(refresh);
+                    return Err(error);
+                }
             }
         }
-
-        unreachable!("the bounded Telegram dialog retry always returns")
     }
 
     async fn set_read(&mut self, chat: &ChatId) -> Result<(), BackendError> {

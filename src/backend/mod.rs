@@ -220,6 +220,7 @@ pub struct Message {
 pub enum BackendEvent {
     Connected,
     Disconnected(String),
+    Status(String),
     MessageReceived(Message),
     MessageUpdated(Message),
     ChatUpdated(Chat),

@@ -6,11 +6,16 @@ use crate::tui::state::Focus;
 pub struct StatusBarWidget {
     curr_chat: Option<String>,
     focus: Focus,
+    status: Option<String>,
 }
 
 impl StatusBarWidget {
-    pub fn new(curr_chat: Option<String>, focus: Focus) -> Self {
-        StatusBarWidget { curr_chat, focus }
+    pub fn new(curr_chat: Option<String>, focus: Focus, status: Option<String>) -> Self {
+        StatusBarWidget {
+            curr_chat,
+            focus,
+            status,
+        }
     }
 }
 
@@ -32,7 +37,11 @@ impl Widget for StatusBarWidget {
             Focus::Popup => "Esc close overlay",
         };
 
-        let line = Span::styled(hint, Style::default().fg(Color::DarkGray));
+        let line = if let Some(status) = self.status {
+            Span::styled(status, Style::default().fg(Color::Yellow))
+        } else {
+            Span::styled(hint, Style::default().fg(Color::DarkGray))
+        };
 
         Paragraph::new(line).render(area, buf);
     }

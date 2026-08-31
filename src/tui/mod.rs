@@ -716,7 +716,9 @@ impl App {
             .chat_state
             .selected_chat()
             .map(|c| c.contact_name.clone());
-        StatusBarWidget::new(name, self.state.focus).render(vertical[1], frame.buffer_mut());
+
+        StatusBarWidget::new(name, self.state.focus, self.state.backend_status.clone())
+            .render(vertical[1], frame.buffer_mut());
 
         if let Some(open) = &self.state.chat_state.open_chat {
             debug!(

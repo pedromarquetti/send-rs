@@ -61,6 +61,7 @@ pub struct AppState {
     pub chat_load_generation: u64,
     pub history_refresh_in_flight: bool,
     pub sidebar_sync_in_flight: bool,
+    pub backend_status: Option<String>,
 }
 
 pub struct LoginState {
@@ -119,6 +120,7 @@ impl AppState {
             chat_load_generation: 0,
             history_refresh_in_flight: false,
             sidebar_sync_in_flight: false,
+            backend_status: None,
         };
 
         if open_settings {
@@ -833,6 +835,9 @@ impl AppState {
     pub fn handle_backend_event(&mut self, _provider: Provider, event: BackendEvent) {
         match event {
             BackendEvent::Connected => info!("Backend connected"),
+            BackendEvent::Status(status) => {
+                self.backend_status = (!status.is_empty()).then_some(status);
+            }
             BackendEvent::Disconnected(message) => {
                 warn!(message, "Backend disconnected");
                 self.create_popup(PopupKind::Error(message));
