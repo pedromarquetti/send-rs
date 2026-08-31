@@ -1,6 +1,9 @@
 use crate::backend::AuthSteps;
 
-use super::{BackendError, BackendEvent, Chat, ChatId, LoginStepState, Message, Messenger};
+use super::{
+    BackendError, BackendEvent, Chat, ChatId, LoginStepState, Message, MessageAction, MessageId,
+    Messenger, ReplyContext,
+};
 use anyhow::Result;
 use grammers_client::client::UpdatesConfiguration;
 use grammers_client::peer::Dialog;
@@ -145,13 +148,21 @@ impl TelegramMessenger {
                                         "MessageReceived"
                                     );
                                     let message = Message {
-                                        id: msg.id().to_string(),
+                                        message_id: msg.id().to_string().into(),
                                         chat: chat_id,
                                         sender,
                                         text: text.clone(),
                                         timestamp: msg.date().timestamp(),
                                         from_me: msg.outgoing(),
-                                        options: Vec::new(),
+                                        msg_actions: vec![
+                                            MessageAction::Reply,
+                                            MessageAction::Edit,
+                                            MessageAction::Delete,
+                                        ],
+                                        reply_to_id: msg.reply_to_message_id().map(|id| id.to_string().into()),
+                                        reply_to: reply_context(&client, &msg).await,
+                                        pending: false,
+                                        failed: false,
                                     };
                                     let _ = tx.send(BackendEvent::MessageReceived(message));
                                 }
@@ -250,6 +261,41 @@ impl TelegramMessenger {
     }
 }
 
+/// Fetches the quoted original message for an incoming reply and builds its
+/// context for display. Returns `None` when `msg` is not a reply.
+async fn reply_context(
+    _client: &Client,
+    msg: &grammers_client::message::Message,
+) -> Option<ReplyContext> {
+    msg.reply_to_message_id()?;
+
+    let target: grammers_client::message::Message = match msg.get_reply().await {
+        Ok(Some(m)) => m,
+        _ => return None,
+    };
+
+    let id = target.id().to_string().into();
+    let sender = if target.outgoing() {
+        "You".to_string()
+    } else {
+        target
+            .sender()
+            .and_then(|p| p.name())
+            .unwrap_or("Unknown")
+            .to_string()
+    };
+
+    let text = target.text().to_string();
+    let timestamp = target.date().timestamp();
+
+    Some(ReplyContext {
+        id,
+        sender,
+        text,
+        timestamp,
+    })
+}
+
 #[async_trait::async_trait]
 impl Messenger for TelegramMessenger {
     fn platform(&self) -> &'static str {
@@ -342,13 +388,22 @@ impl Messenger for TelegramMessenger {
             };
 
             messages_rev.push(Message {
-                id: msg.id().to_string(),
+                message_id: msg.id().to_string().into(),
                 chat: chat.clone(),
                 sender,
                 text: msg.text().to_string(),
                 timestamp: msg.date().timestamp(),
                 from_me: msg.outgoing(),
-                options: Vec::new(),
+                msg_actions: vec![
+                    MessageAction::Reply,
+                    MessageAction::Edit,
+                    MessageAction::Delete,
+                ],
+                reply_to_id: msg.reply_to_message_id().map(|id| id.to_string().into()),
+                // Reply details are fetched lazily when the message is opened.
+                reply_to: None,
+                pending: false,
+                failed: false,
             });
         }
 
@@ -359,9 +414,113 @@ impl Messenger for TelegramMessenger {
         Ok(messages_rev)
     }
 
-    async fn send(&self, _chat: &ChatId, _text: &str) -> Result<(), BackendError> {
-        // Phase 3: will call client.send_message
-        Err(BackendError::Other("not implemented yet".into()))
+    async fn reply_context(
+        &self,
+        chat: &ChatId,
+        message_id: &MessageId,
+    ) -> Result<Option<ReplyContext>, BackendError> {
+        let bare_id = match chat {
+            ChatId::Telegram(id) => *id,
+            _ => return Err(BackendError::Other("not a Telegram chat".into())),
+        };
+
+        let peer_ref = self
+            .find_dialog_peer_ref(bare_id)
+            .ok_or_else(|| BackendError::Other("chat not found in dialog cache".into()))?;
+        let id = message_id.to_i32().ok_or_else(|| {
+            BackendError::Other("telegram reply needs a numeric message id".into())
+        })?;
+
+        let message = self
+            .client
+            .get_messages_by_id(peer_ref, &[id])
+            .await?
+            .into_iter()
+            .next()
+            .flatten();
+
+        match message {
+            Some(message) => Ok(reply_context(&self.client, &message).await),
+            None => Ok(None),
+        }
+    }
+
+    async fn send(
+        &self,
+        chat: &ChatId,
+        text: &str,
+        reply_to: Option<MessageId>,
+    ) -> Result<Message, BackendError> {
+        let bare_id = match chat {
+            ChatId::Telegram(id) => *id,
+            _ => return Err(BackendError::Other("not a Telegram chat".into())),
+        };
+
+        let peer_ref = self
+            .find_dialog_peer_ref(bare_id)
+            .ok_or_else(|| BackendError::Other("chat not found in dialog cache".into()))?;
+
+        let mut input = grammers_client::message::InputMessage::new().text(text.to_string());
+        if let Some(reply_id) = reply_to.as_ref().and_then(|id| id.to_i32()) {
+            input = input.reply_to(Some(reply_id));
+        }
+
+        debug!(bare_id, "Sending message");
+        let sent = self.client.send_message(peer_ref, input).await?;
+
+        Ok(Message {
+            message_id: sent.id().to_string().into(),
+            chat: chat.clone(),
+            sender: "You".into(),
+            text: text.to_string(),
+            timestamp: sent.date().timestamp(),
+            from_me: true,
+            msg_actions: vec![
+                MessageAction::Reply,
+                MessageAction::Edit,
+                MessageAction::Delete,
+            ],
+            reply_to_id: reply_to.clone(),
+            reply_to: None,
+            pending: false,
+            failed: false,
+        })
+    }
+
+    async fn delete(&self, chat: &ChatId, id: &MessageId) -> Result<(), BackendError> {
+        let bare_id = match chat {
+            ChatId::Telegram(id) => *id,
+            _ => return Err(BackendError::Other("not a Telegram chat".into())),
+        };
+        let msg_id = id.to_i32().ok_or_else(|| {
+            BackendError::Other("telegram delete needs a numeric message id".into())
+        })?;
+
+        let peer_ref = self
+            .find_dialog_peer_ref(bare_id)
+            .ok_or_else(|| BackendError::Other("chat not found in dialog cache".into()))?;
+
+        debug!(bare_id, msg_id, "Deleting message");
+        self.client.delete_messages(peer_ref, &[msg_id]).await?;
+        Ok(())
+    }
+
+    async fn edit(&self, chat: &ChatId, id: &MessageId, text: &str) -> Result<(), BackendError> {
+        let bare_id = match chat {
+            ChatId::Telegram(id) => *id,
+            _ => return Err(BackendError::Other("not a Telegram chat".into())),
+        };
+        let msg_id = id.to_i32().ok_or_else(|| {
+            BackendError::Other("telegram edit needs a numeric message id".into())
+        })?;
+
+        let peer_ref = self
+            .find_dialog_peer_ref(bare_id)
+            .ok_or_else(|| BackendError::Other("chat not found in dialog cache".into()))?;
+
+        let input = grammers_client::message::InputMessage::new().text(text.to_string());
+        self.client.edit_message(peer_ref, msg_id, input).await?;
+        Ok(())
     }
 
     fn subscribe(&self) -> broadcast::Receiver<BackendEvent> {
@@ -371,13 +530,6 @@ impl Messenger for TelegramMessenger {
     async fn disconnect(&mut self) -> Result<(), BackendError> {
         self.client.disconnect();
         Ok(())
-    }
-
-    async fn login(&mut self) -> Result<(), BackendError> {
-        if self.is_authenticated().await {
-            return Ok(());
-        }
-        Err(BackendError::NotAuthenticated)
     }
 
     async fn logout(&mut self) -> Result<(), BackendError> {

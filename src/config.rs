@@ -25,7 +25,7 @@ impl Default for Config {
             providers: ProvidersConfig::default(),
             max_write_lines: 5,
             chat_poll_interval_secs: 2,
-            sync_update_state_secs: 60,
+            sync_update_state_secs: 120,
             sidebar_sync_secs: 10,
         }
     }

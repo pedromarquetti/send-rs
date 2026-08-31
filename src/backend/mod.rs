@@ -132,21 +132,88 @@ impl ChatId {
     }
 }
 
+/// A universal message identifier. Opaque to the UI; backends interpret it
+/// (e.g. Telegram parses it to a numeric i32 for edit/delete calls).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct MessageId(pub String);
+
+impl MessageId {
+    /// Parse this id as a raw i32 (Telegram message ids). Returns `None` for
+    /// non-numeric ids (mock, WhatsApp, local/synthetic echoes).
+    pub fn to_i32(&self) -> Option<i32> {
+        self.0.parse().ok()
+    }
+
+    /// Whether this id refers to a local, not-yet-confirmed outgoing echo
+    /// (created optimistically by the TUI while the send is in flight).
+    pub fn is_local(&self) -> bool {
+        self.0.starts_with("local-")
+    }
+}
+
+impl From<String> for MessageId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for MessageId {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+
+impl std::ops::Deref for MessageId {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for MessageId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Context about the original message a reply quotes: who wrote it, when, and
+/// a preview of its text.
+#[derive(Debug, Clone)]
+pub struct ReplyContext {
+    pub id: MessageId,
+    pub sender: String,
+    pub text: String,
+    pub timestamp: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MessageAction {
     Reply,
     Edit,
+    Delete,
+    /// TUI-only pseudo-action shown on failed (outgoing) messages to re-send.
+    Retry,
 }
 
 #[derive(Debug, Clone)]
 pub struct Message {
-    pub id: String,
+    pub message_id: MessageId,
     pub chat: ChatId,
     pub sender: String,
     pub text: String,
     pub timestamp: i64,
     pub from_me: bool,
-    pub options: Vec<MessageAction>,
+    pub msg_actions: Vec<MessageAction>,
+    pub reply_to_id: Option<MessageId>,
+    /// Set when this message quotes an earlier one (the reply target).
+    pub reply_to: Option<ReplyContext>,
+    /// Truthy for an optimistic outgoing echo still awaiting confirmation.
+    /// When `pending` and `failed` are both false the message is confirmed.
+    pub pending: bool,
+    /// Outgoing message that failed to send (no auto-delete; shown grayed
+    /// with a Retry action available).
+    pub failed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -203,15 +270,35 @@ pub trait Messenger: Send + Sync {
     async fn set_read(&mut self, chat: &ChatId) -> Result<(), BackendError>;
     /// Requests the Messenger provider for chat history
     async fn history(&self, chat: &ChatId) -> Result<Vec<Message>, BackendError>;
-    /// Handles sending Client >>> Messenger (provider) messages
-    async fn send(&self, chat: &ChatId, text: &str) -> Result<(), BackendError>;
+    /// Fetch full details for the message quoted by `message_id`, if any.
+    async fn reply_context(
+        &self,
+        chat: &ChatId,
+        message_id: &MessageId,
+    ) -> Result<Option<ReplyContext>, BackendError>;
+    /// Handles sending Client >>> Messenger (provider) messages.
+    /// `reply_to` quotes an earlier message id when `Some`. Returns the
+    /// confirmed sent message so the caller can reconcile an echo with reality.
+    async fn send(
+        &self,
+        chat: &ChatId,
+        text: &str,
+        reply_to: Option<MessageId>,
+    ) -> Result<Message, BackendError>;
+    /// Delete an already-sent message.
+    async fn delete(&self, chat: &ChatId, id: &MessageId) -> Result<(), BackendError>;
+    /// Edit an already-sent message, replacing its text.
+    async fn edit(&self, chat: &ChatId, id: &MessageId, text: &str) -> Result<(), BackendError>;
     /// Messenger provider >>> Client message handling
     fn subscribe(&self) -> broadcast::Receiver<BackendEvent>;
     /// Graceful shutdown: flush pending work, close transport, stop background tasks.
     async fn disconnect(&mut self) -> Result<(), BackendError>;
     /// Start authentication flow. For event-driven providers (WhatsApp) this is a no-op;
-    /// the actual auth happens via BackendEvent callbacks.
-    async fn login(&mut self) -> Result<(), BackendError>;
+    /// the actual auth happens via BackendEvent callbacks. Text-based providers drive the
+    /// flow through [`Messenger::login_step`] instead, so the default is a successful no-op.
+    async fn login(&mut self) -> Result<(), BackendError> {
+        Ok(())
+    }
     /// Destroy remote session (sign out / deregister device).
     async fn logout(&mut self) -> Result<(), BackendError>;
 
@@ -325,7 +412,10 @@ impl MessengerKind {
         , async fn chats(&self) -> Result<Vec<Chat>, BackendError> ;
         , async fn set_read(&mut self, chat: &ChatId) -> Result<(), BackendError> ;
         , async fn history(&self, chat: &ChatId) -> Result<Vec<Message>, BackendError> ;
-        , async fn send(&self, chat: &ChatId, text: &str) -> Result<(), BackendError> ;
+        , async fn reply_context(&self, chat: &ChatId, message_id: &MessageId) -> Result<Option<ReplyContext>, BackendError> ;
+        , async fn send(&self, chat: &ChatId, text: &str, reply_to: Option<MessageId>) -> Result<Message, BackendError> ;
+        , async fn delete(&self, chat: &ChatId, id: &MessageId) -> Result<(), BackendError> ;
+        , async fn edit(&self, chat: &ChatId, id: &MessageId, text: &str) -> Result<(), BackendError> ;
         , fn subscribe(&self) -> broadcast::Receiver<BackendEvent> ;
         , async fn disconnect(&mut self) -> Result<(), BackendError> ;
         , async fn login(&mut self) -> Result<(), BackendError> ;

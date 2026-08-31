@@ -1,4 +1,7 @@
-use super::{BackendError, BackendEvent, Chat, ChatId, Message, Messenger};
+use super::{
+    BackendError, BackendEvent, Chat, ChatId, Message, MessageAction, MessageId, Messenger,
+    ReplyContext,
+};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -69,13 +72,17 @@ impl MockMessenger {
                 sleep(interval).await;
                 n += 1;
                 let msg = Message {
-                    id: format!("mock-{name}-incoming-{n}"),
+                    message_id: format!("mock-{name}-incoming-{n}").into(),
                     chat: chat.clone(),
                     sender: format!("{name} Mock"),
                     text: format!("simulated incoming message #{n}"),
                     timestamp: now(),
                     from_me: false,
-                    options: Vec::new(),
+                    msg_actions: Vec::new(),
+                    reply_to_id: None,
+                    reply_to: None,
+                    pending: false,
+                    failed: false,
                 };
                 let Ok(mut state) = state.lock() else {
                     return;
@@ -139,20 +146,77 @@ impl Messenger for MockMessenger {
         Ok(messages)
     }
 
-    async fn send(&self, chat: &ChatId, text: &str) -> Result<(), BackendError> {
+    async fn reply_context(
+        &self,
+        chat: &ChatId,
+        message_id: &MessageId,
+    ) -> Result<Option<ReplyContext>, BackendError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|e| BackendError::Other(format!("{} mock state poisoned: {e}", self.name)))?;
+        let context = state
+            .history
+            .get(chat)
+            .and_then(|messages| {
+                messages
+                    .iter()
+                    .find(|message| message.message_id == *message_id)
+            })
+            .and_then(|message| {
+                message.reply_to_id.as_ref().and_then(|reply_id| {
+                    state
+                        .history
+                        .get(chat)
+                        .into_iter()
+                        .flatten()
+                        .find(|original| original.message_id == *reply_id)
+                        .map(|original| ReplyContext {
+                            id: original.message_id.clone(),
+                            sender: original.sender.clone(),
+                            text: original.text.clone(),
+                            timestamp: original.timestamp,
+                        })
+                })
+            });
+        Ok(context)
+    }
+
+    async fn send(
+        &self,
+        chat: &ChatId,
+        text: &str,
+        reply_to: Option<MessageId>,
+    ) -> Result<Message, BackendError> {
         let mut state = self
             .state
             .lock()
             .map_err(|e| BackendError::Other(format!("{} mock state poisoned: {e}", self.name)))?;
         state.outgoing_seq += 1;
+        let reply_context = reply_to.as_ref().and_then(|id| {
+            state
+                .history
+                .get(chat)
+                .and_then(|messages| messages.iter().find(|message| message.message_id == *id))
+                .map(|message| ReplyContext {
+                    id: message.message_id.clone(),
+                    sender: message.sender.clone(),
+                    text: message.text.clone(),
+                    timestamp: message.timestamp,
+                })
+        });
         let msg = Message {
-            id: format!("mock-outgoing-{}", state.outgoing_seq),
+            message_id: format!("mock-outgoing-{}", state.outgoing_seq).into(),
             chat: chat.clone(),
             sender: "You".into(),
             text: text.to_string(),
             timestamp: now(),
             from_me: true,
-            options: Vec::new(),
+            msg_actions: vec![MessageAction::Edit, MessageAction::Delete],
+            reply_to_id: reply_to.clone(),
+            reply_to: reply_context,
+            pending: false,
+            failed: false,
         };
         state
             .history
@@ -171,7 +235,7 @@ impl Messenger for MockMessenger {
         drop(state);
 
         self.tx
-            .send(BackendEvent::MessageReceived(msg))
+            .send(BackendEvent::MessageReceived(msg.clone()))
             .map_err(|_| BackendError::Other("event channel closed".into()))?;
         if let Some(chat) = updated_chat {
             self.tx
@@ -181,6 +245,30 @@ impl Messenger for MockMessenger {
 
         if chat == &self.echo_chat {
             self.spawn_echo(chat.clone(), text);
+        }
+        Ok(msg)
+    }
+
+    async fn delete(&self, chat: &ChatId, id: &MessageId) -> Result<(), BackendError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|e| BackendError::Other(format!("{} mock state poisoned: {e}", self.name)))?;
+        if let Some(msgs) = state.history.get_mut(chat) {
+            msgs.retain(|m| m.message_id != *id);
+        }
+        Ok(())
+    }
+
+    async fn edit(&self, chat: &ChatId, id: &MessageId, text: &str) -> Result<(), BackendError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|e| BackendError::Other(format!("{} mock state poisoned: {e}", self.name)))?;
+        if let Some(msgs) = state.history.get_mut(chat)
+            && let Some(m) = msgs.iter_mut().find(|m| m.message_id == *id)
+        {
+            m.text = text.to_string();
         }
         Ok(())
     }
@@ -195,16 +283,6 @@ impl Messenger for MockMessenger {
             .lock()
             .map_err(|e| BackendError::Other(format!("{} mock state poisoned: {e}", self.name)))?;
         state.connected = false;
-        Ok(())
-    }
-
-    async fn login(&mut self) -> Result<(), BackendError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|e| BackendError::Other(format!("{} mock state poisoned: {e}", self.name)))?;
-        state.authenticated = true;
-        state.connected = true;
         Ok(())
     }
 
@@ -231,13 +309,17 @@ impl MockMessenger {
             };
             state.outgoing_seq += 1;
             let msg = Message {
-                id: format!("mock-echo-{}", state.outgoing_seq),
+                message_id: format!("mock-echo-{}", state.outgoing_seq).into(),
                 chat: chat.clone(),
                 sender: sender.clone(),
                 text: text.clone(),
                 timestamp: now(),
                 from_me: false,
-                options: Vec::new(),
+                msg_actions: Vec::new(),
+                reply_to_id: None,
+                reply_to: None,
+                pending: false,
+                failed: false,
             };
             state
                 .history
@@ -447,13 +529,17 @@ fn long_history(chat: ChatId) -> Vec<Message> {
 
 fn message(id: &str, chat: &ChatId, sender: &str, text: &str, from_me: bool) -> Message {
     Message {
-        id: id.into(),
+        message_id: id.into(),
         chat: chat.clone(),
         sender: sender.into(),
         text: text.into(),
         timestamp: now(),
         from_me,
-        options: Vec::new(),
+        msg_actions: Vec::new(),
+        reply_to_id: None,
+        reply_to: None,
+        pending: false,
+        failed: false,
     }
 }
 
@@ -482,7 +568,7 @@ mod tests {
         let mock = MockMessenger::new("Telegram");
         let mut rx = mock.subscribe();
         let chat = mock.chats().await.unwrap().remove(0).id;
-        mock.send(&chat, "hi").await.unwrap();
+        mock.send(&chat, "hi", None).await.unwrap();
 
         let mut saw_message = false;
         let mut saw_chat = false;
@@ -523,7 +609,7 @@ mod tests {
         let mock = MockMessenger::new("Telegram");
         let mut rx = mock.subscribe();
         let echo = mock.echo_chat.clone();
-        mock.send(&echo, "hello there").await.unwrap();
+        mock.send(&echo, "hello there", None).await.unwrap();
 
         let echoed = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -543,7 +629,7 @@ mod tests {
         assert_eq!(echoed.text, "hello there");
         assert_eq!(echoed.sender, ECHO_SENDER);
         let history = mock.history(&echo).await.unwrap();
-        assert!(history.iter().any(|m| m.id == echoed.id));
+        assert!(history.iter().any(|m| m.message_id == echoed.message_id));
     }
 
     #[tokio::test]

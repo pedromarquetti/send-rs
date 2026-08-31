@@ -5,7 +5,8 @@ use ratatui_textarea::{TextArea, WrapMode};
 use std::collections::HashMap;
 
 use crate::backend::{
-    BackendError, BackendEvent, Chat, ChatId, LoginStepState, Message, MessengerKind, Provider,
+    BackendError, BackendEvent, Chat, ChatId, LoginStepState, Message, MessageAction, MessageId,
+    MessengerKind, Provider,
 };
 use crate::config::{Config, Keymap};
 use crate::tui::chat::{ChatState, OpenChat};
@@ -42,6 +43,7 @@ pub struct AppState {
 
     pub focus: Focus,
     pub screen: Screen,
+
     pub write: TextArea<'static>,
     pub pop_up: Option<PopupState>,
     pub running: bool,
@@ -53,6 +55,12 @@ pub struct AppState {
     /// While false, the chat pane shows the loading widget instead of a blank
     /// terminal (non-blocking startup).
     pub chats_loaded: bool,
+
+    /// Monotonic counter for generating local/synthetic echo message ids.
+    pub local_seq: u64,
+    pub chat_load_generation: u64,
+    pub history_refresh_in_flight: bool,
+    pub sidebar_sync_in_flight: bool,
 }
 
 pub struct LoginState {
@@ -107,6 +115,10 @@ impl AppState {
             running: true,
             login_state: None,
             chats_loaded: false,
+            local_seq: 0,
+            chat_load_generation: 0,
+            history_refresh_in_flight: false,
+            sidebar_sync_in_flight: false,
         };
 
         if open_settings {
@@ -237,6 +249,11 @@ impl AppState {
                     let text = self.write.lines().join("\n");
                     self.chat_state.save_draft(&chat_id, text);
                 }
+
+                // The edit/reply should not persist if user dismisses Write 
+                self.chat_state.pending_reply = None;
+                self.chat_state.pending_edit = None;
+
                 self.write.clear();
                 Focus::Chat
             }
@@ -313,6 +330,74 @@ impl AppState {
         self.focus = Focus::Chat;
     }
 
+    pub fn begin_chat_load(&mut self, index: usize) -> Option<(Chat, u64, MessengerKind)> {
+        let chat = self.chat_state.chats.get(index).cloned()?;
+
+        if let Some(current_chat_id) = self
+            .chat_state
+            .open_chat
+            .as_ref()
+            .map(|o| o.chat.id.clone())
+        {
+            let text = self.write.lines().join("\n");
+            self.chat_state.save_draft(&current_chat_id, text);
+            self.chat_state.save_message_selection();
+        }
+
+        self.chat_load_generation = self.chat_load_generation.wrapping_add(1);
+        self.chat_state.open_chat = None;
+        self.chat_state.chats[index].unread = false;
+        self.chat_state.chats[index].unread_count = 0;
+        self.write.clear();
+
+        if let Some(draft) = self.chat_state.load_draft(&chat.id) {
+            self.write.insert_str(draft);
+        }
+
+        self.focus = Focus::Chat;
+
+        let messenger = self
+            .messengers
+            .iter()
+            .find(|m| m.provider() == chat.id.to_provider())?
+            .clone();
+
+        Some((chat, self.chat_load_generation, messenger))
+    }
+
+    pub fn apply_chat_load(
+        &mut self,
+        chat: Chat,
+        generation: u64,
+        result: std::result::Result<Vec<Message>, BackendError>,
+    ) {
+        // Return early if user closed the chat and opened a new one
+        if generation != self.chat_load_generation
+            || self.chat_state.selected_chat().map(|c| &c.id) != Some(&chat.id)
+        {
+            return;
+        }
+
+        match result {
+            Ok(messages) => {
+                let history_len = messages.len();
+                self.chat_state.open_chat = Some(OpenChat {
+                    chat,
+                    history: messages,
+                });
+                self.chat_state.restore_message_selection(history_len);
+            }
+            Err(e) => {
+                error!(chat = %chat.contact_name, error = %e, "Failed to load history");
+                self.create_popup(PopupKind::Error(format!(
+                    "{} failed to load history for {}: {e}",
+                    chat.id.platform(),
+                    chat.contact_name
+                )));
+            }
+        }
+    }
+
     /// Inserts pasted text into the write box if it has focus.
     pub fn handle_paste(&mut self, text: String) {
         if self.focus == Focus::Write {
@@ -336,24 +421,197 @@ impl AppState {
             return;
         };
 
+        let reply_to = self.chat_state.pending_reply.take();
+        let editing = self.chat_state.pending_edit.take();
+
+        if let Some(edit_id) = editing {
+            // Editing an existing message: update in place, no echo.
+            let result = match self.chat_owner(&chat.id) {
+                Some(messenger) => messenger.edit(&chat.id, &edit_id, &text).await,
+                None => Err(BackendError::Other("no messenger for this chat".into())),
+            };
+
+            match result {
+                Ok(()) => {
+                    self.write.clear();
+                    self.chat_state.drafts.remove(&chat.id);
+                    self.chat_state.update_message_text(&edit_id, &text);
+                }
+                Err(e) => {
+                    self.create_popup(PopupKind::Error(format!(
+                        "{} failed to edit message: {e}",
+                        chat.id.platform()
+                    )));
+                }
+            }
+            return;
+        }
+
+        // Build the reply display context (for the optimistic echo) from the
+        // open chat's history, so the "You replied" indicator shows immediately.
+        let reply_context = match self.chat_state.selected_message().cloned() {
+            Some(target)
+                if reply_to
+                    .as_ref()
+                    .map(|id| target.message_id == *id)
+                    .unwrap_or(false) =>
+            {
+                Some(crate::backend::ReplyContext {
+                    id: target.message_id,
+                    sender: target.sender,
+                    text: target.text,
+                    timestamp: target.timestamp,
+                })
+            }
+            _ => None,
+        };
+
+        // Optimistically echo the outgoing message with a local, pending id.
+        self.local_seq += 1;
+        let local_id: MessageId = format!("local-{}", self.local_seq).into();
+        let local = Message {
+            message_id: local_id.clone(),
+            chat: chat.id.clone(),
+            sender: "You".into(),
+            text: text.clone(),
+            timestamp: chrono::Utc::now().timestamp(),
+            from_me: true,
+            msg_actions: vec![MessageAction::Edit, MessageAction::Delete],
+            reply_to_id: reply_to.clone(),
+            reply_to: reply_context,
+            pending: true,
+            failed: false,
+        };
+
+        let local_reply_context = local.reply_to.clone();
+        self.chat_state.push_incoming(local);
+
         let send_result = match self.chat_owner(&chat.id) {
-            Some(messenger) => messenger.send(&chat.id, &text).await,
+            Some(messenger) => messenger.send(&chat.id, &text, reply_to).await,
             None => Err(BackendError::Other("no messenger for this chat".into())),
         };
+
         match send_result {
-            Ok(()) => {
+            Ok(confirmed) => {
                 self.write.clear();
                 self.chat_state.drafts.remove(&chat.id);
+                let mut confirmed = confirmed;
+                if confirmed.reply_to.is_none() {
+                    confirmed.reply_to = local_reply_context;
+                }
+                self.chat_state.replace_message(&local_id, confirmed);
             }
-            Err(e) => self.create_popup(PopupKind::Error(format!(
-                "{} failed to send message: {e}",
-                chat.id.platform()
-            ))),
+            Err(e) => {
+                self.chat_state.mark_failed(&local_id);
+                self.create_popup(PopupKind::Error(format!(
+                    "{} failed to send message: {e}",
+                    chat.id.platform()
+                )));
+            }
+        }
+    }
+
+    /// Re-send a previously failed outgoing message (the `Retry` action).
+    /// The failed copy is replaced by a fresh pending echo, then confirmed.
+    pub async fn retry_message(&mut self, id: &MessageId) {
+        let Some(chat) = self.chat_state.selected_chat().cloned() else {
+            self.create_popup(PopupKind::Error(String::from("No chat selected")));
+            return;
+        };
+        let Some(failed) = self.chat_state.find_message(id).cloned() else {
+            return;
+        };
+        if !failed.failed {
+            return;
+        }
+
+        // Fresh pending echo reusing the original text.
+        self.local_seq += 1;
+        let new_local_id: MessageId = format!("local-{}", self.local_seq).into();
+        let mut echo = failed.clone();
+        echo.message_id = new_local_id.clone();
+        echo.pending = true;
+        echo.failed = false;
+        echo.msg_actions = vec![MessageAction::Edit, MessageAction::Delete];
+        self.chat_state.replace_message(id, echo);
+
+        let reply_to = failed.reply_to.as_ref().map(|r| r.id.clone());
+        let send_result = match self.chat_owner(&chat.id) {
+            Some(messenger) => messenger.send(&chat.id, &failed.text, reply_to).await,
+            None => Err(BackendError::Other("no messenger for this chat".into())),
+        };
+
+        match send_result {
+            Ok(confirmed) => {
+                let mut confirmed = confirmed;
+                if confirmed.reply_to.is_none() {
+                    confirmed.reply_to = failed.reply_to.clone();
+                }
+                self.chat_state.replace_message(&new_local_id, confirmed);
+            }
+            Err(e) => {
+                self.chat_state.mark_failed(&new_local_id);
+                self.create_popup(PopupKind::Error(format!(
+                    "{} failed to resend message: {e}",
+                    chat.id.platform()
+                )));
+            }
+        }
+    }
+
+    /// Set up the write box to reply to `id`. The next send will quote it.
+    pub fn reply_to_message(&mut self, id: &MessageId) {
+        self.chat_state.pending_reply = Some(id.clone());
+        self.chat_state.pending_edit = None;
+        self.focus = Focus::Write;
+    }
+
+    /// Load `id`'s text into the write box for editing. The next send will
+    /// issue an edit instead of a new message. Returns false if not found.
+    pub fn edit_message(&mut self, id: &MessageId) -> bool {
+        let Some(msg) = self.chat_state.find_message(id).cloned() else {
+            return false;
+        };
+        self.write.clear();
+        self.write.insert_str(&msg.text);
+        self.chat_state.pending_edit = Some(id.clone());
+        self.chat_state.pending_reply = None;
+        self.focus = Focus::Write;
+        true
+    }
+
+    /// Delete a message. Local/pending ones are simply dropped from view;
+    /// confirmed ones are removed from the backend too.
+    pub async fn delete_message(&mut self, id: &MessageId) {
+        let Some(chat) = self.chat_state.selected_chat().cloned() else {
+            return;
+        };
+
+        if id.is_local() {
+            self.chat_state.remove_message(id);
+            return;
+        }
+
+        let result = match self.chat_owner(&chat.id) {
+            Some(messenger) => messenger.delete(&chat.id, id).await,
+            None => Ok(()),
+        };
+
+        match result {
+            Ok(()) => {
+                self.chat_state.remove_message(id);
+            }
+            Err(e) => {
+                self.create_popup(PopupKind::Error(format!(
+                    "{} failed to delete message: {e}",
+                    chat.id.platform()
+                )));
+            }
         }
     }
 
     /// Gets the owner of the current chat
-    fn chat_owner(&self, chat: &ChatId) -> Option<&MessengerKind> {
+    pub(crate) fn chat_owner(&self, chat: &ChatId) -> Option<&MessengerKind> {
         let target = match chat {
             ChatId::Telegram(_) => Provider::Telegram,
             ChatId::WhatsApp(_) => Provider::WhatsApp,
@@ -671,7 +929,7 @@ pub async fn fetch_all_chats(
 mod tests {
     use super::*;
     use crate::backend::mock::MockMessenger;
-    use crate::backend::{Message, Messenger};
+    use crate::backend::{Message, MessageId, Messenger};
     use tokio::sync::broadcast;
 
     async fn app_state() -> AppState {
@@ -781,13 +1039,17 @@ mod tests {
         state.handle_backend_event(
             Provider::Telegram,
             BackendEvent::MessageReceived(Message {
-                id: "incoming".into(),
+                message_id: "incoming".into(),
                 chat: ChatId::Telegram(101),
                 sender: "Telegram News".into(),
                 text: "breaking".into(),
                 timestamp: 0,
                 from_me: false,
-                options: Vec::new(),
+                msg_actions: Vec::new(),
+                reply_to_id: None,
+                reply_to: None,
+                pending: false,
+                failed: false,
             }),
         );
 
@@ -811,13 +1073,17 @@ mod tests {
         state.handle_backend_event(
             Provider::Telegram,
             BackendEvent::MessageReceived(Message {
-                id: "incoming".into(),
+                message_id: "incoming".into(),
                 chat: ChatId::Telegram(103),
                 sender: "Alice".into(),
                 text: "hi".into(),
                 timestamp: 0,
                 from_me: false,
-                options: Vec::new(),
+                msg_actions: Vec::new(),
+                reply_to_id: None,
+                reply_to: None,
+                pending: false,
+                failed: false,
             }),
         );
 
@@ -1029,11 +1295,49 @@ mod tests {
             }
         }
 
-        async fn send(&self, _chat: &ChatId, _text: &str) -> Result<(), BackendError> {
+        async fn reply_context(
+            &self,
+            _chat: &ChatId,
+            _message_id: &MessageId,
+        ) -> Result<Option<crate::backend::ReplyContext>, BackendError> {
+            Ok(None)
+        }
+
+        async fn send(
+            &self,
+            chat: &ChatId,
+            text: &str,
+            _reply_to: Option<MessageId>,
+        ) -> Result<Message, BackendError> {
             match self.send_result.lock().unwrap().take() {
-                Some(result) => result,
-                None => Ok(()),
+                Some(Err(err)) => Err(err),
+                _ => Ok(Message {
+                    message_id: "stub-sent".into(),
+                    chat: chat.clone(),
+                    sender: "You".into(),
+                    text: text.to_string(),
+                    timestamp: 0,
+                    from_me: true,
+                    msg_actions: Vec::new(),
+                    reply_to_id: None,
+                    reply_to: None,
+                    pending: false,
+                    failed: false,
+                }),
             }
+        }
+
+        async fn delete(&self, _chat: &ChatId, _id: &MessageId) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        async fn edit(
+            &self,
+            _chat: &ChatId,
+            _id: &MessageId,
+            _text: &str,
+        ) -> Result<(), BackendError> {
+            Ok(())
         }
 
         fn subscribe(&self) -> broadcast::Receiver<BackendEvent> {

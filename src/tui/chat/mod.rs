@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use ratatui::widgets::ListState;
 
-use crate::backend::{Chat, ChatId, Message};
+use crate::backend::{Chat, ChatId, Message, MessageAction, MessageId};
 
 pub mod chat_list;
 pub mod chat_widget;
@@ -24,6 +24,15 @@ pub struct ChatState {
     pub visible_page: usize,
     /// The chat whose history is currently loaded, if any.
     pub open_chat: Option<OpenChat>,
+
+    /// The message being replied to via the write box, if any. Set when the
+    /// user initiates a reply; consumed (and cleared) on the next send.
+    pub pending_reply: Option<MessageId>,
+
+    /// The message currently being edited in the write box, if any. When set,
+    /// the next `send` issues an edit instead of a new message.
+    pub pending_edit: Option<MessageId>,
+
     /// Per-chat draft messages (unsent text saved when switching chats).
     pub drafts: HashMap<ChatId, String>,
     /// Selection state for the message list in the currently open chat.
@@ -62,11 +71,97 @@ impl ChatState {
         if self.is_open(&message.chat)
             && let Some(open) = &mut self.open_chat
         {
+            // Dedup by id: a sent message may arrive both via our optimistic
+            // echo and via the poll/update stream. Never show it twice.
+            if open
+                .history
+                .iter()
+                .any(|m| m.message_id == message.message_id)
+            {
+                return true;
+            }
             open.history.push(message);
             true
         } else {
             false
         }
+    }
+
+    /// Replace a message in the open chat's history that matches `old_id`
+    /// (e.g. swap a local pending echo for the confirmed server message).
+    /// Returns `true` if a replacement happened.
+    pub fn replace_message(&mut self, old_id: &MessageId, new: Message) -> bool {
+        if let Some(open) = &mut self.open_chat {
+            if old_id != &new.message_id {
+                open.history
+                    .retain(|msg| msg.message_id != new.message_id || msg.message_id == *old_id);
+            }
+            for msg in &mut open.history {
+                if msg.message_id == *old_id {
+                    *msg = new;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Flip an outgoing message to `failed` (kept, grayed, retryable).
+    pub fn mark_failed(&mut self, id: &MessageId) -> bool {
+        if let Some(open) = &mut self.open_chat
+            && let Some(msg) = open.history.iter_mut().find(|m| m.message_id == *id)
+        {
+            msg.failed = true;
+            msg.pending = false;
+            if !msg.msg_actions.contains(&MessageAction::Retry) {
+                msg.msg_actions.push(MessageAction::Retry);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Remove a message from the open chat's history by id.
+    pub fn remove_message(&mut self, id: &MessageId) -> bool {
+        if let Some(open) = &mut self.open_chat {
+            let before = open.history.len();
+            open.history.retain(|m| m.message_id != *id);
+            open.history.len() != before
+        } else {
+            false
+        }
+    }
+
+    /// Update the text of a message already shown in the open chat.
+    pub fn update_message_text(&mut self, id: &MessageId, text: &str) -> bool {
+        if let Some(open) = &mut self.open_chat
+            && let Some(message) = open
+                .history
+                .iter_mut()
+                .find(|message| message.message_id == *id)
+        {
+            message.text = text.to_string();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Find a message by id in the open chat's history.
+    pub fn find_message(&self, id: &MessageId) -> Option<&Message> {
+        self.open_chat
+            .as_ref()
+            .and_then(|open| open.history.iter().find(|m| m.message_id == *id))
+    }
+
+    /// The message currently selected in the open chat's list, if any.
+    pub fn selected_message(&self) -> Option<&Message> {
+        let idx = self.message_list_state.selected()?;
+
+        self.open_chat
+            .as_ref()
+            .and_then(|open| open.history.get(idx))
     }
 
     pub fn find_mut(&mut self, id: &ChatId) -> Option<(usize, &mut Chat)> {
@@ -88,7 +183,38 @@ impl ChatState {
         {
             let old_len = chat.history.len();
             let old_selected = self.message_list_state.selected();
-            chat.history = history;
+            let mut refreshed = history;
+
+            for message in &mut refreshed {
+                if let Some(previous) = chat
+                    .history
+                    .iter()
+                    .find(|item| item.message_id == message.message_id)
+                {
+                    if message.reply_to_id.is_none() {
+                        message.reply_to_id = previous.reply_to_id.clone();
+                    }
+                    if message.reply_to.is_none() {
+                        message.reply_to = previous.reply_to.clone();
+                    }
+                }
+            }
+            let local_messages: Vec<Message> = chat
+                .history
+                .iter()
+                .filter(|message| message.pending || message.failed)
+                .filter(|message| {
+                    !refreshed
+                        .iter()
+                        .any(|item| item.message_id == message.message_id)
+                })
+                .cloned()
+                .collect();
+
+            refreshed.extend(local_messages);
+            refreshed.sort_by_key(|message| message.timestamp);
+            chat.history = refreshed;
+
             let new_len = chat.history.len();
 
             // Preserve the user's current scroll position, clamped to bounds.
@@ -97,7 +223,9 @@ impl ChatState {
                 _ if new_len > 0 => Some(new_len - 1),
                 _ => None,
             };
+
             self.message_list_state.select(new_selected);
+
             // If the user was already at the bottom and new messages arrived, follow them.
             if old_len > 0 && old_selected == Some(old_len - 1) && new_len > old_len {
                 self.message_list_state.select(Some(new_len - 1));
@@ -163,13 +291,17 @@ mod tests {
 
     fn message(chat: ChatId) -> Message {
         Message {
-            id: "m".into(),
+            message_id: "m".into(),
             chat,
             sender: "Sender".into(),
             text: "hello".into(),
             timestamp: 0,
             from_me: false,
-            options: Vec::new(),
+            msg_actions: Vec::new(),
+            reply_to_id: None,
+            reply_to: None,
+            pending: false,
+            failed: false,
         }
     }
 

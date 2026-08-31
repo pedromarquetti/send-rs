@@ -33,6 +33,7 @@ impl StatefulWidget for ChatWidget<'_> {
             .selected_chat()
             .map(|chat| chat.id.tag())
             .unwrap_or_else(|| "ME");
+
         let border = match self.focus {
             Focus::Chat | Focus::Write => match tag {
                 "TG" => Style::default().fg(Color::LightBlue),
@@ -41,6 +42,7 @@ impl StatefulWidget for ChatWidget<'_> {
             },
             _ => Style::default(),
         };
+
         let title = state
             .selected_chat()
             .map(|chat| format!(" {} ", chat.contact_name))
@@ -154,11 +156,40 @@ impl StatefulWidget for ChatWidget<'_> {
             Style::default()
         };
 
-        self.write.set_block(
-            Block::bordered()
-                .title(" Write ")
-                .border_style(write_border),
-        );
+        match state.selected_message() {
+            Some(msg) => {
+                if state.pending_edit.is_some() {
+                    self.write.set_block(
+                        Block::bordered()
+                            .title(format!(" Write - Editing {} ", msg.text))
+                            .border_style(write_border),
+                    );
+                } else if state.pending_reply.is_some() {
+                    self.write.set_block(
+                        Block::bordered()
+                            .title(format!(
+                                " Write - Replying to '{}': {} ",
+                                msg.sender, msg.text
+                            ))
+                            .border_style(write_border),
+                    );
+                } else {
+                    self.write.set_block(
+                        Block::bordered()
+                            .title(" Write ")
+                            .border_style(write_border),
+                    );
+                }
+            }
+            None => {
+                self.write.set_block(
+                    Block::bordered()
+                        .title(" Write ")
+                        .border_style(write_border),
+                );
+            }
+        }
+
         Widget::render(&*self.write, write_area, buf);
     }
 }
@@ -210,21 +241,60 @@ pub(crate) fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
 
 /// Renders one message as one or more physical lines, word-wrapped to fit `width` columns.
 /// If `max_lines` is set, output is capped and a "Press Enter for full message…" hint is added.
+/// A reply indicator ("X replied") is rendered as a line above the message, and outgoing
+/// messages that are still pending (or failed) are shown grayed out.
 fn message_lines(message: &Message, width: u16, max_lines: Option<usize>) -> Vec<Line<'static>> {
     let sender = if message.from_me {
         "You".to_string()
     } else {
         message.sender.clone()
     };
-    let head = format!("{sender} {}", format_timestamp(message.timestamp));
+    let mut result: Vec<Line> = Vec::new();
+
+    if message.reply_to_id.is_some() {
+        let who = if message.from_me {
+            "You".to_string()
+        } else {
+            message.sender.clone()
+        };
+
+        result.push(Line::from(Span::styled(
+            format!("  {who} replied"),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )));
+    }
+
+    // Gray out messages that haven't been confirmed on the server yet.
+    let pending_style = message.pending || message.failed;
+    let body_style = Style::default().fg(if pending_style {
+        Color::DarkGray
+    } else {
+        Color::Gray
+    });
+
+    let status_suffix = if message.failed {
+        " ⚠ failed"
+    } else if message.pending {
+        " …"
+    } else {
+        ""
+    };
+
+    let head = format!(
+        "{sender} {}{status_suffix}",
+        format_timestamp(message.timestamp)
+    );
+
     let header_style = Style::default()
         .fg(Color::DarkGray)
         .add_modifier(Modifier::BOLD);
+
     let header_width = head.len();
 
-    let mut result = Vec::new();
-    let mut text_lines = message.text.lines();
     let mut any_truncated = false;
+    let mut text_lines = message.text.lines();
 
     match text_lines.next() {
         Some(first) => {
@@ -242,10 +312,10 @@ fn message_lines(message: &Message, width: u16, max_lines: Option<usize>) -> Vec
                 result.push(Line::from(vec![
                     Span::styled(head.clone(), header_style),
                     Span::raw("  "),
-                    Span::raw(first_chunk.clone()),
+                    Span::styled(first_chunk.clone(), body_style),
                 ]));
                 for chunk in rest {
-                    result.push(Line::from(Span::raw(chunk.clone())));
+                    result.push(Line::from(Span::styled(chunk.clone(), body_style)));
                 }
             }
         }
@@ -264,7 +334,7 @@ fn message_lines(message: &Message, width: u16, max_lines: Option<usize>) -> Vec
             any_truncated = true;
         }
         for chunk in chunks {
-            result.push(Line::from(Span::raw(chunk)));
+            result.push(Line::from(Span::styled(chunk, body_style)));
         }
     }
 
@@ -304,6 +374,10 @@ fn message_line_count(message: &Message, width: u16, max_lines: Option<usize>) -
     let wrap_width = width.saturating_sub(2) as usize;
     let mut count = 0usize;
     let mut any_truncated = false;
+
+    if message.reply_to_id.is_some() {
+        count += 1; // reply indicator line
+    }
 
     let mut text_lines = message.text.lines();
     match text_lines.next() {
@@ -377,13 +451,17 @@ mod tests {
 
     fn message(text: &str) -> Message {
         Message {
-            id: "m".into(),
+            message_id: "m".into(),
             chat: ChatId::Telegram(1),
             sender: "Alice".into(),
             text: text.into(),
             timestamp: 0,
             from_me: false,
-            options: Vec::new(),
+            msg_actions: Vec::new(),
+            reply_to_id: None,
+            reply_to: None,
+            pending: false,
+            failed: false,
         }
     }
 

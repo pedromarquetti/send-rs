@@ -34,6 +34,19 @@ enum UiEvent {
     Backend(Provider, BackendEvent),
     Resize(u16, u16),
     HistoryRefresh(ChatId, Vec<crate::backend::Message>),
+    HistoryRefreshResult(
+        ChatId,
+        std::result::Result<Vec<crate::backend::Message>, crate::backend::BackendError>,
+    ),
+    ChatLoaded {
+        chat: crate::backend::Chat,
+        generation: u64,
+        result: std::result::Result<Vec<crate::backend::Message>, crate::backend::BackendError>,
+    },
+    SidebarChats(
+        Provider,
+        std::result::Result<Vec<crate::backend::Chat>, crate::backend::BackendError>,
+    ),
     ChatsLoaded {
         chats: Vec<crate::backend::Chat>,
         errors: Vec<crate::backend::BackendError>,
@@ -80,7 +93,7 @@ async fn run_app(
         });
     }
 
-    let mut app = App::new(config, keymap, messengers, open_settings).await;
+    let mut app = App::new(config, keymap, messengers, open_settings, tx.clone()).await;
     info!("TUI started");
 
     // Kick off the initial chat list fetch in the background so the UI renders
@@ -121,50 +134,33 @@ async fn run_app(
                     });
 
                 if let Some(idx) = messenger_idx {
-                    match app.state.messengers[idx].history(&chat_id).await {
-                        Ok(history) => {
-                            debug!(chat = ?chat_id, msgs = history.len(), "Poll refresh OK");
-                            app.state.update_sidebar_from_poll(&chat_id, &history);
-                            app.state.chat_state.refresh_chat_history(&chat_id, history);
-                        }
-                        Err(e) => {
-                            error!(chat = ?chat_id, error = %e, "Poll refresh failed");
-                        }
+                    if app.state.history_refresh_in_flight {
+                        continue;
                     }
+                    app.state.history_refresh_in_flight = true;
+                    let messenger = app.state.messengers[idx].clone();
+                    let tx = tx.clone();
+                    let chat_for_task = chat_id.clone();
+                    tokio::spawn(async move {
+                        let result = messenger.history(&chat_for_task).await;
+                        let _ = tx.send(UiEvent::HistoryRefreshResult(chat_for_task, result));
+                    });
                 }
             }
 
             _ = sidebar_sync_interval.tick() => {
+                if app.state.sidebar_sync_in_flight {
+                    continue;
+                }
+                app.state.sidebar_sync_in_flight = true;
                 for messenger in app.state.messengers.iter() {
-                    match messenger.chats().await {
-                        Ok(chats) => {
-                            for chat in &chats {
-                                if let Some(entry) = app.state.chat_state.chats.iter_mut().find(|e| e.id == chat.id) {
-                                    let changed = entry.unread != chat.unread
-                                        || entry.unread_count != chat.unread_count;
-                                    if changed {
-                                        debug!(
-                                            chat = ?chat.id,
-                                            old_unread = entry.unread,
-                                            new_unread = chat.unread,
-                                            old_count = entry.unread_count,
-                                            new_count = chat.unread_count,
-                                            "Sidebar sync: unread changed"
-                                        );
-                                        entry.unread = chat.unread;
-                                        entry.unread_count = chat.unread_count;
-                                    }
-                                    if let Some(ref lm) = chat.last_message {
-                                        entry.last_message = Some(lm.clone());
-                                    }
-                                }
-                            }
-                            debug!(provider = ?messenger.provider(), chats = chats.len(), "Sidebar sync OK");
-                        }
-                        Err(e) => {
-                            error!(provider = ?messenger.provider(), error = %e, "Sidebar sync failed");
-                        }
-                    }
+                    let messenger = messenger.clone();
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let provider = messenger.provider();
+                        let result = messenger.chats().await;
+                        let _ = tx.send(UiEvent::SidebarChats(provider, result));
+                    });
                 }
             }
             event = rx.recv() => {
@@ -191,6 +187,44 @@ async fn run_app(
                         );
                         app.state.update_sidebar_from_poll(&chat_id, &history);
                         app.state.chat_state.refresh_chat_history(&chat_id, history);
+                    }
+                    UiEvent::HistoryRefreshResult(chat_id, result) => {
+                        app.state.history_refresh_in_flight = false;
+                        if app.state.chat_state.open_chat.as_ref().map(|open| &open.chat.id)
+                            != Some(&chat_id)
+                        {
+                            continue;
+                        }
+                        if let Ok(history) = result {
+                            debug!(chat = ?chat_id, msgs = history.len(), "Poll refresh OK");
+                            app.state.update_sidebar_from_poll(&chat_id, &history);
+                            app.state.chat_state.refresh_chat_history(&chat_id, history);
+                        } else if let Err(e) = result {
+                            error!(chat = ?chat_id, error = %e, "Poll refresh failed");
+                        }
+                    }
+                        UiEvent::ChatLoaded {
+                            chat,
+                            generation,
+                            result,
+                        } => app.state.apply_chat_load(chat, generation, result),
+                    UiEvent::SidebarChats(provider, result) => {
+                        app.state.sidebar_sync_in_flight = false;
+                        match result {
+                            Ok(chats) => {
+                                for chat in chats {
+                                    if let Some(entry) = app.state.chat_state.chats.iter_mut().find(|e| e.id == chat.id) {
+                                        entry.unread = chat.unread;
+                                        entry.unread_count = chat.unread_count;
+                                        if chat.last_message.is_some() {
+                                            entry.last_message = chat.last_message;
+                                        }
+                                    }
+                                }
+                                debug!(provider = ?provider, "Sidebar sync OK");
+                            }
+                            Err(e) => error!(provider = ?provider, error = %e, "Sidebar sync failed"),
+                        }
                     }
                     UiEvent::ChatsLoaded { chats, errors } => {
                         debug!(
@@ -239,6 +273,7 @@ fn spawn_terminal_reader(tx: mpsc::UnboundedSender<UiEvent>) {
 struct App {
     state: AppState,
     loading_spinner: LoadingSpinner,
+    tx: mpsc::UnboundedSender<UiEvent>,
 }
 
 impl App {
@@ -247,11 +282,32 @@ impl App {
         keymap: Keymap,
         messengers: Vec<MessengerKind>,
         open_settings: bool,
+        tx: mpsc::UnboundedSender<UiEvent>,
     ) -> Self {
         Self {
             state: AppState::new(config, keymap, messengers, open_settings).await,
             loading_spinner: LoadingSpinner::new(),
+            tx,
         }
+    }
+
+    fn start_chat_load(&mut self, index: usize) {
+        let Some((chat, generation, mut messenger)) = self.state.begin_chat_load(index) else {
+            return;
+        };
+
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = match messenger.set_read(&chat.id).await {
+                Ok(()) => messenger.history(&chat.id).await,
+                Err(e) => Err(e),
+            };
+            let _ = tx.send(UiEvent::ChatLoaded {
+                chat,
+                generation,
+                result,
+            });
+        });
     }
 
     async fn handle_key(&mut self, key: KeyEvent) {
@@ -264,7 +320,7 @@ impl App {
         }
 
         if self.state.pop_up.is_some() {
-            self.handle_popup_key(key);
+            self.handle_popup_key(key).await;
             return;
         }
 
@@ -316,16 +372,7 @@ impl App {
         let km = self.state.keymap.clone();
 
         if key == km.dismiss {
-            match self.state.focus {
-                Focus::Write => {
-                    self.state.cycle_focus();
-                }
-                Focus::Chat => {
-                    self.state.chat_state.open_chat = None;
-                    self.state.cycle_focus();
-                }
-                _ => {}
-            }
+            self.state.cycle_focus();
             return;
         }
 
@@ -339,6 +386,7 @@ impl App {
             return;
         }
 
+        // Jump from chat list to Write Box in selected chat
         if key == km.focus_write && self.state.focus != Focus::Write {
             match &self.state.chat_state.open_chat {
                 Some(_) => {
@@ -347,7 +395,7 @@ impl App {
                 }
                 None => match self.state.selected_chat_idx() {
                     Some(chat) => {
-                        self.state.select_chat(chat).await;
+                        self.start_chat_load(chat);
                         self.state.focus = Focus::Write;
                         return;
                     }
@@ -370,7 +418,7 @@ impl App {
                 {
                     match self.state.selected_chat_idx() {
                         Some(chat) => {
-                            self.state.select_chat(chat).await;
+                            self.start_chat_load(chat);
                         }
                         None => {
                             self.state
@@ -429,7 +477,31 @@ impl App {
                     && let Some(msg) = open.history.get(idx)
                 {
                     let mut msg = msg.clone();
-                    msg.options = vec![MessageAction::Reply, MessageAction::Edit];
+                    if msg.reply_to.is_none()
+                        && msg.reply_to_id.is_some()
+                        && let Some(messenger) = self.state.chat_owner(&msg.chat)
+                    {
+                        match messenger.reply_context(&msg.chat, &msg.message_id).await {
+                            Ok(context) => msg.reply_to = context,
+                            Err(error) => {
+                                tracing::debug!(
+                                    message = %msg.message_id,
+                                    %error,
+                                    "Unable to load reply context for popup"
+                                );
+                            }
+                        }
+                    }
+                    // Offer actions appropriate to the message's state.
+                    msg.msg_actions = if msg.failed {
+                        vec![MessageAction::Retry, MessageAction::Delete]
+                    } else {
+                        vec![
+                            MessageAction::Reply,
+                            MessageAction::Edit,
+                            MessageAction::Delete,
+                        ]
+                    };
                     self.state.create_popup(PopupKind::Message(msg));
                 }
             }
@@ -452,16 +524,16 @@ impl App {
         }
     }
 
-    fn handle_popup_key(&mut self, key: KeyEvent) {
+    async fn handle_popup_key(&mut self, key: KeyEvent) {
         if key == self.state.keymap.dismiss {
             self.state.dismiss_popup();
         }
+
         let km = self.state.keymap.clone();
+
         let popup = match self.state.pop_up.as_mut() {
             Some(p) => p,
-            None => {
-                return;
-            }
+            None => return,
         };
 
         if key == km.scroll_up {
@@ -470,24 +542,51 @@ impl App {
             popup.scroll_idx = popup.scroll_idx.saturating_add(1);
         }
 
-        if let PopupKind::Message(msg) = &popup.popup_type
-            && let KeyCode::Char(c) = key.code
-            && let Some(digit) = c.to_digit(10)
-        {
-            let idx = (digit as usize).saturating_sub(1);
-            if idx < msg.options.len() {
-                // TODO: implement MessageAction actions
-                match msg.options[idx] {
-                    MessageAction::Reply => {
-                        self.state
-                            .create_popup(PopupKind::Info(String::from("reply")));
+        let action = {
+            if let PopupKind::Message(msg) = &popup.popup_type
+                && let KeyCode::Char(c) = key.code
+                && let Some(digit) = c.to_digit(10)
+            {
+                let idx = (digit as usize).saturating_sub(1);
+                (idx < msg.msg_actions.len())
+                    .then(|| (msg.msg_actions[idx].clone(), msg.message_id.clone()))
+            } else if let PopupKind::Question(_) = &popup.popup_type
+                && let KeyCode::Char(c) = key.code
+                && let Some(digit) = c.to_digit(10)
+            {
+                if let Some(msg) = &self.state.chat_state.selected_message() {
+                    let idx = (digit as usize).saturating_sub(1);
+                    (idx <= 2).then(|| (MessageAction::Delete, msg.message_id.clone()))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        if let Some((action, msg_id)) = action {
+            self.state.dismiss_popup();
+            match action {
+                MessageAction::Reply => self.state.reply_to_message(&msg_id),
+                MessageAction::Edit => {
+                    self.state.edit_message(&msg_id);
+                }
+                MessageAction::Delete => {
+                    self.state.create_popup(PopupKind::Question(String::from(
+                        "Do you really want to delete this message?",
+                    )));
+
+                    if key == KeyCode::Char('1').into() {
+                        self.state.delete_message(&msg_id).await;
+                        self.state.dismiss_popup();
                     }
-                    MessageAction::Edit => {
-                        self.state
-                            .create_popup(PopupKind::Info(String::from("edit")));
+
+                    if key == KeyCode::Char('2').into() {
+                        self.state.dismiss_popup();
                     }
                 }
-                self.state.dismiss_popup();
+                MessageAction::Retry => self.state.retry_message(&msg_id).await,
             }
         }
     }

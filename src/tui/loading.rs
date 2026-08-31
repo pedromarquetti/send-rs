@@ -68,7 +68,6 @@ impl Widget for LoadingWidget<'_> {
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::BOLD),
             ),
-
             Span::styled(
                 " Loading...",
                 Style::default()
