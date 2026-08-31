@@ -205,9 +205,11 @@ pub struct Message {
     pub timestamp: i64,
     pub from_me: bool,
     pub msg_actions: Vec<MessageAction>,
+
     pub reply_to_id: Option<MessageId>,
+
     /// Set when this message quotes an earlier one (the reply target).
-    pub reply_to: Option<ReplyContext>,
+    pub reply_ctx: Option<ReplyContext>,
     /// Truthy for an optimistic outgoing echo still awaiting confirmation.
     /// When `pending` and `failed` are both false the message is confirmed.
     pub pending: bool,

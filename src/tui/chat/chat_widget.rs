@@ -156,7 +156,13 @@ impl StatefulWidget for ChatWidget<'_> {
             Style::default()
         };
 
-        match state.selected_message() {
+        let compose_context = state
+            .pending_edit
+            .as_ref()
+            .or(state.pending_reply.as_ref())
+            .or_else(|| state.selected_message());
+
+        match compose_context {
             Some(msg) => {
                 if state.pending_edit.is_some() {
                     self.write.set_block(
@@ -358,7 +364,14 @@ fn message_lines(message: &Message, width: u16, max_lines: Option<usize>) -> Vec
         result.push(hint_line);
     }
 
-    result
+    if message.from_me {
+        result
+            .into_iter()
+            .map(|line| line.alignment(Alignment::Right))
+            .collect()
+    } else {
+        result
+    }
 }
 
 /// Counts the number of visual lines a message occupies at a given width, accounting for
@@ -459,7 +472,7 @@ mod tests {
             from_me: false,
             msg_actions: Vec::new(),
             reply_to_id: None,
-            reply_to: None,
+            reply_ctx: None,
             pending: false,
             failed: false,
         }

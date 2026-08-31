@@ -129,7 +129,7 @@ impl StatefulWidget for &mut PopUp {
                 )));
 
                 // Quote the original message this one replies to (if any).
-                if let Some(reply) = &msg.reply_to {
+                if let Some(reply) = &msg.reply_ctx {
                     content_lines.push(Line::from(Span::styled(
                         "  ─ Reply to:",
                         Style::default()

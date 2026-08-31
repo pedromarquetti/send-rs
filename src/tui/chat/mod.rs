@@ -27,11 +27,11 @@ pub struct ChatState {
 
     /// The message being replied to via the write box, if any. Set when the
     /// user initiates a reply; consumed (and cleared) on the next send.
-    pub pending_reply: Option<MessageId>,
+    pub pending_reply: Option<Message>,
 
     /// The message currently being edited in the write box, if any. When set,
     /// the next `send` issues an edit instead of a new message.
-    pub pending_edit: Option<MessageId>,
+    pub pending_edit: Option<Message>,
 
     /// Per-chat draft messages (unsent text saved when switching chats).
     pub drafts: HashMap<ChatId, String>,
@@ -208,24 +208,12 @@ impl ChatState {
                     if message.reply_to_id.is_none() {
                         message.reply_to_id = previous.reply_to_id.clone();
                     }
-                    if message.reply_to.is_none() {
-                        message.reply_to = previous.reply_to.clone();
+
+                    if message.reply_ctx.is_none() {
+                        message.reply_ctx = previous.reply_ctx.clone();
                     }
                 }
             }
-            let local_messages: Vec<Message> = chat
-                .history
-                .iter()
-                .filter(|message| message.pending || message.failed)
-                .filter(|message| {
-                    !refreshed
-                        .iter()
-                        .any(|item| item.message_id == message.message_id)
-                })
-                .cloned()
-                .collect();
-
-            refreshed.extend(local_messages);
             refreshed.sort_by_key(|message| message.timestamp);
             chat.history = refreshed;
 
@@ -313,7 +301,7 @@ mod tests {
             from_me: false,
             msg_actions: Vec::new(),
             reply_to_id: None,
-            reply_to: None,
+            reply_ctx: None,
             pending: false,
             failed: false,
         }

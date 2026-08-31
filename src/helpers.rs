@@ -1,5 +1,18 @@
 use ratatui::{layout::Flex, prelude::*};
 
+use crate::backend::MessageAction;
+
+pub fn available_message_actions(message: &crate::backend::Message) -> Vec<MessageAction> {
+    let mut actions = Vec::with_capacity(3);
+    if !message.pending && !message.failed {
+        actions.push(MessageAction::Reply);
+        if message.from_me {
+            actions.extend([MessageAction::Edit, MessageAction::Delete]);
+        }
+    }
+    actions
+}
+
 /// helper function to create a centered rect using up certain percentage of the available rect `r`
 pub fn popup_area(area: Rect, width: u16, height: u16) -> Rect {
     let vertical = Layout::vertical([Constraint::Length(height)]).flex(Flex::Center);

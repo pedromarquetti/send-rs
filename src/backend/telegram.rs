@@ -22,6 +22,23 @@ use tracing::{debug, error, info, warn};
 
 type CachedChats = Option<(Instant, Vec<Chat>)>;
 
+fn message_actions(from_me: bool) -> Vec<MessageAction> {
+    let mut actions = vec![MessageAction::Reply];
+    if from_me {
+        actions.extend([MessageAction::Edit, MessageAction::Delete]);
+    }
+
+    actions
+}
+
+async fn self_user_id(client: &Client) -> Option<ChatId> {
+    client
+        .get_me()
+        .await
+        .ok()
+        .and_then(|user| user.id().bare_id().map(ChatId::Telegram))
+}
+
 /// The active login step. Stored between `request_code` and `sign_in` calls
 /// so the TUI can collect user input across multiple frames.
 ///
@@ -112,6 +129,7 @@ impl TelegramMessenger {
                 }
             };
             info!("Telegram update stream started");
+            let mut own_chat = self_user_id(&client).await;
             let mut sync_interval =
                 tokio::time::interval(std::time::Duration::from_secs(sync_secs));
 
@@ -137,13 +155,20 @@ impl TelegramMessenger {
                                     let chat_id =
                                         ChatId::Telegram(peer.id().bare_id().unwrap_or(0));
 
+                                    if own_chat.is_none() {
+                                        own_chat = self_user_id(&client).await;
+                                    }
+
+                                    let from_me =
+                                        msg.outgoing() || own_chat.as_ref() == Some(&chat_id);
+
                                     let text = if msg.media().is_some() {
                                         "[media]".to_string()
                                     } else {
                                         msg.text().to_string()
                                     };
 
-                                    let sender = if msg.outgoing() {
+                                    let sender = if from_me {
                                         "You".to_string()
                                     } else {
                                         msg.sender()
@@ -166,14 +191,10 @@ impl TelegramMessenger {
                                         sender,
                                         text: text.clone(),
                                         timestamp: msg.date().timestamp(),
-                                        from_me: msg.outgoing(),
-                                        msg_actions: vec![
-                                            MessageAction::Reply,
-                                            MessageAction::Edit,
-                                            MessageAction::Delete,
-                                        ],
+                                        from_me,
+                                        msg_actions: message_actions(from_me),
                                         reply_to_id: msg.reply_to_message_id().map(|id| id.to_string().into()),
-                                        reply_to: reply_context(&client, &msg).await,
+                                        reply_ctx: reply_context(&client, &msg).await,
                                         pending: false,
                                         failed: false,
                                     };
@@ -186,6 +207,13 @@ impl TelegramMessenger {
                                     };
                                     let chat_id =
                                         ChatId::Telegram(peer.id().bare_id().unwrap_or(0));
+
+                                    if own_chat.is_none() {
+                                        own_chat = self_user_id(&client).await;
+                                    }
+
+                                    let from_me =
+                                        msg.outgoing() || own_chat.as_ref() == Some(&chat_id);
                                     let name = peer.name().unwrap_or("Unknown").to_string();
                                     let last_message = if msg.outgoing() {
                                         Some(format!("You: {}", msg.text()))
@@ -196,21 +224,17 @@ impl TelegramMessenger {
                                     let message = Message {
                                         message_id: msg.id().to_string().into(),
                                         chat: chat_id.clone(),
-                                        sender: if msg.outgoing() {
+                                        sender: if from_me {
                                             "You".into()
                                         } else {
                                             name.clone()
                                         },
                                         text: msg.text().to_string(),
                                         timestamp: msg.date().timestamp(),
-                                        from_me: msg.outgoing(),
-                                        msg_actions: vec![
-                                            MessageAction::Reply,
-                                            MessageAction::Edit,
-                                            MessageAction::Delete,
-                                        ],
+                                        from_me,
+                                        msg_actions: message_actions(from_me),
                                         reply_to_id: msg.reply_to_message_id().map(|id| id.to_string().into()),
-                                        reply_to: None,
+                                        reply_ctx: None,
                                         pending: false,
                                         failed: false,
                                     };
@@ -489,10 +513,13 @@ impl Messenger for TelegramMessenger {
 
         debug!(bare_id, "Fetching message history");
 
+        let own_chat = self_user_id(&self.client).await;
         let mut messages_rev = Vec::new();
         let mut msg_iter = self.client.iter_messages(peer_ref).limit(100);
+
         while let Some(msg) = msg_iter.next().await? {
-            let sender = if msg.outgoing() {
+            let from_me = msg.outgoing() || own_chat.as_ref() == Some(chat);
+            let sender = if from_me {
                 "You".to_string()
             } else {
                 msg.sender()
@@ -507,15 +534,11 @@ impl Messenger for TelegramMessenger {
                 sender,
                 text: msg.text().to_string(),
                 timestamp: msg.date().timestamp(),
-                from_me: msg.outgoing(),
-                msg_actions: vec![
-                    MessageAction::Reply,
-                    MessageAction::Edit,
-                    MessageAction::Delete,
-                ],
+                from_me,
+                msg_actions: message_actions(from_me),
                 reply_to_id: msg.reply_to_message_id().map(|id| id.to_string().into()),
                 // Reply details are fetched lazily when the message is opened.
-                reply_to: None,
+                reply_ctx: None,
                 pending: false,
                 failed: false,
             });
@@ -589,13 +612,9 @@ impl Messenger for TelegramMessenger {
             text: text.to_string(),
             timestamp: sent.date().timestamp(),
             from_me: true,
-            msg_actions: vec![
-                MessageAction::Reply,
-                MessageAction::Edit,
-                MessageAction::Delete,
-            ],
+            msg_actions: message_actions(true),
             reply_to_id: reply_to.clone(),
-            reply_to: None,
+            reply_ctx: None,
             pending: false,
             failed: false,
         })

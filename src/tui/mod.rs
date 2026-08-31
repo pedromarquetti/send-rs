@@ -12,6 +12,7 @@ use tracing::{debug, error, info};
 
 use crate::backend::{AuthSteps, BackendEvent, ChatId, MessageAction, MessengerKind, Provider};
 use crate::config::{Config, Keymap};
+use crate::helpers::available_message_actions;
 use crate::tui::chat::chat_list::ChatList;
 use crate::tui::chat::chat_widget::ChatWidget;
 use crate::tui::loading::{LoadingSpinner, LoadingWidget};
@@ -494,12 +495,12 @@ impl App {
                     && let Some(msg) = open.history.get(idx)
                 {
                     let mut msg = msg.clone();
-                    if msg.reply_to.is_none()
+                    if msg.reply_ctx.is_none()
                         && msg.reply_to_id.is_some()
                         && let Some(messenger) = self.state.chat_owner(&msg.chat)
                     {
                         match messenger.reply_context(&msg.chat, &msg.message_id).await {
-                            Ok(context) => msg.reply_to = context,
+                            Ok(context) => msg.reply_ctx = context,
                             Err(error) => {
                                 tracing::debug!(
                                     message = %msg.message_id,
@@ -510,15 +511,7 @@ impl App {
                         }
                     }
                     // Offer actions appropriate to the message's state.
-                    msg.msg_actions = if msg.failed {
-                        vec![MessageAction::Retry, MessageAction::Delete]
-                    } else {
-                        vec![
-                            MessageAction::Reply,
-                            MessageAction::Edit,
-                            MessageAction::Delete,
-                        ]
-                    };
+                    msg.msg_actions = available_message_actions(&msg);
                     self.state.create_popup(PopupKind::Message(msg));
                 }
             }
@@ -560,7 +553,14 @@ impl App {
         }
 
         let action = {
-            if let PopupKind::Message(msg) = &popup.popup_type
+            if let PopupKind::Error(_) = &popup.popup_type
+                && self.state.retry_draft.is_some()
+                && key == KeyCode::Char('1').into()
+            {
+                self.state.dismiss_popup();
+                self.state.retry_message().await;
+                return;
+            } else if let PopupKind::Message(msg) = &popup.popup_type
                 && let KeyCode::Char(c) = key.code
                 && let Some(digit) = c.to_digit(10)
             {
@@ -603,7 +603,9 @@ impl App {
                         self.state.dismiss_popup();
                     }
                 }
-                MessageAction::Retry => self.state.retry_message(&msg_id).await,
+                MessageAction::Retry => {
+                    let _ = msg_id;
+                }
             }
         }
     }
@@ -619,6 +621,7 @@ impl App {
                     &mut self.state.settings_state,
                 );
             }
+
             Screen::Login => {
                 if let Some(login_state) = self.state.login_state.as_ref() {
                     let provider = login_state.provider;

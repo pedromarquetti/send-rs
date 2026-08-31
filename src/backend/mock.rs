@@ -80,7 +80,7 @@ impl MockMessenger {
                     from_me: false,
                     msg_actions: Vec::new(),
                     reply_to_id: None,
-                    reply_to: None,
+                    reply_ctx: None,
                     pending: false,
                     failed: false,
                 };
@@ -214,7 +214,7 @@ impl Messenger for MockMessenger {
             from_me: true,
             msg_actions: vec![MessageAction::Edit, MessageAction::Delete],
             reply_to_id: reply_to.clone(),
-            reply_to: reply_context,
+            reply_ctx: reply_context,
             pending: false,
             failed: false,
         };
@@ -317,7 +317,7 @@ impl MockMessenger {
                 from_me: false,
                 msg_actions: Vec::new(),
                 reply_to_id: None,
-                reply_to: None,
+                reply_ctx: None,
                 pending: false,
                 failed: false,
             };
@@ -537,7 +537,7 @@ fn message(id: &str, chat: &ChatId, sender: &str, text: &str, from_me: bool) -> 
         from_me,
         msg_actions: Vec::new(),
         reply_to_id: None,
-        reply_to: None,
+        reply_ctx: None,
         pending: false,
         failed: false,
     }
