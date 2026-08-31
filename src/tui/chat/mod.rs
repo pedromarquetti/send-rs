@@ -148,6 +148,20 @@ impl ChatState {
         }
     }
 
+    pub fn update_message(&mut self, message: Message) -> bool {
+        if let Some(open) = &mut self.open_chat
+            && let Some(existing) = open
+                .history
+                .iter_mut()
+                .find(|existing| existing.message_id == message.message_id)
+        {
+            *existing = message;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Find a message by id in the open chat's history.
     pub fn find_message(&self, id: &MessageId) -> Option<&Message> {
         self.open_chat

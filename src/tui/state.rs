@@ -250,7 +250,7 @@ impl AppState {
                     self.chat_state.save_draft(&chat_id, text);
                 }
 
-                // The edit/reply should not persist if user dismisses Write 
+                // The edit/reply should not persist if user dismisses Write
                 self.chat_state.pending_reply = None;
                 self.chat_state.pending_edit = None;
 
@@ -872,6 +872,13 @@ impl AppState {
                 }
             }
 
+            BackendEvent::MessageUpdated(message) => {
+                self.chat_state.update_message(message.clone());
+                if let Some((_, chat)) = self.chat_state.find_mut(&message.chat) {
+                    chat.last_message = Some(format!("{}: {}", message.sender, message.text));
+                }
+            }
+
             BackendEvent::ChatUpdated(chat) => {
                 let found = self
                     .chat_state
@@ -887,7 +894,11 @@ impl AppState {
                     if !chat.contact_name.is_empty() {
                         entry.contact_name = chat.contact_name;
                     }
-                    entry.last_message = chat.last_message;
+
+                    if chat.last_message.is_some() {
+                        entry.last_message = chat.last_message;
+                    }
+
                     entry.unread = chat.unread;
                     entry.unread_count = chat.unread_count;
                 }

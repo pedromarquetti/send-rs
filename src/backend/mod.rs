@@ -221,6 +221,7 @@ pub enum BackendEvent {
     Connected,
     Disconnected(String),
     MessageReceived(Message),
+    MessageUpdated(Message),
     ChatUpdated(Chat),
     Error(String, BackendError),
 }
@@ -229,6 +230,8 @@ pub enum BackendEvent {
 pub enum BackendError {
     #[error("not authenticated")]
     NotAuthenticated,
+    #[error("Telegram rate limited; retry after {0} seconds")]
+    FloodWait(u64),
     #[error("operation failed: {0}")]
     Other(String),
 }
@@ -244,6 +247,11 @@ impl From<grammers_client::InvocationError> for BackendError {
         use grammers_client::InvocationError;
         match err {
             InvocationError::Authentication(_) => BackendError::NotAuthenticated,
+            InvocationError::Rpc(error)
+                if error.code == 420 && error.name == "FLOOD_WAIT" && error.value.is_some() =>
+            {
+                BackendError::FloodWait(error.value.unwrap() as u64)
+            }
             other => BackendError::Other(format!("Telegram: {other}")),
         }
     }

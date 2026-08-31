@@ -14,7 +14,9 @@ use grammers_client::{Client, SignInError};
 use grammers_session::updates::UpdatesLike;
 use grammers_tl_types as tl;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Instant;
+use tokio::sync::Mutex;
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
@@ -38,7 +40,9 @@ pub struct TelegramMessenger {
     api_hash: String,
     tx: broadcast::Sender<BackendEvent>,
     login_token: Arc<RwLock<Option<LoginToken>>>,
-    cached_dialogs: Arc<Mutex<Vec<Dialog>>>,
+    cached_dialogs: Arc<StdMutex<Vec<Dialog>>>,
+    chat_refresh: Arc<Mutex<()>>,
+    cached_chats: Arc<Mutex<Option<(Instant, Vec<Chat>)>>>,
     sync_update_state_secs: u64,
 }
 
@@ -76,7 +80,9 @@ impl TelegramMessenger {
             api_hash: api_hash.to_string(),
             tx,
             login_token: Arc::new(RwLock::new(None)),
-            cached_dialogs: Arc::new(Mutex::new(Vec::new())),
+            cached_dialogs: Arc::new(StdMutex::new(Vec::new())),
+            chat_refresh: Arc::new(Mutex::new(())),
+            cached_chats: Arc::new(Mutex::new(None)),
             sync_update_state_secs,
         };
 
@@ -141,12 +147,15 @@ impl TelegramMessenger {
                                             .unwrap_or("Unknown")
                                             .to_string()
                                     };
+
+                                    let text_preview: String = text.chars().take(80).collect();
                                     debug!(
                                         sender,
                                         chat_id = ?chat_id,
-                                        text_preview = &text[..text.len().min(80)],
+                                        text_preview,
                                         "MessageReceived"
                                     );
+
                                     let message = Message {
                                         message_id: msg.id().to_string().into(),
                                         chat: chat_id,
@@ -179,6 +188,30 @@ impl TelegramMessenger {
                                     } else {
                                         Some(format!("{name}: {}", msg.text()))
                                     };
+
+                                    let message = Message {
+                                        message_id: msg.id().to_string().into(),
+                                        chat: chat_id.clone(),
+                                        sender: if msg.outgoing() {
+                                            "You".into()
+                                        } else {
+                                            name.clone()
+                                        },
+                                        text: msg.text().to_string(),
+                                        timestamp: msg.date().timestamp(),
+                                        from_me: msg.outgoing(),
+                                        msg_actions: vec![
+                                            MessageAction::Reply,
+                                            MessageAction::Edit,
+                                            MessageAction::Delete,
+                                        ],
+                                        reply_to_id: msg.reply_to_message_id().map(|id| id.to_string().into()),
+                                        reply_to: None,
+                                        pending: false,
+                                        failed: false,
+                                    };
+
+                                    let _ = tx.send(BackendEvent::MessageUpdated(message));
                                     debug!(chat_id = ?chat_id, "ChatUpdated (edited)");
                                     let _ = tx.send(BackendEvent::ChatUpdated(Chat {
                                         id: chat_id,
@@ -259,6 +292,49 @@ impl TelegramMessenger {
             .find(|d| d.peer.id().bare_id() == Some(bare_id))
             .map(|d| d.peer_ref())
     }
+
+    async fn fetch_chats_once(&self) -> Result<Vec<Chat>, BackendError> {
+        info!("Fetching Telegram dialogs...");
+        let mut dialogs_iter = self.client.iter_dialogs();
+        let mut chats = Vec::new();
+        let mut raw_dialogs = Vec::new();
+
+        while let Some(dialog) = dialogs_iter.next().await? {
+            let peer = dialog.peer();
+            let id = ChatId::Telegram(peer.id().bare_id().unwrap_or(0));
+            let contact_name = peer.name().unwrap_or("Unknown").to_string();
+
+            let last_message = dialog.last_message.as_ref().map(|msg| {
+                let prefix = if msg.outgoing() {
+                    "You".to_string()
+                } else {
+                    msg.sender()
+                        .and_then(|p| p.name())
+                        .unwrap_or("Unknown")
+                        .to_string()
+                };
+                format!("{prefix}: {}", msg.text())
+            });
+
+            let unread_count = match &dialog.raw {
+                grammers_client::tl::enums::Dialog::Dialog(d) => d.unread_count,
+                grammers_client::tl::enums::Dialog::Folder(_) => 0,
+            };
+
+            chats.push(Chat {
+                id,
+                contact_name,
+                last_message,
+                unread: unread_count > 0,
+                unread_count,
+                scroll: 0,
+            });
+            raw_dialogs.push(dialog);
+        }
+        info!("Loaded {} Telegram dialogs", chats.len());
+        self.cache_dialogs(raw_dialogs);
+        Ok(chats)
+    }
 }
 
 /// Fetches the quoted original message for an incoming reply and builds its
@@ -307,47 +383,35 @@ impl Messenger for TelegramMessenger {
     }
 
     async fn chats(&self) -> Result<Vec<Chat>, BackendError> {
-        info!("Fetching Telegram dialogs...");
-        let mut dialogs_iter = self.client.iter_dialogs();
-        let mut chats = Vec::new();
-        let mut raw_dialogs = Vec::new();
-
-        while let Some(dialog) = dialogs_iter.next().await? {
-            let peer = dialog.peer();
-            let id = ChatId::Telegram(peer.id().bare_id().unwrap_or(0));
-            let contact_name = peer.name().unwrap_or("Unknown").to_string();
-
-            let last_message = dialog.last_message.as_ref().map(|msg| {
-                let prefix = if msg.outgoing() {
-                    "You".to_string()
-                } else {
-                    msg.sender()
-                        .and_then(|p| p.name())
-                        .unwrap_or("Unknown")
-                        .to_string()
-                };
-                format!("{prefix}: {}", msg.text())
-            });
-
-            let unread_count = match &dialog.raw {
-                grammers_client::tl::enums::Dialog::Dialog(d) => d.unread_count,
-                grammers_client::tl::enums::Dialog::Folder(_) => 0,
-            };
-
-            chats.push(Chat {
-                id,
-                contact_name,
-                last_message,
-                unread: unread_count > 0,
-                unread_count,
-                scroll: 0,
-            });
-            raw_dialogs.push(dialog);
+        let _refresh = self.chat_refresh.lock().await;
+        {
+            let cached = self.cached_chats.lock().await;
+            if let Some((loaded_at, chats)) = cached.as_ref()
+                && loaded_at.elapsed() < std::time::Duration::from_secs(5)
+            {
+                debug!("Using cached Telegram dialogs");
+                return Ok(chats.clone());
+            }
         }
 
-        info!("Loaded {} Telegram dialogs", chats.len());
-        self.cache_dialogs(raw_dialogs);
-        Ok(chats)
+        for attempt in 0..=1 {
+            match self.fetch_chats_once().await {
+                Ok(chats) => {
+                    *self.cached_chats.lock().await = Some((Instant::now(), chats.clone()));
+                    return Ok(chats);
+                }
+                Err(BackendError::FloodWait(seconds)) if attempt == 0 => {
+                    warn!(
+                        seconds,
+                        "Telegram rate limited while fetching dialogs; retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        unreachable!("the bounded Telegram dialog retry always returns")
     }
 
     async fn set_read(&mut self, chat: &ChatId) -> Result<(), BackendError> {

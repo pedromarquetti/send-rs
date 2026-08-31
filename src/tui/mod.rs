@@ -113,8 +113,9 @@ async fn run_app(
     ));
     chat_poll_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
+    let sidebar_period = Duration::from_secs(app.state.config.sidebar_sync_secs);
     let mut sidebar_sync_interval =
-        tokio::time::interval(Duration::from_secs(app.state.config.sidebar_sync_secs));
+        tokio::time::interval_at(tokio::time::Instant::now() + sidebar_period, sidebar_period);
     sidebar_sync_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
