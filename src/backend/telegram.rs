@@ -303,14 +303,11 @@ impl TelegramMessenger {
                                             max_id = u.max_id,
                                             "ReadHistoryInbox"
                                         );
-                                        let _ = tx.send(BackendEvent::ChatUpdated(Chat {
-                                            id: chat_id,
-                                            contact_name: String::new(),
-                                            last_message: None,
-                                            scroll: 0,
+                                        let _ = tx.send(BackendEvent::UnreadUpdated {
+                                            chat: chat_id,
                                             unread: u.still_unread_count > 0,
                                             unread_count: u.still_unread_count,
-                                        }));
+                                        });
                                     } else if let tl::enums::Update::ReadChannelInbox(ref u) = *raw {
                                         let chat_id = ChatId::Telegram(u.channel_id);
                                         debug!(
@@ -319,14 +316,11 @@ impl TelegramMessenger {
                                             max_id = u.max_id,
                                             "ReadChannelInbox"
                                         );
-                                        let _ = tx.send(BackendEvent::ChatUpdated(Chat {
-                                            id: chat_id,
-                                            contact_name: String::new(),
-                                            last_message: None,
-                                            scroll: 0,
+                                        let _ = tx.send(BackendEvent::UnreadUpdated {
+                                            chat: chat_id,
                                             unread: u.still_unread_count > 0,
                                             unread_count: u.still_unread_count,
-                                        }));
+                                        });
                                     } else {
                                         debug!("Telegram update (unhandled): {raw:?}");
                                     }

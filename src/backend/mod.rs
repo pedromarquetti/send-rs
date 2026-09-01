@@ -229,6 +229,11 @@ pub enum BackendEvent {
         chat: Option<ChatId>,
         message_ids: Vec<MessageId>,
     },
+    UnreadUpdated {
+        chat: ChatId,
+        unread: bool,
+        unread_count: i32,
+    },
     ChatUpdated(Chat),
     Error(String, BackendError),
 }

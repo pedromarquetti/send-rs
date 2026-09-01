@@ -898,6 +898,17 @@ impl AppState {
                 }
             }
 
+            BackendEvent::UnreadUpdated {
+                chat,
+                unread,
+                unread_count,
+            } => {
+                if let Some((_, entry)) = self.chat_state.find_mut(&chat) {
+                    entry.unread = unread;
+                    entry.unread_count = unread_count;
+                }
+            }
+
             BackendEvent::ChatUpdated(chat) => {
                 debug!(chat = ?chat.id, "TUI ChatUpdated");
                 self.chat_state.upsert_chat(chat);
