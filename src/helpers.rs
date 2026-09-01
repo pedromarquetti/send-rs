@@ -3,13 +3,17 @@ use ratatui::{layout::Flex, prelude::*};
 use crate::backend::MessageAction;
 
 pub fn available_message_actions(message: &crate::backend::Message) -> Vec<MessageAction> {
-    let mut actions = Vec::with_capacity(3);
-    if !message.pending && !message.failed {
-        actions.push(MessageAction::Reply);
-        if message.from_me {
-            actions.extend([MessageAction::Edit, MessageAction::Delete]);
-        }
+    if message.pending || message.failed {
+        return Vec::new();
     }
+
+    let mut actions = Vec::with_capacity(3);
+    actions.push(MessageAction::Reply);
+
+    if message.from_me {
+        actions.extend([MessageAction::Edit, MessageAction::Delete]);
+    }
+
     actions
 }
 
@@ -90,4 +94,55 @@ pub fn parse_text<'l>(lines: &mut Vec<Line<'l>>, text: String, width: usize) {
     }
 
     lines.push(Line::from(""));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::available_message_actions;
+    use crate::backend::{ChatId, Message, MessageAction, MessageId};
+
+    fn sample_message(from_me: bool, pending: bool, failed: bool) -> Message {
+        Message {
+            message_id: MessageId::from("msg-1"),
+            chat: ChatId::Myself,
+            sender: if from_me { "You".into() } else { "Them".into() },
+            text: "hello".to_string(),
+            timestamp: 0,
+            from_me,
+            msg_actions: Vec::new(),
+            reply_to_id: None,
+            reply_ctx: None,
+            pending,
+            failed,
+        }
+    }
+
+    #[test]
+    fn incoming_messages_only_offer_reply() {
+        let message = sample_message(false, false, false);
+        let actions = available_message_actions(&message);
+        assert_eq!(actions, vec![MessageAction::Reply]);
+    }
+
+    #[test]
+    fn outgoing_messages_offer_edit_and_delete() {
+        let message = sample_message(true, false, false);
+        let actions = available_message_actions(&message);
+        assert_eq!(
+            actions,
+            vec![
+                MessageAction::Reply,
+                MessageAction::Edit,
+                MessageAction::Delete
+            ]
+        );
+    }
+
+    #[test]
+    fn pending_or_failed_messages_offer_no_actions() {
+        let pending = sample_message(true, true, false);
+        let failed = sample_message(false, false, true);
+        assert!(available_message_actions(&pending).is_empty());
+        assert!(available_message_actions(&failed).is_empty());
+    }
 }

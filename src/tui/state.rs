@@ -533,6 +533,10 @@ impl AppState {
             return;
         };
 
+        if message.pending || message.failed {
+            return;
+        }
+
         self.chat_state.pending_reply = Some(message);
         self.chat_state.pending_edit = None;
         self.focus = Focus::Write;
@@ -544,6 +548,11 @@ impl AppState {
         let Some(msg) = self.chat_state.find_message(id).cloned() else {
             return false;
         };
+
+        if !msg.from_me || msg.pending || msg.failed {
+            return false;
+        }
+
         self.write.clear();
         self.write.insert_str(&msg.text);
         self.chat_state.pending_edit = Some(msg);
@@ -558,6 +567,18 @@ impl AppState {
         let Some(chat) = self.chat_state.selected_chat().cloned() else {
             return;
         };
+
+        let Some(message) = self.chat_state.find_message(id).cloned() else {
+            return;
+        };
+
+        if !message.from_me || message.pending || message.failed {
+            self.create_popup(PopupKind::Error(format!(
+                "{} cannot delete this message",
+                chat.id.platform()
+            )));
+            return;
+        }
 
         if id.is_local() {
             self.chat_state.remove_message(id);
