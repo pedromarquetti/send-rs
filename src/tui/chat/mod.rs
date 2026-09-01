@@ -362,6 +362,7 @@ mod tests {
             timestamp: 0,
             from_me: false,
             msg_actions: Vec::new(),
+            media: None,
             reply_to_id: None,
             reply_ctx: None,
             pending: false,

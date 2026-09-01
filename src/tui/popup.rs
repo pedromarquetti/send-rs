@@ -128,6 +128,33 @@ impl StatefulWidget for &mut PopUp {
                         .add_modifier(Modifier::BOLD),
                 )));
 
+                if let Some(media) = &msg.media {
+                    let media_label = format!("  {}: click to show", media.kind.label());
+                    content_lines.push(Line::from(Span::styled(
+                        media_label,
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )));
+                    content_lines.push(Line::from(Span::styled(
+                        "  Terminal media preview is not rendered here;\n this is a placeholder",
+                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                    )));
+                    if let Some(caption) = media
+                        .caption
+                        .as_ref()
+                        .filter(|caption| !caption.trim().is_empty())
+                    {
+                        content_lines.push(Line::from(Span::raw("")));
+                        for text_line in caption.lines() {
+                            let chunks = wrap_text(text_line, content_width);
+                            for chunk in chunks {
+                                content_lines.push(Line::from(Span::raw(chunk)));
+                            }
+                        }
+                    }
+                }
+
                 // Quote the original message this one replies to (if any).
                 if let Some(reply) = &msg.reply_ctx {
                     content_lines.push(Line::from(Span::styled(
@@ -152,19 +179,21 @@ impl StatefulWidget for &mut PopUp {
                     content_lines.push(Line::from(Span::raw("")));
                 }
 
-                for text_line in msg.text.lines() {
-                    let chunks = wrap_text(text_line, content_width);
-                    if chunks.is_empty() {
-                        content_lines.push(Line::from(Span::raw("")));
-                    } else {
-                        for chunk in chunks {
-                            content_lines.push(Line::from(Span::raw(chunk)));
+                if msg.media.is_none() {
+                    for text_line in msg.text.lines() {
+                        let chunks = wrap_text(text_line, content_width);
+                        if chunks.is_empty() {
+                            content_lines.push(Line::from(Span::raw("")));
+                        } else {
+                            for chunk in chunks {
+                                content_lines.push(Line::from(Span::raw(chunk)));
+                            }
                         }
                     }
-                }
 
-                if msg.text.is_empty() {
-                    content_lines.push(Line::from(Span::raw("")));
+                    if msg.text.is_empty() {
+                        content_lines.push(Line::from(Span::raw("")));
+                    }
                 }
 
                 let options_spans: Vec<Span> = msg

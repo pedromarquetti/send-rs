@@ -20,7 +20,9 @@ the future?) in one TUI app!
 - [ ] Telegram integration
 - [ ] Message actions (reply, edit, delete) for telegram
 - [ ] Support for notifications
+- [ ] Support for endless chat scroll (currently limited history fetch)
 - [ ] Image rendering
+- [ ] Audio playback
 - [ ] Ordered chat list - All chats, ordered by pinned/most recent.
 - [ ] Dedicated chatlist for each provider
 

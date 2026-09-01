@@ -196,6 +196,36 @@ pub enum MessageAction {
     Retry,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MediaKind {
+    Image,
+    Audio,
+    Video,
+    Document,
+    Sticker,
+    Unsupported,
+}
+
+impl MediaKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Image => "Image",
+            Self::Audio => "Audio",
+            Self::Video => "Video",
+            Self::Document => "Document",
+            Self::Sticker => "Sticker",
+            Self::Unsupported => "Media",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageMedia {
+    pub kind: MediaKind,
+    pub caption: Option<String>,
+    pub file_name: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Message {
     pub message_id: MessageId,
@@ -205,6 +235,8 @@ pub struct Message {
     pub timestamp: i64,
     pub from_me: bool,
     pub msg_actions: Vec<MessageAction>,
+
+    pub media: Option<MessageMedia>,
 
     pub reply_to_id: Option<MessageId>,
 

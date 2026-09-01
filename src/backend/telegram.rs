@@ -1,8 +1,8 @@
 use crate::backend::AuthSteps;
 
 use super::{
-    BackendError, BackendEvent, Chat, ChatId, LoginStepState, Message, MessageAction, MessageId,
-    Messenger, ReplyContext,
+    BackendError, BackendEvent, Chat, ChatId, LoginStepState, MediaKind, Message, MessageAction,
+    MessageId, MessageMedia, Messenger, ReplyContext,
 };
 use anyhow::Result;
 use grammers_client::client::UpdatesConfiguration;
@@ -33,13 +33,53 @@ fn message_actions(from_me: bool) -> Vec<MessageAction> {
     actions
 }
 
-fn telegram_message_text(msg: &grammers_client::message::Message) -> String {
-    let text = msg.text().to_string();
-    if text.trim().is_empty() && msg.media().is_some() {
-        "[media]".to_string()
-    } else {
-        text
+fn telegram_media_kind(msg: &grammers_client::message::Message) -> Option<MediaKind> {
+    match msg.media()? {
+        grammers_client::media::Media::Photo(_) => Some(MediaKind::Image),
+        grammers_client::media::Media::Document(doc) => {
+            let raw = doc.raw;
+
+            if raw.video {
+                return Some(MediaKind::Video);
+            }
+
+            if raw.voice {
+                return Some(MediaKind::Audio);
+            };
+
+            Some(MediaKind::Document)
+        }
+        grammers_client::media::Media::Sticker(_) => Some(MediaKind::Sticker),
+        grammers_client::media::Media::Geo(_) => Some(MediaKind::Unsupported),
+        grammers_client::media::Media::Dice(_) => Some(MediaKind::Unsupported),
+        grammers_client::media::Media::Venue(_) => Some(MediaKind::Unsupported),
+        grammers_client::media::Media::GeoLive(_) => Some(MediaKind::Unsupported),
+        grammers_client::media::Media::WebPage(_) => Some(MediaKind::Unsupported),
+        grammers_client::media::Media::Contact(_) => Some(MediaKind::Unsupported),
+        grammers_client::media::Media::Poll(_) => Some(MediaKind::Unsupported),
+        _ => Some(MediaKind::Unsupported),
     }
+}
+
+fn telegram_message_media(msg: &grammers_client::message::Message) -> Option<MessageMedia> {
+    let kind = telegram_media_kind(msg)?;
+    let caption = (!msg.text().trim().is_empty()).then(|| msg.text().to_string());
+    Some(MessageMedia {
+        kind,
+        caption,
+        file_name: None,
+    })
+}
+
+fn telegram_message_text(msg: &grammers_client::message::Message) -> String {
+    if let Some(media) = telegram_message_media(msg) {
+        return media
+            .caption
+            .filter(|caption| !caption.trim().is_empty())
+            .unwrap_or_else(|| format!("{}, click to show", media.kind.label()));
+    }
+
+    msg.text().to_string()
 }
 
 fn telegram_message_sender(msg: &grammers_client::message::Message, from_me: bool) -> String {
@@ -72,7 +112,17 @@ fn normalize_telegram_message(
 ) -> Message {
     let from_me = msg.outgoing() || own_chat == Some(chat);
     let sender = telegram_message_sender(msg, from_me);
-    let text = telegram_message_text(msg);
+    let media = telegram_message_media(msg);
+    let text = media
+        .as_ref()
+        .and_then(|media| media.caption.clone())
+        .filter(|caption| !caption.trim().is_empty())
+        .unwrap_or_else(|| {
+            media
+                .as_ref()
+                .map(|media| format!("{}, click to show", media.kind.label()))
+                .unwrap_or_else(|| msg.text().to_string())
+        });
 
     Message {
         message_id: telegram_message_id(msg),
@@ -82,6 +132,7 @@ fn normalize_telegram_message(
         timestamp: msg.date().timestamp(),
         from_me,
         msg_actions: message_actions(from_me),
+        media,
         reply_to_id: telegram_message_reply_to(msg),
         reply_ctx,
         pending,
