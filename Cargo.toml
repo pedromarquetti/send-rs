@@ -13,6 +13,7 @@ tokio = { version = "1", features = [
   "macros",
   "sync",
   "time",
+  "signal",
 ] }
 
 grammers-client = "0.10"

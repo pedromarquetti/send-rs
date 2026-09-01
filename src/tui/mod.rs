@@ -32,6 +32,7 @@ mod status_bar;
 enum UiEvent {
     Key(KeyEvent),
     Paste(String),
+    Shutdown,
     Backend(Provider, BackendEvent),
     Resize(u16, u16),
     HistoryRefresh(ChatId, Vec<crate::backend::Message>),
@@ -70,6 +71,58 @@ pub async fn run(
     result
 }
 
+fn spawn_signal_listener(tx: mpsc::UnboundedSender<UiEvent>) {
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+
+            let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT listener");
+            let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM listener");
+
+            tokio::select! {
+                _ = sigint.recv() => {
+                    let _ = tx.send(UiEvent::Shutdown);
+                }
+                _ = sigterm.recv() => {
+                    let _ = tx.send(UiEvent::Shutdown);
+                }
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            use tokio::signal::windows::{
+                ctrl_break, ctrl_c, ctrl_close, ctrl_logoff, ctrl_shutdown,
+            };
+
+            let mut sigint = ctrl_c().expect("Ctrl-C listener");
+            let mut sigbreak = ctrl_break().expect("Ctrl-Break listener");
+            let mut sigclose = ctrl_close().expect("Ctrl-Close listener");
+            let mut siglogoff = ctrl_logoff().expect("Ctrl-Logoff listener");
+            let mut sigshutdown = ctrl_shutdown().expect("Ctrl-Shutdown listener");
+
+            tokio::select! {
+                _ = sigint.recv() => {
+                    let _ = tx.send(UiEvent::Shutdown);
+                }
+                _ = sigbreak.recv() => {
+                    let _ = tx.send(UiEvent::Shutdown);
+                }
+                _ = sigclose.recv() => {
+                    let _ = tx.send(UiEvent::Shutdown);
+                }
+                _ = siglogoff.recv() => {
+                    let _ = tx.send(UiEvent::Shutdown);
+                }
+                _ = sigshutdown.recv() => {
+                    let _ = tx.send(UiEvent::Shutdown);
+                }
+            }
+        }
+    });
+}
+
 async fn run_app(
     terminal: &mut DefaultTerminal,
     config: Config,
@@ -79,6 +132,7 @@ async fn run_app(
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
     spawn_terminal_reader(tx.clone());
+    spawn_signal_listener(tx.clone());
 
     // handling new events for each messenger type
     for messenger in messengers.iter() {
@@ -188,6 +242,10 @@ async fn run_app(
                 match event {
                     UiEvent::Key(key) => app.handle_key(key).await,
                     UiEvent::Paste(text) => app.state.handle_paste(text),
+                    UiEvent::Shutdown => {
+                        app.state.running = false;
+                        break;
+                    }
                     UiEvent::Backend(provider, backend_event) => {
                         debug!(
                             provider = ?provider,
