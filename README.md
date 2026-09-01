@@ -38,7 +38,7 @@ enable Telegram and/or WhatsApp.
 
 ```toml
 max_write_lines = 5
-chat_poll_interval_secs = 2
+chat_poll_interval_secs = 10
 sync_update_state_secs = 60
 sidebar_sync_secs = 10
 
@@ -74,7 +74,7 @@ whatsapp = false
 | Key                       | Default | Description                                                                                                                                                                                                                                                                                                   |
 | ------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `max_write_lines`         | `5`     | How many text lines the Write box can grow to. The input wraps long lines and scrolls once it exceeds that.                                                                                                                                                                                                   |
-| `chat_poll_interval_secs` | `2`     | How often (in seconds) the TUI polls for new messages in the **currently open** chat. Lower values feel more responsive but use more resources.                                                                                                                                                               |
+| `chat_poll_interval_secs` | `10`    | Fallback interval (in seconds) for reconciling messages in the **currently open** chat when push updates are unavailable. Lower values feel more responsive but use more resources.                                                                                                            |
 | `sync_update_state_secs`  | `120`   | How often (in seconds) the Telegram client persists its internal update-state (pts/qts/seq) to the session file. This does **not** call any Telegram API — it only saves local state so that `catch_up` on restart is faster. I recommend setting a high value, because it does consume Disk IO               |
 | `sidebar_sync_secs`       | `10`    | How often (in seconds) the TUI fetches the full dialog list from Telegram to detect **unread-count changes across all chats**. This is the mechanism that updates unread indicators on chats you are not currently viewing. Increase this if you notice high CPU usage; decrease it for snappier unread dots. |
 

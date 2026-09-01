@@ -231,9 +231,15 @@ async fn run_app(
                         match result {
                             Ok(chats) => {
                                 for chat in chats {
+                                    let is_open = app.state.chat_state.is_open(&chat.id);
                                     if let Some(entry) = app.state.chat_state.chats.iter_mut().find(|e| e.id == chat.id) {
-                                        entry.unread = chat.unread;
-                                        entry.unread_count = chat.unread_count;
+                                        if is_open {
+                                            entry.unread = false;
+                                            entry.unread_count = 0;
+                                        } else {
+                                            entry.unread = chat.unread;
+                                            entry.unread_count = chat.unread_count;
+                                        }
                                         if chat.last_message.is_some() {
                                             entry.last_message = chat.last_message;
                                         }

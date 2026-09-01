@@ -189,9 +189,17 @@ impl ChatState {
             .find(|(_, chat)| chat.id == *id)
     }
 
+    pub fn mark_read(&mut self, id: &ChatId) {
+        if let Some((_, chat)) = self.find_mut(id) {
+            chat.unread = false;
+            chat.unread_count = 0;
+        }
+    }
+
     /// Insert or update a sidebar chat entry from a push update while keeping
     /// the existing order intact and preserving user-visible scroll state.
     pub fn upsert_chat(&mut self, chat: Chat) -> bool {
+        let selected_id = self.selected_chat().map(|selected| selected.id.clone());
         if let Some((pos, entry)) = self.find_mut(&chat.id) {
             if !chat.contact_name.is_empty()
                 && chat.contact_name != "Unknown"
@@ -221,12 +229,20 @@ impl ChatState {
                 let item = self.chats.remove(pos);
                 self.chats.insert(0, item);
             }
+            if let Some(selected_id) = selected_id {
+                let selected = self.chats.iter().position(|item| item.id == selected_id);
+                self.chat_list_state.select(selected);
+            }
             return true;
         }
 
         let mut chat = chat;
         chat.scroll = 0;
         self.chats.insert(0, chat);
+        if let Some(selected_id) = selected_id {
+            let selected = self.chats.iter().position(|item| item.id == selected_id);
+            self.chat_list_state.select(selected);
+        }
         true
     }
 
@@ -417,6 +433,29 @@ mod tests {
         state.upsert_chat(chat(id, "You"));
 
         assert_eq!(state.chats[0].contact_name, "Chat1");
+    }
+
+    #[test]
+    fn upsert_keeps_selected_chat_selected_when_bumped() {
+        let selected_id = ChatId::Telegram(2);
+        let mut state = ChatState {
+            chats: vec![
+                chat(ChatId::Telegram(1), "A"),
+                chat(selected_id.clone(), "B"),
+                chat(ChatId::Telegram(3), "C"),
+            ],
+            ..Default::default()
+        };
+        state.chat_list_state.select(Some(1));
+
+        state.upsert_chat(Chat {
+            id: selected_id,
+            last_message: Some("B: newest".into()),
+            ..Default::default()
+        });
+
+        assert_eq!(state.chat_list_state.selected(), Some(0));
+        assert_eq!(state.selected_chat().unwrap().contact_name, "B");
     }
 
     #[test]

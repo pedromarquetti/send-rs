@@ -818,51 +818,67 @@ impl AppState {
             }
             BackendEvent::MessageReceived(message) => {
                 let is_open = self.chat_state.push_incoming(message.clone());
+
                 if is_open
                     && let Some(len) = self.chat_state.open_chat.as_ref().map(|o| o.history.len())
                 {
                     self.chat_state.message_list_state.select(Some(len - 1));
                 }
+
                 let open_chat_id = self
                     .chat_state
                     .open_chat
                     .as_ref()
                     .map(|o| o.chat.id.clone());
-                let found = self.chat_state.find_mut(&message.chat);
+
+                let preview = crate::helpers::message_preview(&message.sender, &message.text);
+                let previous_unread_count = self
+                    .chat_state
+                    .chats
+                    .iter()
+                    .find(|chat| chat.id == message.chat)
+                    .map(|chat| chat.unread_count)
+                    .unwrap_or(0);
+
+                let mut chat_update = Chat {
+                    id: message.chat.clone(),
+                    contact_name: message.sender.clone(),
+                    last_message: Some(preview),
+                    ..Default::default()
+                };
+
+                if !message.from_me && !is_open {
+                    chat_update.unread = true;
+                    chat_update.unread_count = previous_unread_count.saturating_add(1);
+                }
+
+                let sidebar_found = self
+                    .chat_state
+                    .chats
+                    .iter()
+                    .any(|chat| chat.id == message.chat);
+
+                self.chat_state.upsert_chat(chat_update);
+
+                if is_open {
+                    self.chat_state.mark_read(&message.chat);
+                }
+
                 debug!(
                     chat = ?message.chat,
                     from_me = message.from_me,
                     is_open,
-                    sidebar_found = found.is_some(),
+                    sidebar_found,
                     open_chat_id = ?open_chat_id,
                     text_preview = &message.text[..message.text.len().min(60)],
                     "TUI MessageReceived",
                 );
-                if let Some((_, chat)) = found {
-                    chat.last_message = Some(crate::helpers::message_preview(
-                        &message.sender,
-                        &message.text,
-                    ));
 
-                    if !message.from_me && !is_open {
-                        chat.unread = true;
-                        chat.unread_count = chat.unread_count.saturating_add(1);
-                        debug!(chat = ?message.chat, "TUI set unread");
-                    }
-                } else {
-                    let preview = crate::helpers::message_preview(&message.sender, &message.text);
-                    let mut new_chat = Chat {
-                        id: message.chat.clone(),
-                        contact_name: message.sender.clone(),
-                        last_message: Some(preview.clone()),
-                        unread: !message.from_me,
-                        unread_count: if message.from_me { 0 } else { 1 },
-                        ..Default::default()
-                    };
-                    if message.from_me {
-                        new_chat.unread = false;
-                    }
-                    self.chat_state.upsert_chat(new_chat);
+                if !message.from_me && !is_open {
+                    debug!(chat = ?message.chat, "TUI set unread");
+                }
+
+                if !sidebar_found {
                     debug!(chat = ?message.chat, "TUI MessageReceived: inserted sidebar chat from push event");
                 }
             }
@@ -903,9 +919,16 @@ impl AppState {
                 unread,
                 unread_count,
             } => {
+                let is_open = self.chat_state.is_open(&chat);
+
                 if let Some((_, entry)) = self.chat_state.find_mut(&chat) {
-                    entry.unread = unread;
-                    entry.unread_count = unread_count;
+                    if is_open {
+                        entry.unread = false;
+                        entry.unread_count = 0;
+                    } else {
+                        entry.unread = unread;
+                        entry.unread_count = unread_count;
+                    }
                 }
             }
 
@@ -1073,13 +1096,16 @@ mod tests {
     #[tokio::test]
     async fn incoming_message_updates_open_chat_without_unread() {
         let mut state = app_state().await;
+
         state.chat_state.chat_list_state.select(Some(0));
         state.select_chat(0).await;
+
         assert_eq!(
             state.chat_state.open_chat.as_ref().unwrap().history.len(),
             2
         );
         assert!(!state.chat_state.chats[0].unread);
+        assert_eq!(state.chat_state.chats[0].unread_count, 0);
 
         state.handle_backend_event(
             Provider::Telegram,
@@ -1132,8 +1158,39 @@ mod tests {
             }),
         );
 
-        assert!(state.chat_state.chats[2].unread);
-        assert_eq!(state.chat_state.chats[2].unread_count, 1);
+        let chat = state
+            .chat_state
+            .chats
+            .iter()
+            .find(|chat| chat.id == ChatId::Telegram(103))
+            .expect("incoming chat remains in sidebar");
+        assert!(chat.unread);
+        assert_eq!(chat.unread_count, 1);
+    }
+
+    #[tokio::test]
+    async fn unread_update_does_not_mark_open_chat_unread() {
+        let mut state = app_state().await;
+        state.chat_state.chat_list_state.select(Some(0));
+        state.select_chat(0).await;
+
+        state.handle_backend_event(
+            Provider::Telegram,
+            BackendEvent::UnreadUpdated {
+                chat: ChatId::Telegram(101),
+                unread: true,
+                unread_count: 4,
+            },
+        );
+
+        let chat = state
+            .chat_state
+            .chats
+            .iter()
+            .find(|chat| chat.id == ChatId::Telegram(101))
+            .expect("open chat remains in sidebar");
+        assert!(!chat.unread);
+        assert_eq!(chat.unread_count, 0);
     }
 
     #[tokio::test]

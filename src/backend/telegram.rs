@@ -13,6 +13,7 @@ use grammers_client::update::Update;
 use grammers_client::{Client, SignInError};
 use grammers_session::updates::UpdatesLike;
 use grammers_tl_types as tl;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
@@ -77,6 +78,7 @@ pub struct TelegramMessenger {
     cached_dialogs: Arc<StdMutex<Vec<Dialog>>>,
     chat_refresh: Arc<Mutex<()>>,
     cached_chats: Arc<Mutex<CachedChats>>,
+    reply_contexts: Arc<Mutex<HashMap<(ChatId, MessageId), ReplyContext>>>,
     flood_wait_until: Arc<Mutex<Option<Instant>>>,
     sync_update_state_secs: u64,
 }
@@ -118,6 +120,7 @@ impl TelegramMessenger {
             cached_dialogs: Arc::new(StdMutex::new(Vec::new())),
             chat_refresh: Arc::new(Mutex::new(())),
             cached_chats: Arc::new(Mutex::new(None)),
+            reply_contexts: Arc::new(Mutex::new(HashMap::new())),
             flood_wait_until: Arc::new(Mutex::new(None)),
             sync_update_state_secs,
         };
@@ -130,6 +133,7 @@ impl TelegramMessenger {
         let client = self.client.clone();
         let tx = self.tx.clone();
         let sync_secs = self.sync_update_state_secs;
+        let cached_chats = self.cached_chats.clone();
 
         tokio::spawn(async move {
             // Avoid eager bulk diffs on reconnects: live push updates are the
@@ -209,12 +213,16 @@ impl TelegramMessenger {
                                         from_me,
                                         msg_actions: message_actions(from_me),
                                         reply_to_id: msg.reply_to_message_id().map(|id| id.to_string().into()),
-                                        reply_ctx: reply_context(&client, &msg).await,
+                                        reply_ctx: None,
                                         pending: false,
                                         failed: false,
                                     };
+
                                     let preview = crate::helpers::message_preview(&sender, &text);
                                     let _ = tx.send(BackendEvent::MessageReceived(message.clone()));
+
+                                    *cached_chats.lock().await = None;
+
                                     let _ = tx.send(BackendEvent::ChatUpdated(Chat {
                                         id: chat_id,
                                         contact_name: pretty_peer_name(&msg, &sender),
@@ -270,6 +278,9 @@ impl TelegramMessenger {
                                     };
 
                                     let _ = tx.send(BackendEvent::MessageUpdated(message));
+
+                                    *cached_chats.lock().await = None;
+
                                     debug!(
                                         chat_id = ?chat_id,
                                         preview = ?last_message,
@@ -283,11 +294,15 @@ impl TelegramMessenger {
                                         .iter()
                                         .map(|id| id.to_string().into())
                                         .collect::<Vec<_>>();
+
                                     if message_ids.is_empty() {
                                         continue;
                                     }
+
                                     debug!(chat = ?chat, ids = message_ids.len(), "MessageDeleted");
                                     let _ = tx.send(BackendEvent::MessageDeleted { chat, message_ids });
+
+                                    *cached_chats.lock().await = None;
                                 }
                                 Update::Raw(raw) => {
                                     if let tl::enums::Update::ReadHistoryInbox(ref u) = *raw {
@@ -296,6 +311,7 @@ impl TelegramMessenger {
                                             tl::enums::Peer::Chat(c) => c.chat_id,
                                             tl::enums::Peer::Channel(c) => c.channel_id,
                                         };
+
                                         let chat_id = ChatId::Telegram(peer_id);
                                         debug!(
                                             chat_id = ?chat_id,
@@ -308,6 +324,8 @@ impl TelegramMessenger {
                                             unread: u.still_unread_count > 0,
                                             unread_count: u.still_unread_count,
                                         });
+
+                                        *cached_chats.lock().await = None;
                                     } else if let tl::enums::Update::ReadChannelInbox(ref u) = *raw {
                                         let chat_id = ChatId::Telegram(u.channel_id);
                                         debug!(
@@ -321,6 +339,8 @@ impl TelegramMessenger {
                                             unread: u.still_unread_count > 0,
                                             unread_count: u.still_unread_count,
                                         });
+
+                                        *cached_chats.lock().await = None;
                                     } else {
                                         debug!("Telegram update (unhandled): {raw:?}");
                                     }
@@ -593,6 +613,12 @@ impl Messenger for TelegramMessenger {
         chat: &ChatId,
         message_id: &MessageId,
     ) -> Result<Option<ReplyContext>, BackendError> {
+        let cache_key = (chat.clone(), message_id.clone());
+
+        if let Some(context) = self.reply_contexts.lock().await.get(&cache_key).cloned() {
+            return Ok(Some(context));
+        }
+
         let bare_id = match chat {
             ChatId::Telegram(id) => *id,
             _ => return Err(BackendError::Other("not a Telegram chat".into())),
@@ -614,7 +640,18 @@ impl Messenger for TelegramMessenger {
             .flatten();
 
         match message {
-            Some(message) => Ok(reply_context(&self.client, &message).await),
+            Some(message) => {
+                let context = reply_context(&self.client, &message).await;
+
+                if let Some(context) = &context {
+                    self.reply_contexts
+                        .lock()
+                        .await
+                        .insert(cache_key, context.clone());
+                }
+
+                Ok(context)
+            }
             None => Ok(None),
         }
     }
