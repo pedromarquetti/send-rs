@@ -33,6 +33,62 @@ fn message_actions(from_me: bool) -> Vec<MessageAction> {
     actions
 }
 
+fn telegram_message_text(msg: &grammers_client::message::Message) -> String {
+    let text = msg.text().to_string();
+    if text.trim().is_empty() && msg.media().is_some() {
+        "[media]".to_string()
+    } else {
+        text
+    }
+}
+
+fn telegram_message_sender(msg: &grammers_client::message::Message, from_me: bool) -> String {
+    if from_me {
+        return "You".to_string();
+    }
+
+    msg.sender()
+        .and_then(|p| p.name())
+        .or_else(|| msg.peer().and_then(|p| p.name()))
+        .unwrap_or("Unknown")
+        .to_string()
+}
+
+fn telegram_message_id(msg: &grammers_client::message::Message) -> MessageId {
+    msg.id().to_string().into()
+}
+
+fn telegram_message_reply_to(msg: &grammers_client::message::Message) -> Option<MessageId> {
+    msg.reply_to_message_id().map(|id| id.to_string().into())
+}
+
+fn normalize_telegram_message(
+    msg: &grammers_client::message::Message,
+    chat: &ChatId,
+    own_chat: Option<&ChatId>,
+    reply_ctx: Option<ReplyContext>,
+    pending: bool,
+    failed: bool,
+) -> Message {
+    let from_me = msg.outgoing() || own_chat == Some(chat);
+    let sender = telegram_message_sender(msg, from_me);
+    let text = telegram_message_text(msg);
+
+    Message {
+        message_id: telegram_message_id(msg),
+        chat: chat.clone(),
+        sender,
+        text,
+        timestamp: msg.date().timestamp(),
+        from_me,
+        msg_actions: message_actions(from_me),
+        reply_to_id: telegram_message_reply_to(msg),
+        reply_ctx,
+        pending,
+        failed,
+    }
+}
+
 async fn self_user_id(client: &Client) -> Option<ChatId> {
     client
         .get_me()
@@ -241,24 +297,13 @@ impl TelegramMessenger {
                                             own_chat = self_user_id(&current_client).await;
                                         }
 
+                                        let reply_ctx = reply_context(&current_client, &msg).await;
+
                                         let from_me =
                                             msg.outgoing() || own_chat.as_ref() == Some(&chat_id);
 
-                                        let text = if msg.media().is_some() {
-                                            "[media]".to_string()
-                                        } else {
-                                            msg.text().to_string()
-                                        };
-
-                                        let sender = if from_me {
-                                            "You".to_string()
-                                        } else {
-                                            msg.sender()
-                                                .and_then(|p| p.name())
-                                                .or_else(|| msg.peer().and_then(|p| p.name()))
-                                                .unwrap_or("Unknown")
-                                                .to_string()
-                                        };
+                                        let sender = telegram_message_sender(&msg, from_me);
+                                        let text = telegram_message_text(&msg);
 
                                         let text_preview: String = text.chars().take(80).collect();
                                         debug!(
@@ -268,19 +313,14 @@ impl TelegramMessenger {
                                             "MessageReceived"
                                         );
 
-                                        let message = Message {
-                                            message_id: msg.id().to_string().into(),
-                                            chat: chat_id.clone(),
-                                            sender: sender.clone(),
-                                            text: text.clone(),
-                                            timestamp: msg.date().timestamp(),
-                                            from_me,
-                                            msg_actions: message_actions(from_me),
-                                            reply_to_id: msg.reply_to_message_id().map(|id| id.to_string().into()),
-                                            reply_ctx: None,
-                                            pending: false,
-                                            failed: false,
-                                        };
+                                        let message = normalize_telegram_message(
+                                            &msg,
+                                            &chat_id,
+                                            own_chat.as_ref(),
+                                            reply_ctx,
+                                            false,
+                                            false,
+                                        );
 
                                         let preview = crate::helpers::message_preview(&sender, &text);
                                         let _ = tx.send(BackendEvent::MessageReceived(message.clone()));
@@ -309,13 +349,8 @@ impl TelegramMessenger {
                                         let from_me =
                                             msg.outgoing() || own_chat.as_ref() == Some(&chat_id);
 
-                                        let name = msg
-                                            .peer()
-                                            .and_then(|p| p.name())
-                                            .unwrap_or("Unknown")
-                                            .to_string();
-
-                                        let display_text = msg.text().to_string();
+                                        let name = telegram_message_sender(&msg, from_me);
+                                        let display_text = telegram_message_text(&msg);
 
                                         let last_message = if from_me {
                                             Some(crate::helpers::message_preview("You", &display_text))
@@ -323,23 +358,14 @@ impl TelegramMessenger {
                                             Some(crate::helpers::message_preview(&name, &display_text))
                                         };
 
-                                        let message = Message {
-                                            message_id: msg.id().to_string().into(),
-                                            chat: chat_id.clone(),
-                                            sender: if from_me {
-                                                "You".into()
-                                            } else {
-                                                name.clone()
-                                            },
-                                            text: display_text.clone(),
-                                            timestamp: msg.date().timestamp(),
-                                            from_me,
-                                            msg_actions: message_actions(from_me),
-                                            reply_to_id: msg.reply_to_message_id().map(|id| id.to_string().into()),
-                                            reply_ctx: None,
-                                            pending: false,
-                                            failed: false,
-                                        };
+                                        let message = normalize_telegram_message(
+                                            &msg,
+                                            &chat_id,
+                                            own_chat.as_ref(),
+                                            None,
+                                            false,
+                                            false,
+                                        );
 
                                         let _ = tx.send(BackendEvent::MessageUpdated(message));
 
@@ -725,30 +751,9 @@ impl Messenger for TelegramMessenger {
         let mut msg_iter = client.iter_messages(peer_ref).limit(100);
 
         while let Some(msg) = msg_iter.next().await? {
-            let from_me = msg.outgoing() || own_chat.as_ref() == Some(chat);
-            let sender = if from_me {
-                "You".to_string()
-            } else {
-                msg.sender()
-                    .and_then(|p| p.name())
-                    .unwrap_or("Unknown")
-                    .to_string()
-            };
-
-            messages_rev.push(Message {
-                message_id: msg.id().to_string().into(),
-                chat: chat.clone(),
-                sender,
-                text: msg.text().to_string(),
-                timestamp: msg.date().timestamp(),
-                from_me,
-                msg_actions: message_actions(from_me),
-                reply_to_id: msg.reply_to_message_id().map(|id| id.to_string().into()),
-                // Reply details are fetched lazily when the message is opened.
-                reply_ctx: None,
-                pending: false,
-                failed: false,
-            });
+            let message =
+                normalize_telegram_message(&msg, chat, own_chat.as_ref(), None, false, false);
+            messages_rev.push(message);
         }
 
         // grammers iter_messages defaults to newest-to-oldest; reverse so
@@ -830,18 +835,11 @@ impl Messenger for TelegramMessenger {
         let client = self.current_client().await;
         let sent = client.send_message(peer_ref, input).await?;
 
+        let own_chat = Some(chat);
+        let message = normalize_telegram_message(&sent, chat, own_chat, None, false, false);
         Ok(Message {
-            message_id: sent.id().to_string().into(),
-            chat: chat.clone(),
-            sender: "You".into(),
-            text: text.to_string(),
-            timestamp: sent.date().timestamp(),
-            from_me: true,
-            msg_actions: message_actions(true),
             reply_to_id: reply_to.clone(),
-            reply_ctx: None,
-            pending: false,
-            failed: false,
+            ..message
         })
     }
 
