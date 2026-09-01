@@ -229,6 +229,9 @@ impl AppState {
     pub fn cycle_focus(&mut self) {
         self.focus = match self.focus {
             Focus::ChatList => {
+                // Invalidate a background history request when Escape is used
+                // before the selected chat finishes opening.
+                self.chat_load_generation = self.chat_load_generation.wrapping_add(1);
                 if self.chat_state.open_chat.is_some() {
                     self.chat_state.open_chat = None;
                     Focus::Chat
@@ -237,6 +240,7 @@ impl AppState {
                 }
             }
             Focus::Chat => {
+                self.chat_load_generation = self.chat_load_generation.wrapping_add(1);
                 // Save draft and clear write when exiting chat
                 if let Some(chat_id) = self
                     .chat_state
@@ -273,6 +277,10 @@ impl AppState {
             }
             Focus::Popup => Focus::ChatList,
         };
+    }
+
+    pub fn cancel_chat_load(&mut self) {
+        self.chat_load_generation = self.chat_load_generation.wrapping_add(1);
     }
 
     pub async fn select_chat(&mut self, index: usize) {
@@ -861,20 +869,7 @@ impl AppState {
 
             BackendEvent::MessageUpdated(message) => {
                 self.chat_state.update_message(message.clone());
-                let preview = crate::helpers::message_preview(&message.sender, &message.text);
-
-                if let Some((_, chat)) = self.chat_state.find_mut(&message.chat) {
-                    chat.last_message = Some(preview.clone());
-                } else {
-                    self.chat_state.upsert_chat(Chat {
-                        id: message.chat.clone(),
-                        contact_name: message.sender.clone(),
-                        last_message: Some(preview),
-                        unread: false,
-                        unread_count: 0,
-                        ..Default::default()
-                    });
-                }
+                self.refresh_sidebar_preview(&message.chat);
             }
 
             BackendEvent::MessageDeleted { chat, message_ids } => {
@@ -884,6 +879,7 @@ impl AppState {
                 for message_id in message_ids {
                     self.chat_state.remove_message(&message_id);
                 }
+                self.refresh_sidebar_preview(&chat);
                 if let Some(open) = self.chat_state.open_chat.as_ref()
                     && open.chat.id == chat
                 {
@@ -906,6 +902,22 @@ impl AppState {
                 debug!(chat = ?chat.id, "TUI ChatUpdated");
                 self.chat_state.upsert_chat(chat);
             }
+        }
+    }
+}
+
+impl AppState {
+    fn refresh_sidebar_preview(&mut self, chat_id: &ChatId) {
+        let latest = self
+            .chat_state
+            .open_chat
+            .as_ref()
+            .filter(|open| open.chat.id == *chat_id)
+            .and_then(|open| open.history.last())
+            .map(|message| crate::helpers::message_preview(&message.sender, &message.text));
+
+        if let Some((_, chat)) = self.chat_state.find_mut(chat_id) {
+            chat.last_message = latest;
         }
     }
 }

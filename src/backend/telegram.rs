@@ -270,15 +270,11 @@ impl TelegramMessenger {
                                     };
 
                                     let _ = tx.send(BackendEvent::MessageUpdated(message));
-                                    debug!(chat_id = ?chat_id, "ChatUpdated (edited)");
-                                    let _ = tx.send(BackendEvent::ChatUpdated(Chat {
-                                        id: chat_id,
-                                        contact_name: name,
-                                        last_message,
-                                        scroll: 0,
-                                        unread: false,
-                                        unread_count: 0,
-                                    }));
+                                    debug!(
+                                        chat_id = ?chat_id,
+                                        preview = ?last_message,
+                                        "MessageUpdated"
+                                    );
                                 }
                                 Update::MessageDeleted(del) => {
                                     let chat = del.channel_id().map(ChatId::Telegram);

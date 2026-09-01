@@ -292,6 +292,7 @@ struct App {
     state: AppState,
     loading_spinner: LoadingSpinner,
     tx: mpsc::UnboundedSender<UiEvent>,
+    chat_load_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl App {
@@ -306,16 +307,18 @@ impl App {
             state: AppState::new(config, keymap, messengers, open_settings).await,
             loading_spinner: LoadingSpinner::new(),
             tx,
+            chat_load_task: None,
         }
     }
 
     fn start_chat_load(&mut self, index: usize) {
+        self.cancel_chat_load();
         let Some((chat, generation, mut messenger)) = self.state.begin_chat_load(index) else {
             return;
         };
 
         let tx = self.tx.clone();
-        tokio::spawn(async move {
+        self.chat_load_task = Some(tokio::spawn(async move {
             let result = match messenger.set_read(&chat.id).await {
                 Ok(()) => messenger.history(&chat.id).await,
                 Err(e) => Err(e),
@@ -325,7 +328,14 @@ impl App {
                 generation,
                 result,
             });
-        });
+        }));
+    }
+
+    fn cancel_chat_load(&mut self) {
+        if let Some(task) = self.chat_load_task.take() {
+            task.abort();
+        }
+        self.state.cancel_chat_load();
     }
 
     async fn handle_key(&mut self, key: KeyEvent) {
@@ -390,6 +400,11 @@ impl App {
         let km = self.state.keymap.clone();
 
         if key == km.dismiss {
+            if self.state.focus == Focus::Chat && self.state.chat_state.open_chat.is_none() {
+                self.cancel_chat_load();
+                self.state.focus = Focus::ChatList;
+                return;
+            }
             self.state.cycle_focus();
             return;
         }
