@@ -840,9 +840,15 @@ impl AppState {
                     .map(|chat| chat.unread_count)
                     .unwrap_or(0);
 
+                let contact_name = if message.sender == "Unknown" {
+                    String::new()
+                } else {
+                    message.sender.clone()
+                };
+
                 let mut chat_update = Chat {
                     id: message.chat.clone(),
-                    contact_name: message.sender.clone(),
+                    contact_name: contact_name.clone(),
                     last_message: Some(preview),
                     ..Default::default()
                 };

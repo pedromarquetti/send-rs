@@ -15,8 +15,9 @@ use grammers_session::updates::UpdatesLike;
 use grammers_tl_types as tl;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tracing::{debug, error, info, warn};
@@ -71,7 +72,9 @@ pub enum LoginToken {
 
 #[derive(Clone)]
 pub struct TelegramMessenger {
-    client: Client,
+    session: Arc<SqliteSession>,
+    api_id: u32,
+    client: Arc<RwLock<Client>>,
     api_hash: String,
     tx: broadcast::Sender<BackendEvent>,
     login_token: Arc<RwLock<Option<LoginToken>>>,
@@ -81,6 +84,7 @@ pub struct TelegramMessenger {
     reply_contexts: Arc<Mutex<HashMap<(ChatId, MessageId), ReplyContext>>>,
     flood_wait_until: Arc<Mutex<Option<Instant>>>,
     sync_update_state_secs: u64,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl TelegramMessenger {
@@ -101,7 +105,7 @@ impl TelegramMessenger {
                 .map_err(|e| BackendError::Other(format!("failed to open TG session: {e}")))?,
         );
 
-        let pool = SenderPool::new(session, api_id as i32);
+        let pool = SenderPool::new(Arc::clone(&session), api_id as i32);
 
         // The runner must be spawned; it drives all network I/O.
         let runner = pool.runner;
@@ -113,7 +117,9 @@ impl TelegramMessenger {
         let (tx, _) = broadcast::channel(128);
 
         let messenger = Self {
-            client,
+            session,
+            api_id,
+            client: Arc::new(RwLock::new(client)),
             api_hash: api_hash.to_string(),
             tx,
             login_token: Arc::new(RwLock::new(None)),
@@ -123,10 +129,24 @@ impl TelegramMessenger {
             reply_contexts: Arc::new(Mutex::new(HashMap::new())),
             flood_wait_until: Arc::new(Mutex::new(None)),
             sync_update_state_secs,
+            shutdown: Arc::new(AtomicBool::new(false)),
         };
 
         messenger.spawn_update_listener(updates);
         Ok(messenger)
+    }
+
+    async fn current_client(&self) -> Client {
+        self.client.read().await.clone()
+    }
+
+    async fn replace_client_with_new_pool(&self) -> mpsc::UnboundedReceiver<UpdatesLike> {
+        let pool = SenderPool::new(Arc::clone(&self.session), self.api_id as i32);
+        let runner = pool.runner;
+        tokio::spawn(async move { runner.run().await });
+        let client = Client::new(pool.handle);
+        *self.client.write().await = client;
+        pool.updates
     }
 
     fn spawn_update_listener(&self, updates: mpsc::UnboundedReceiver<UpdatesLike>) {
@@ -134,228 +154,350 @@ impl TelegramMessenger {
         let tx = self.tx.clone();
         let sync_secs = self.sync_update_state_secs;
         let cached_chats = self.cached_chats.clone();
+        let shutdown = self.shutdown.clone();
+        let session = self.session.clone();
+        let api_id = self.api_id;
 
         tokio::spawn(async move {
-            // Avoid eager bulk diffs on reconnects: live push updates are the
-            // authoritative path here, while dialog polling remains the fallback.
-            let config = UpdatesConfiguration {
-                catch_up: false,
-                ..Default::default()
-            };
-            let mut stream = match client.stream_updates(updates, config).await {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("Telegram update stream failed to start: {e}");
-                    return;
-                }
-            };
-            info!("Telegram update stream started");
-            let mut own_chat = self_user_id(&client).await;
-            let mut sync_interval =
-                tokio::time::interval(std::time::Duration::from_secs(sync_secs));
+            let mut current_updates = Some(updates);
+            let mut reconnect_attempt = 0u32;
 
             loop {
-                tokio::select! {
-                    biased;
-                    _ = sync_interval.tick() => {
-                        if let Err(e) = stream.sync_update_state().await {
-                            error!("Failed to sync update state: {e}");
-                        } else {
-                            debug!("Update state synced to session");
+                let Some(updates) = current_updates.take() else {
+                    break;
+                };
+
+                if shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                let current_client = client.read().await.clone();
+
+                let config = UpdatesConfiguration {
+                    catch_up: false,
+                    ..Default::default()
+                };
+
+                let mut stream = match current_client.stream_updates(updates, config).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let reason = format!("Telegram update stream failed to start: {e}");
+                        warn!(reason);
+                        let _ = tx.send(BackendEvent::Disconnected(reason.clone()));
+                        let delay = Self::reconnect_delay(
+                            &reason,
+                            reconnect_attempt,
+                            !current_client.is_authorized().await.unwrap_or(false),
+                        );
+                        reconnect_attempt += 1;
+                        if shutdown.load(Ordering::SeqCst) || delay.is_zero() {
+                            break;
                         }
+                        tokio::time::sleep(delay).await;
+                        current_updates =
+                            Some(Self::new_updates_receiver(&session, api_id, &client).await);
+                        continue;
                     }
-                    update = stream.next() => {
-                        match update {
-                            Ok(update) => match update {
-                                Update::NewMessage(msg) => {
-                                    let Some(chat_id) = message_chat_id(&msg) else {
-                                        debug!(msg_id = msg.id(), "Skipping new message without usable peer metadata");
-                                        continue;
-                                    };
+                };
 
-                                    if own_chat.is_none() {
-                                        own_chat = self_user_id(&client).await;
-                                    }
+                let _ = tx.send(BackendEvent::Connected);
 
-                                    let from_me =
-                                        msg.outgoing() || own_chat.as_ref() == Some(&chat_id);
+                info!("Telegram update stream started");
 
-                                    let text = if msg.media().is_some() {
-                                        "[media]".to_string()
-                                    } else {
-                                        msg.text().to_string()
-                                    };
+                let mut own_chat = self_user_id(&current_client).await;
+                let mut sync_interval =
+                    tokio::time::interval(std::time::Duration::from_secs(sync_secs));
+                let mut stream_reason = None;
 
-                                    let sender = if from_me {
-                                        "You".to_string()
-                                    } else {
-                                        msg.sender()
-                                            .and_then(|p| p.name())
-                                            .or_else(|| msg.peer().and_then(|p| p.name()))
-                                            .unwrap_or("Unknown")
-                                            .to_string()
-                                    };
+                loop {
+                    if shutdown.load(Ordering::SeqCst) {
+                        if let Err(e) = stream.sync_update_state().await {
+                            error!("Failed to sync update state before shutdown: {e}");
+                        }
+                        break;
+                    }
 
-                                    let text_preview: String = text.chars().take(80).collect();
-                                    debug!(
-                                        sender,
-                                        chat_id = ?chat_id,
-                                        text_preview,
-                                        "MessageReceived"
-                                    );
+                    tokio::select! {
+                        biased;
 
-                                    let message = Message {
-                                        message_id: msg.id().to_string().into(),
-                                        chat: chat_id.clone(),
-                                        sender: sender.clone(),
-                                        text: text.clone(),
-                                        timestamp: msg.date().timestamp(),
-                                        from_me,
-                                        msg_actions: message_actions(from_me),
-                                        reply_to_id: msg.reply_to_message_id().map(|id| id.to_string().into()),
-                                        reply_ctx: None,
-                                        pending: false,
-                                        failed: false,
-                                    };
+                        _ = sync_interval.tick() => {
+                            if let Err(e) = stream.sync_update_state().await {
+                                error!("Failed to sync update state: {e}");
+                            } else {
+                                debug!("Update state synced to session");
+                            }
+                        }
 
-                                    let preview = crate::helpers::message_preview(&sender, &text);
-                                    let _ = tx.send(BackendEvent::MessageReceived(message.clone()));
-
-                                    *cached_chats.lock().await = None;
-
-                                    let _ = tx.send(BackendEvent::ChatUpdated(Chat {
-                                        id: chat_id,
-                                        contact_name: pretty_peer_name(&msg, &sender),
-                                        last_message: Some(preview),
-                                        scroll: 0,
-                                        unread: false,
-                                        unread_count: 0,
-                                    }));
-                                }
-                                Update::MessageEdited(msg) => {
-                                    let Some(chat_id) = message_chat_id(&msg) else {
-                                        debug!(msg_id = msg.id(), "Skipping edited message without usable peer metadata");
-                                        continue;
-                                    };
-
-                                    if own_chat.is_none() {
-                                        own_chat = self_user_id(&client).await;
-                                    }
-
-                                    let from_me =
-                                        msg.outgoing() || own_chat.as_ref() == Some(&chat_id);
-
-                                    let name = msg
-                                        .peer()
-                                        .and_then(|p| p.name())
-                                        .unwrap_or("Unknown")
-                                        .to_string();
-
-                                    let display_text = msg.text().to_string();
-
-                                    let last_message = if from_me {
-                                        Some(crate::helpers::message_preview("You", &display_text))
-                                    } else {
-                                        Some(crate::helpers::message_preview(&name, &display_text))
-                                    };
-
-                                    let message = Message {
-                                        message_id: msg.id().to_string().into(),
-                                        chat: chat_id.clone(),
-                                        sender: if from_me {
-                                            "You".into()
-                                        } else {
-                                            name.clone()
-                                        },
-                                        text: display_text.clone(),
-                                        timestamp: msg.date().timestamp(),
-                                        from_me,
-                                        msg_actions: message_actions(from_me),
-                                        reply_to_id: msg.reply_to_message_id().map(|id| id.to_string().into()),
-                                        reply_ctx: None,
-                                        pending: false,
-                                        failed: false,
-                                    };
-
-                                    let _ = tx.send(BackendEvent::MessageUpdated(message));
-
-                                    *cached_chats.lock().await = None;
-
-                                    debug!(
-                                        chat_id = ?chat_id,
-                                        preview = ?last_message,
-                                        "MessageUpdated"
-                                    );
-                                }
-                                Update::MessageDeleted(del) => {
-                                    let chat = del.channel_id().map(ChatId::Telegram);
-                                    let message_ids = del
-                                        .messages()
-                                        .iter()
-                                        .map(|id| id.to_string().into())
-                                        .collect::<Vec<_>>();
-
-                                    if message_ids.is_empty() {
-                                        continue;
-                                    }
-
-                                    debug!(chat = ?chat, ids = message_ids.len(), "MessageDeleted");
-                                    let _ = tx.send(BackendEvent::MessageDeleted { chat, message_ids });
-
-                                    *cached_chats.lock().await = None;
-                                }
-                                Update::Raw(raw) => {
-                                    if let tl::enums::Update::ReadHistoryInbox(ref u) = *raw {
-                                        let peer_id = match &u.peer {
-                                            tl::enums::Peer::User(u) => u.user_id,
-                                            tl::enums::Peer::Chat(c) => c.chat_id,
-                                            tl::enums::Peer::Channel(c) => c.channel_id,
+                        update = stream.next() => {
+                            match update {
+                                Ok(update) => match update {
+                                    Update::NewMessage(msg) => {
+                                        let Some(chat_id) = message_chat_id(&msg) else {
+                                            debug!(msg_id = msg.id(), "Skipping new message without usable peer metadata");
+                                            continue;
                                         };
 
-                                        let chat_id = ChatId::Telegram(peer_id);
+                                        if own_chat.is_none() {
+                                            own_chat = self_user_id(&current_client).await;
+                                        }
+
+                                        let from_me =
+                                            msg.outgoing() || own_chat.as_ref() == Some(&chat_id);
+
+                                        let text = if msg.media().is_some() {
+                                            "[media]".to_string()
+                                        } else {
+                                            msg.text().to_string()
+                                        };
+
+                                        let sender = if from_me {
+                                            "You".to_string()
+                                        } else {
+                                            msg.sender()
+                                                .and_then(|p| p.name())
+                                                .or_else(|| msg.peer().and_then(|p| p.name()))
+                                                .unwrap_or("Unknown")
+                                                .to_string()
+                                        };
+
+                                        let text_preview: String = text.chars().take(80).collect();
                                         debug!(
+                                            sender,
                                             chat_id = ?chat_id,
-                                            still_unread = u.still_unread_count,
-                                            max_id = u.max_id,
-                                            "ReadHistoryInbox"
+                                            text_preview,
+                                            "MessageReceived"
                                         );
-                                        let _ = tx.send(BackendEvent::UnreadUpdated {
-                                            chat: chat_id,
-                                            unread: u.still_unread_count > 0,
-                                            unread_count: u.still_unread_count,
-                                        });
+
+                                        let message = Message {
+                                            message_id: msg.id().to_string().into(),
+                                            chat: chat_id.clone(),
+                                            sender: sender.clone(),
+                                            text: text.clone(),
+                                            timestamp: msg.date().timestamp(),
+                                            from_me,
+                                            msg_actions: message_actions(from_me),
+                                            reply_to_id: msg.reply_to_message_id().map(|id| id.to_string().into()),
+                                            reply_ctx: None,
+                                            pending: false,
+                                            failed: false,
+                                        };
+
+                                        let preview = crate::helpers::message_preview(&sender, &text);
+                                        let _ = tx.send(BackendEvent::MessageReceived(message.clone()));
 
                                         *cached_chats.lock().await = None;
-                                    } else if let tl::enums::Update::ReadChannelInbox(ref u) = *raw {
-                                        let chat_id = ChatId::Telegram(u.channel_id);
-                                        debug!(
-                                            chat_id = ?chat_id,
-                                            still_unread = u.still_unread_count,
-                                            max_id = u.max_id,
-                                            "ReadChannelInbox"
-                                        );
-                                        let _ = tx.send(BackendEvent::UnreadUpdated {
-                                            chat: chat_id,
-                                            unread: u.still_unread_count > 0,
-                                            unread_count: u.still_unread_count,
-                                        });
 
-                                        *cached_chats.lock().await = None;
-                                    } else {
-                                        debug!("Telegram update (unhandled): {raw:?}");
+                                        let _ = tx.send(BackendEvent::ChatUpdated(Chat {
+                                            id: chat_id,
+                                            contact_name: pretty_peer_name(&msg, &sender),
+                                            last_message: Some(preview),
+                                            scroll: 0,
+                                            unread: false,
+                                            unread_count: 0,
+                                        }));
                                     }
+                                    Update::MessageEdited(msg) => {
+                                        let Some(chat_id) = message_chat_id(&msg) else {
+                                            debug!(msg_id = msg.id(), "Skipping edited message without usable peer metadata");
+                                            continue;
+                                        };
+
+                                        if own_chat.is_none() {
+                                            own_chat = self_user_id(&current_client).await;
+                                        }
+
+                                        let from_me =
+                                            msg.outgoing() || own_chat.as_ref() == Some(&chat_id);
+
+                                        let name = msg
+                                            .peer()
+                                            .and_then(|p| p.name())
+                                            .unwrap_or("Unknown")
+                                            .to_string();
+
+                                        let display_text = msg.text().to_string();
+
+                                        let last_message = if from_me {
+                                            Some(crate::helpers::message_preview("You", &display_text))
+                                        } else {
+                                            Some(crate::helpers::message_preview(&name, &display_text))
+                                        };
+
+                                        let message = Message {
+                                            message_id: msg.id().to_string().into(),
+                                            chat: chat_id.clone(),
+                                            sender: if from_me {
+                                                "You".into()
+                                            } else {
+                                                name.clone()
+                                            },
+                                            text: display_text.clone(),
+                                            timestamp: msg.date().timestamp(),
+                                            from_me,
+                                            msg_actions: message_actions(from_me),
+                                            reply_to_id: msg.reply_to_message_id().map(|id| id.to_string().into()),
+                                            reply_ctx: None,
+                                            pending: false,
+                                            failed: false,
+                                        };
+
+                                        let _ = tx.send(BackendEvent::MessageUpdated(message));
+
+                                        *cached_chats.lock().await = None;
+
+                                        debug!(
+                                            chat_id = ?chat_id,
+                                            preview = ?last_message,
+                                            "MessageUpdated"
+                                        );
+                                    }
+                                    Update::MessageDeleted(del) => {
+                                        let chat = del.channel_id().map(ChatId::Telegram);
+                                        let message_ids = del
+                                            .messages()
+                                            .iter()
+                                            .map(|id| id.to_string().into())
+                                            .collect::<Vec<_>>();
+
+                                        if message_ids.is_empty() {
+                                            continue;
+                                        }
+
+                                        debug!(chat = ?chat, ids = message_ids.len(), "MessageDeleted");
+                                        let _ = tx.send(BackendEvent::MessageDeleted { chat, message_ids });
+
+                                        *cached_chats.lock().await = None;
+                                    }
+                                    Update::Raw(raw) => {
+                                        if let tl::enums::Update::ReadHistoryInbox(ref u) = *raw {
+                                            let peer_id = match &u.peer {
+                                                tl::enums::Peer::User(u) => u.user_id,
+                                                tl::enums::Peer::Chat(c) => c.chat_id,
+                                                tl::enums::Peer::Channel(c) => c.channel_id,
+                                            };
+
+                                            let chat_id = ChatId::Telegram(peer_id);
+                                            debug!(
+                                                chat_id = ?chat_id,
+                                                still_unread = u.still_unread_count,
+                                                max_id = u.max_id,
+                                                "ReadHistoryInbox"
+                                            );
+                                            let _ = tx.send(BackendEvent::UnreadUpdated {
+                                                chat: chat_id,
+                                                unread: u.still_unread_count > 0,
+                                                unread_count: u.still_unread_count,
+                                            });
+
+                                            *cached_chats.lock().await = None;
+                                        } else if let tl::enums::Update::ReadChannelInbox(ref u) = *raw {
+                                            let chat_id = ChatId::Telegram(u.channel_id);
+                                            debug!(
+                                                chat_id = ?chat_id,
+                                                still_unread = u.still_unread_count,
+                                                max_id = u.max_id,
+                                                "ReadChannelInbox"
+                                            );
+                                            let _ = tx.send(BackendEvent::UnreadUpdated {
+                                                chat: chat_id,
+                                                unread: u.still_unread_count > 0,
+                                                unread_count: u.still_unread_count,
+                                            });
+
+                                            *cached_chats.lock().await = None;
+                                        } else {
+                                            debug!("Telegram update (unhandled): {raw:?}");
+                                        }
+                                    }
+                                    _ => {}
+                                },
+                                Err(e) => {
+                                    let reason = format!("Telegram update stream error: {e}");
+                                    stream_reason = Some(reason.clone());
+                                    if let Err(sync_err) = stream.sync_update_state().await {
+                                        error!("Failed to sync update state before reconnect: {sync_err}");
+                                    }
+                                    let _ = tx.send(BackendEvent::Disconnected(reason));
+                                    break;
                                 }
-                                _ => {}
-                            },
-                            Err(e) => {
-                                error!("Telegram update stream error: {e}");
-                                break;
                             }
                         }
                     }
                 }
+
+                if shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                let Some(reason) = stream_reason else {
+                    break;
+                };
+
+                let delay = Self::reconnect_delay(
+                    &reason,
+                    reconnect_attempt,
+                    !current_client.is_authorized().await.unwrap_or(false),
+                );
+
+                reconnect_attempt += 1;
+
+                if delay.is_zero() {
+                    break;
+                }
+
+                tokio::time::sleep(delay).await;
+
+                if shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                current_updates = Some(Self::new_updates_receiver(&session, api_id, &client).await);
             }
         });
+    }
+
+    fn reconnect_delay(reason: &str, attempt: u32, unauthenticated: bool) -> Duration {
+        let lowercase = reason.to_ascii_lowercase();
+
+        if lowercase.contains("dropped")
+            || lowercase.contains("quit")
+            || lowercase.contains("shutdown")
+        {
+            return Duration::ZERO;
+        }
+
+        if lowercase.contains("flood_wait") {
+            return Duration::from_secs(30);
+        }
+
+        if lowercase.contains("not authenticated")
+            || lowercase.contains("session_password_needed")
+            || lowercase.contains("session_revoked")
+            || lowercase.contains("session_invalid")
+            || lowercase.contains("auth_key_unregistered")
+            || lowercase.contains("auth_key_invalid")
+            || lowercase.contains("invalid session")
+            || lowercase.contains("invalid auth")
+            || unauthenticated
+        {
+            return Duration::from_secs(30);
+        }
+
+        let backoff = 1u32 << attempt.min(5);
+        Duration::from_secs(backoff.min(30) as u64)
+    }
+
+    async fn new_updates_receiver(
+        session: &Arc<SqliteSession>,
+        api_id: u32,
+        client: &Arc<RwLock<Client>>,
+    ) -> mpsc::UnboundedReceiver<UpdatesLike> {
+        let pool = SenderPool::new(Arc::clone(session), api_id as i32);
+        let runner = pool.runner;
+        tokio::spawn(async move { runner.run().await });
+        let next_client = Client::new(pool.handle);
+        *client.write().await = next_client;
+        pool.updates
     }
 
     fn cache_dialogs(&self, dialogs: Vec<Dialog>) {
@@ -376,7 +518,9 @@ impl TelegramMessenger {
 
     async fn fetch_chats_once(&self) -> Result<Vec<Chat>, BackendError> {
         info!("Fetching Telegram dialogs...");
-        let mut dialogs_iter = self.client.iter_dialogs();
+
+        let client = self.current_client().await;
+        let mut dialogs_iter = client.iter_dialogs();
         let mut chats = Vec::new();
         let mut raw_dialogs = Vec::new();
 
@@ -472,7 +616,11 @@ impl Messenger for TelegramMessenger {
     }
 
     async fn is_authenticated(&self) -> bool {
-        self.client.is_authorized().await.unwrap_or(false)
+        self.current_client()
+            .await
+            .is_authorized()
+            .await
+            .unwrap_or(false)
     }
 
     async fn chats(&self) -> Result<Vec<Chat>, BackendError> {
@@ -554,7 +702,8 @@ impl Messenger for TelegramMessenger {
             .find_dialog_peer_ref(bare_id)
             .ok_or_else(|| BackendError::Other("chat not found in dialog cache".into()))?;
         debug!(bare_id, "Marking chat as read");
-        self.client.mark_as_read(peer_ref).await?;
+        let client = self.current_client().await;
+        client.mark_as_read(peer_ref).await?;
         Ok(())
     }
 
@@ -570,9 +719,10 @@ impl Messenger for TelegramMessenger {
 
         debug!(bare_id, "Fetching message history");
 
-        let own_chat = self_user_id(&self.client).await;
+        let client = self.current_client().await;
+        let own_chat = self_user_id(&client).await;
         let mut messages_rev = Vec::new();
-        let mut msg_iter = self.client.iter_messages(peer_ref).limit(100);
+        let mut msg_iter = client.iter_messages(peer_ref).limit(100);
 
         while let Some(msg) = msg_iter.next().await? {
             let from_me = msg.outgoing() || own_chat.as_ref() == Some(chat);
@@ -631,8 +781,8 @@ impl Messenger for TelegramMessenger {
             BackendError::Other("telegram reply needs a numeric message id".into())
         })?;
 
-        let message = self
-            .client
+        let client = self.current_client().await;
+        let message = client
             .get_messages_by_id(peer_ref, &[id])
             .await?
             .into_iter()
@@ -641,7 +791,7 @@ impl Messenger for TelegramMessenger {
 
         match message {
             Some(message) => {
-                let context = reply_context(&self.client, &message).await;
+                let context = reply_context(&client, &message).await;
 
                 if let Some(context) = &context {
                     self.reply_contexts
@@ -677,7 +827,8 @@ impl Messenger for TelegramMessenger {
         }
 
         debug!(bare_id, "Sending message");
-        let sent = self.client.send_message(peer_ref, input).await?;
+        let client = self.current_client().await;
+        let sent = client.send_message(peer_ref, input).await?;
 
         Ok(Message {
             message_id: sent.id().to_string().into(),
@@ -708,7 +859,10 @@ impl Messenger for TelegramMessenger {
             .ok_or_else(|| BackendError::Other("chat not found in dialog cache".into()))?;
 
         debug!(bare_id, msg_id, "Deleting message");
-        self.client.delete_messages(peer_ref, &[msg_id]).await?;
+
+        let client = self.current_client().await;
+        client.delete_messages(peer_ref, &[msg_id]).await?;
+
         Ok(())
     }
 
@@ -726,7 +880,9 @@ impl Messenger for TelegramMessenger {
             .ok_or_else(|| BackendError::Other("chat not found in dialog cache".into()))?;
 
         let input = grammers_client::message::InputMessage::new().text(text.to_string());
-        self.client.edit_message(peer_ref, msg_id, input).await?;
+        let client = self.current_client().await;
+
+        client.edit_message(peer_ref, msg_id, input).await?;
         Ok(())
     }
 
@@ -735,12 +891,22 @@ impl Messenger for TelegramMessenger {
     }
 
     async fn disconnect(&mut self) -> Result<(), BackendError> {
-        self.client.disconnect();
+        self.shutdown.store(true, Ordering::SeqCst);
+
+        let client = self.current_client().await;
+
+        client.disconnect();
+
+        let _ = self.tx.send(BackendEvent::Disconnected(
+            "Telegram disconnected".to_string(),
+        ));
         Ok(())
     }
 
     async fn logout(&mut self) -> Result<(), BackendError> {
-        self.client
+        let client = self.current_client().await;
+
+        client
             .sign_out()
             .await
             .map_err(|e| BackendError::Other(format!("sign-out failed: {e}")))?;
@@ -772,10 +938,8 @@ impl Messenger for TelegramMessenger {
         match step {
             0 => {
                 info!(phone = input, "Telegram login: requesting code");
-                let token = self
-                    .client
-                    .request_login_code(input, &self.api_hash)
-                    .await?;
+                let client = self.current_client().await;
+                let token = client.request_login_code(input, &self.api_hash).await?;
                 *self.login_token.write().await = Some(LoginToken::CodeRequested { token });
                 Ok(LoginStepState::NextStep)
             }
@@ -787,7 +951,8 @@ impl Messenger for TelegramMessenger {
                 match token {
                     LoginToken::CodeRequested { token } => {
                         info!("Telegram login: submitting code");
-                        match self.client.sign_in(&token, input).await {
+
+                        match self.current_client().await.sign_in(&token, input).await {
                             Ok(_user) => {
                                 info!("Telegram login: success");
                                 Ok(LoginStepState::Done)
@@ -833,7 +998,13 @@ impl Messenger for TelegramMessenger {
                 match token {
                     LoginToken::PasswordRequired { token } => {
                         info!("Telegram login: submitting 2FA password");
-                        match self.client.check_password(token, input.as_bytes()).await {
+
+                        match self
+                            .current_client()
+                            .await
+                            .check_password(token, input.as_bytes())
+                            .await
+                        {
                             Ok(_user) => {
                                 info!("Telegram login: 2FA success");
                                 Ok(LoginStepState::Done)

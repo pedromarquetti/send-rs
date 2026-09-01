@@ -265,6 +265,8 @@ async fn run_app(
             }
         }
     }
+
+    app.shutdown().await;
     Ok(())
 }
 
@@ -344,10 +346,23 @@ impl App {
         self.state.cancel_chat_load();
     }
 
+    async fn shutdown(&mut self) {
+        self.cancel_chat_load();
+
+        for messenger in &mut self.state.messengers {
+            if let Err(err) = messenger.disconnect().await {
+                error!(
+                    provider = ?messenger.provider(),
+                    error = %err,
+                    "Messenger shutdown failed"
+                );
+            }
+        }
+        self.state.running = false;
+    }
+
     async fn handle_key(&mut self, key: KeyEvent) {
         // TODO: add a overlay menu / screen to display all the keymappings
-        // TODO: Add a graceful shutdown? all messages should be sent before shutting down the
-        // app - verify if possible
         if key == self.state.keymap.quit {
             self.state.running = false;
             return;

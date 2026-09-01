@@ -199,6 +199,12 @@ impl ChatState {
     /// Insert or update a sidebar chat entry from a push update while keeping
     /// the existing order intact and preserving user-visible scroll state.
     pub fn upsert_chat(&mut self, chat: Chat) -> bool {
+        let mut chat = chat;
+
+        if chat.contact_name == "Unknown" || chat.contact_name == "You" {
+            chat.contact_name.clear();
+        }
+
         let selected_id = self.selected_chat().map(|selected| selected.id.clone());
         if let Some((pos, entry)) = self.find_mut(&chat.id) {
             if !chat.contact_name.is_empty()
@@ -236,7 +242,6 @@ impl ChatState {
             return true;
         }
 
-        let mut chat = chat;
         chat.scroll = 0;
         self.chats.insert(0, chat);
         if let Some(selected_id) = selected_id {
@@ -433,6 +438,21 @@ mod tests {
         state.upsert_chat(chat(id, "You"));
 
         assert_eq!(state.chats[0].contact_name, "Chat1");
+    }
+
+    #[test]
+    fn upsert_does_not_insert_unknown_name_as_sidebar_title() {
+        let id = ChatId::Telegram(1);
+        let mut state = ChatState::default();
+
+        state.upsert_chat(Chat {
+            id: id.clone(),
+            contact_name: "Unknown".into(),
+            last_message: Some("hi".into()),
+            ..Default::default()
+        });
+
+        assert_eq!(state.chats[0].contact_name, "");
     }
 
     #[test]
