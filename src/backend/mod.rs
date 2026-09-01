@@ -93,6 +93,9 @@ pub struct Chat {
     pub id: ChatId,
     pub contact_name: String,
     pub last_message: Option<String>,
+    pub status: Option<String>,
+    /// True when the user has pinned/fixed this chat at the top of the list.
+    pub fixed: bool,
     /// keeps track of current chat scroll
     /// TODO: make this configurable? should the user be able to config if the chat keeps track of
     /// scroll?
@@ -100,6 +103,14 @@ pub struct Chat {
     // Keeps track of unread state for the chat
     pub unread: bool,
     pub unread_count: i32,
+}
+
+impl Chat {
+    pub fn status_label(&self) -> Option<&str> {
+        self.status
+            .as_deref()
+            .filter(|status| !status.trim().is_empty())
+    }
 }
 
 impl ChatId {
@@ -343,6 +354,11 @@ pub trait Messenger: Send + Sync {
     async fn edit(&self, chat: &ChatId, id: &MessageId, text: &str) -> Result<(), BackendError>;
     /// Messenger provider >>> Client message handling
     fn subscribe(&self) -> broadcast::Receiver<BackendEvent>;
+    /// Optional provider-specific status for a chat, such as Telegram online/last-seen information.
+    /// The default is `None`; a provider may fill this in later without changing the UI contract.
+    async fn status(&self, _chat: &ChatId) -> Result<Option<String>, BackendError> {
+        Ok(None)
+    }
     /// Graceful shutdown: flush pending work, close transport, stop background tasks.
     async fn disconnect(&mut self) -> Result<(), BackendError>;
     /// Start authentication flow. For event-driven providers (WhatsApp) this is a no-op;
@@ -469,6 +485,7 @@ impl MessengerKind {
         , async fn delete(&self, chat: &ChatId, id: &MessageId) -> Result<(), BackendError> ;
         , async fn edit(&self, chat: &ChatId, id: &MessageId, text: &str) -> Result<(), BackendError> ;
         , fn subscribe(&self) -> broadcast::Receiver<BackendEvent> ;
+        , async fn status(&self, chat: &ChatId) -> Result<Option<String>, BackendError> ;
         , async fn disconnect(&mut self) -> Result<(), BackendError> ;
         , async fn login(&mut self) -> Result<(), BackendError> ;
         , async fn logout(&mut self) -> Result<(), BackendError> ;

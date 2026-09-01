@@ -196,6 +196,10 @@ impl ChatState {
         }
     }
 
+    fn sort_fixed_first(&mut self) {
+        self.chats.sort_by_key(|chat| !chat.fixed);
+    }
+
     /// Insert or update a sidebar chat entry from a push update while keeping
     /// the existing order intact and preserving user-visible scroll state.
     pub fn upsert_chat(&mut self, chat: Chat) -> bool {
@@ -212,6 +216,16 @@ impl ChatState {
                 && chat.contact_name != "You"
             {
                 entry.contact_name = chat.contact_name;
+            }
+
+            if let Some(status) = chat.status.clone() {
+                if !status.trim().is_empty() {
+                    entry.status = Some(status);
+                }
+            }
+
+            if chat.fixed {
+                entry.fixed = true;
             }
 
             let should_bump = chat.last_message.is_some();
@@ -231,10 +245,13 @@ impl ChatState {
                 entry.unread_count = chat.unread_count;
             }
 
-            if pos > 0 && should_bump {
+            if entry.fixed {
+                self.sort_fixed_first();
+            } else if pos > 0 && should_bump {
                 let item = self.chats.remove(pos);
                 self.chats.insert(0, item);
             }
+
             if let Some(selected_id) = selected_id {
                 let selected = self.chats.iter().position(|item| item.id == selected_id);
                 self.chat_list_state.select(selected);
@@ -244,6 +261,8 @@ impl ChatState {
 
         chat.scroll = 0;
         self.chats.insert(0, chat);
+        self.sort_fixed_first();
+
         if let Some(selected_id) = selected_id {
             let selected = self.chats.iter().position(|item| item.id == selected_id);
             self.chat_list_state.select(selected);
@@ -541,6 +560,29 @@ mod tests {
 
         assert_eq!(state.message_list_state.selected(), Some(2));
         assert_eq!(state.open_chat.as_ref().unwrap().history.len(), 5);
+    }
+
+    #[test]
+    fn fixed_chats_stay_above_non_fixed() {
+        let mut state = ChatState {
+            chats: vec![
+                chat(ChatId::Telegram(1), "A"),
+                chat(ChatId::Telegram(2), "B"),
+            ],
+            ..Default::default()
+        };
+
+        state.upsert_chat(Chat {
+            id: ChatId::Telegram(2),
+            contact_name: "B".into(),
+            fixed: true,
+            status: Some("online".into()),
+            ..Default::default()
+        });
+
+        assert!(state.chats[0].fixed);
+        assert_eq!(state.chats[0].id, ChatId::Telegram(2));
+        assert_eq!(state.chats[0].status.as_deref(), Some("online"));
     }
 
     #[test]

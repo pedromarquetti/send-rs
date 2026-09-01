@@ -162,7 +162,10 @@ impl AppState {
                 Chat { scroll, ..chat }
             })
             .collect();
+
         self.chat_state.chats = chat_list;
+        self.chat_state.chats.sort_by_key(|chat| !chat.fixed);
+
         let len = self.chat_state.chats.len();
         let index = if len == 0 {
             None
@@ -318,6 +321,15 @@ impl AppState {
         self.chat_state.chats[index].unread = false;
         self.chat_state.chats[index].unread_count = 0;
 
+        let status = match self.chat_owner(&chat.id) {
+            Some(messenger) => messenger.status(&chat.id).await.ok().flatten(),
+            None => None,
+        };
+
+        if let Some(status) = status.clone() {
+            self.chat_state.chats[index].status = Some(status.clone());
+        }
+
         let history_result = match self.chat_owner(&chat.id) {
             Some(messenger) => messenger.history(&chat.id).await,
             None => Ok(Vec::new()),
@@ -326,10 +338,15 @@ impl AppState {
             Ok(messages) => {
                 let history_len = messages.len();
                 debug!(chat = %chat.contact_name, messages = history_len, "History loaded");
+
                 self.chat_state.open_chat = Some(OpenChat {
-                    chat: chat.clone(),
+                    chat: Chat {
+                        status: status.clone(),
+                        ..chat.clone()
+                    },
                     history: messages,
                 });
+
                 self.chat_state.restore_message_selection(history_len);
             }
             Err(e) => {
@@ -403,10 +420,12 @@ impl AppState {
         match result {
             Ok(messages) => {
                 let history_len = messages.len();
+
                 self.chat_state.open_chat = Some(OpenChat {
-                    chat,
+                    chat: chat.clone(),
                     history: messages,
                 });
+
                 self.chat_state.restore_message_selection(history_len);
             }
             Err(e) => {
@@ -961,6 +980,13 @@ impl AppState {
 
             BackendEvent::ChatUpdated(chat) => {
                 debug!(chat = ?chat.id, "TUI ChatUpdated");
+
+                if let Some(open) = self.chat_state.open_chat.as_mut()
+                    && open.chat.id == chat.id
+                {
+                    open.chat.status = chat.status.clone();
+                }
+
                 self.chat_state.upsert_chat(chat);
             }
         }

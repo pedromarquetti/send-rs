@@ -43,10 +43,37 @@ impl StatefulWidget for ChatWidget<'_> {
             _ => Style::default(),
         };
 
-        let title = state
+        let title: Line<'_> = state
             .selected_chat()
-            .map(|chat| format!(" {} ", chat.contact_name))
+            .map(|chat| {
+                let name = chat.contact_name.trim();
+                let status = chat.status_label().unwrap_or("");
+
+                let label = if name.is_empty() {
+                    "Unnamed chat".to_string()
+                } else {
+                    name.to_string()
+                };
+
+                let bullet = match status {
+                    "online" => Span::from("•").style(Style::new().fg(Color::Green)),
+                    "" => Span::from(""),
+                    _ => Span::from("•"),
+                };
+
+                Line::from(vec![
+                    Span::raw(format!(" {} ", label)),
+                    Span::from(bullet),
+                    Span::styled(
+                        format!(" {status} "),
+                        Style::new()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
+                    ),
+                ])
+            })
             .unwrap_or_else(|| " No chat selected ".into());
+
         let block = Block::bordered().title(title).border_style(border);
 
         let content_width = area.width.saturating_sub(2);
@@ -55,6 +82,7 @@ impl StatefulWidget for ChatWidget<'_> {
             self.max_write_lines,
             area.height,
         );
+
         let split =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(write_height)]).split(area);
         let msgs_area = split[0];

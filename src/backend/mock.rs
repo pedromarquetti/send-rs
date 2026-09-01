@@ -108,6 +108,10 @@ impl Messenger for MockMessenger {
         self.name
     }
 
+    async fn status(&self, _chat: &super::ChatId) -> Result<Option<String>, BackendError> {
+        Ok(None)
+    }
+
     async fn is_authenticated(&self) -> bool {
         self.state
             .lock()

@@ -163,6 +163,34 @@ fn pretty_peer_name(msg: &grammers_client::message::Message, fallback: &str) -> 
         .unwrap_or_else(|| fallback.to_string())
 }
 
+fn telegram_status_label(status: &grammers_tl_types::enums::UserStatus) -> Option<String> {
+    match status {
+        grammers_tl_types::enums::UserStatus::Empty => None,
+        grammers_tl_types::enums::UserStatus::Online(_) => Some("online".to_string()),
+        grammers_tl_types::enums::UserStatus::Offline(status) => {
+            Some(format!("last seen {}", telegram_relative_time(status.was_online)))
+        }
+        grammers_tl_types::enums::UserStatus::Recently(_) => Some("recently".to_string()),
+        grammers_tl_types::enums::UserStatus::LastWeek(_) => Some("last week".to_string()),
+        grammers_tl_types::enums::UserStatus::LastMonth(_) => Some("last month".to_string()),
+    }
+}
+
+fn telegram_relative_time(unix_seconds: i32) -> String {
+    let now = chrono::Utc::now().timestamp();
+    let delta = (now.saturating_sub(unix_seconds as i64)).max(0);
+    match delta {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{}m ago", delta / 60),
+        3600..=86399 => format!("{}h ago", delta / 3600),
+        86400..=604799 => format!("{}d ago", delta / 86400),
+        _ => {
+            let days = delta / 86400;
+            format!("{}d ago", days)
+        }
+    }
+}
+
 /// The active login step. Stored between `request_code` and `sign_in` calls
 /// so the TUI can collect user input across multiple frames.
 ///
@@ -382,6 +410,8 @@ impl TelegramMessenger {
                                             id: chat_id,
                                             contact_name: pretty_peer_name(&msg, &sender),
                                             last_message: Some(preview),
+                                            status: None,
+                                            fixed: false,
                                             scroll: 0,
                                             unread: false,
                                             unread_count: 0,
@@ -446,7 +476,25 @@ impl TelegramMessenger {
                                         *cached_chats.lock().await = None;
                                     }
                                     Update::Raw(raw) => {
-                                        if let tl::enums::Update::ReadHistoryInbox(ref u) = *raw {
+                                        if let tl::enums::Update::UserStatus(ref u) = *raw {
+                                            let chat_id = ChatId::Telegram(u.user_id);
+                                            let status = telegram_status_label(&u.status);
+                                            debug!(
+                                                chat_id = ?chat_id,
+                                                status = ?status,
+                                                "UserStatus update"
+                                            );
+                                            let _ = tx.send(BackendEvent::ChatUpdated(Chat {
+                                                id: chat_id,
+                                                contact_name: String::new(),
+                                                last_message: None,
+                                                status,
+                                                fixed: false,
+                                                scroll: 0,
+                                                unread: false,
+                                                unread_count: 0,
+                                            }));
+                                        } else if let tl::enums::Update::ReadHistoryInbox(ref u) = *raw {
                                             let peer_id = match &u.peer {
                                                 tl::enums::Peer::User(u) => u.user_id,
                                                 tl::enums::Peer::Chat(c) => c.chat_id,
@@ -577,6 +625,19 @@ impl TelegramMessenger {
         pool.updates
     }
 
+    async fn status_for_peer_ref(
+        &self,
+        client: &Client,
+        peer_ref: &grammers_session::types::PeerRef,
+    ) -> Result<Option<String>, BackendError> {
+        let peer = client.resolve_peer(peer_ref.clone()).await?;
+        let grammers_client::peer::Peer::User(user) = peer else {
+            return Ok(None);
+        };
+
+        Ok(telegram_status_label(user.status()))
+    }
+
     fn cache_dialogs(&self, dialogs: Vec<Dialog>) {
         *self.cached_dialogs.lock().unwrap() = dialogs;
     }
@@ -626,11 +687,22 @@ impl TelegramMessenger {
                 grammers_client::tl::enums::Dialog::Dialog(d) => d.unread_count,
                 grammers_client::tl::enums::Dialog::Folder(_) => 0,
             };
+            let fixed = match &dialog.raw {
+                grammers_client::tl::enums::Dialog::Dialog(d) => d.pinned,
+                grammers_client::tl::enums::Dialog::Folder(d) => d.pinned,
+            };
+            let status = self
+                .status_for_peer_ref(&client, &dialog.peer_ref())
+                .await
+                .ok()
+                .flatten();
 
             chats.push(Chat {
                 id,
                 contact_name,
                 last_message,
+                status,
+                fixed,
                 unread: unread_count > 0,
                 unread_count,
                 scroll: 0,
@@ -690,6 +762,27 @@ async fn reply_context(
 impl Messenger for TelegramMessenger {
     fn platform(&self) -> &'static str {
         "Telegram"
+    }
+
+    async fn status(&self, chat: &ChatId) -> Result<Option<String>, BackendError> {
+        let ChatId::Telegram(bare_id) = chat else {
+            return Ok(None);
+        };
+
+        let client = self.current_client().await;
+        let peer_ref = self
+            .find_dialog_peer_ref(*bare_id)
+            .or_else(|| {
+                self.cached_dialogs
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|d| d.peer.id().bare_id() == Some(*bare_id))
+                    .map(|d| d.peer_ref())
+            })
+            .ok_or_else(|| BackendError::Other(format!("chat {bare_id} not found in dialog cache")))?;
+
+        self.status_for_peer_ref(&client, &peer_ref).await
     }
 
     async fn is_authenticated(&self) -> bool {

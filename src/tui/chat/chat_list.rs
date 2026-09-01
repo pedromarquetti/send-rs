@@ -29,6 +29,7 @@ impl StatefulWidget for ChatList<'_> {
         } else {
             Style::default()
         };
+
         let block = Block::bordered().title(" Chats ").border_style(border);
 
         if self.chats.is_empty() {
@@ -48,12 +49,29 @@ impl StatefulWidget for ChatList<'_> {
                     Style::default().fg(Color::DarkGray),
                 ));
 
+                if item.fixed {
+                    spans.push(Span::styled("📌 ", Style::default().fg(Color::Yellow)));
+                }
+
                 let name_style = if item.unread {
                     Style::default().add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
-                spans.push(Span::styled(item.contact_name.clone(), name_style));
+
+                let display_name = item.contact_name.trim();
+
+                spans.push(Span::styled(display_name.to_string(), name_style));
+
+                if let Some(status) = item.status_label() {
+                    let bullet = match status {
+                        "online" => Span::from(" •").style(Style::new().fg(Color::Green)),
+                        _ => Span::from(""),
+                    };
+
+                    spans.push(bullet);
+                }
+
                 if item.unread_count > 0 {
                     spans.push(Span::styled(
                         format!(" ({})", item.unread_count),
