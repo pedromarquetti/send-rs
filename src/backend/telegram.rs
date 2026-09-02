@@ -632,7 +632,7 @@ impl TelegramMessenger {
         client: &Client,
         peer_ref: &grammers_session::types::PeerRef,
     ) -> Result<Option<String>, BackendError> {
-        let peer = client.resolve_peer(peer_ref.clone()).await?;
+        let peer = client.resolve_peer(*peer_ref).await?;
         let grammers_client::peer::Peer::User(user) = peer else {
             return Ok(None);
         };

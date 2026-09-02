@@ -537,4 +537,24 @@ mod tests {
         assert_eq!(chat.last_message.as_deref(), Some("hey"));
         assert!(chat.unread);
     }
+
+    #[test]
+    fn chat_status_label_ignores_empty_status() {
+        let mut chat = Chat::default();
+        assert_eq!(chat.status_label(), None);
+
+        chat.status = Some("   ".into());
+        assert_eq!(chat.status_label(), None);
+
+        chat.status = Some("online".into());
+        assert_eq!(chat.status_label(), Some("online"));
+    }
+
+    #[test]
+    fn local_message_ids_are_distinguished_from_server_ids() {
+        assert!(MessageId::from("local-1").is_local());
+        assert!(!MessageId::from("12345").is_local());
+        assert_eq!(MessageId::from("12345").to_i32(), Some(12345));
+        assert_eq!(MessageId::from("local-1").to_i32(), None);
+    }
 }

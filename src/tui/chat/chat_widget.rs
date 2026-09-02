@@ -63,7 +63,7 @@ impl StatefulWidget for ChatWidget<'_> {
 
                 Line::from(vec![
                     Span::raw(format!(" {} ", label)),
-                    Span::from(bullet),
+                    bullet,
                     Span::styled(
                         format!(" {status} "),
                         Style::new()

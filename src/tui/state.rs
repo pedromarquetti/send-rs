@@ -1251,6 +1251,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_update_refreshes_sidebar_and_open_chat() {
+        let mut state = app_state().await;
+        state.chat_state.chat_list_state.select(Some(0));
+        state.select_chat(0).await;
+
+        state.handle_backend_event(
+            Provider::Telegram,
+            BackendEvent::ChatUpdated(Chat {
+                id: ChatId::Telegram(101),
+                status: Some("last seen 5m ago".into()),
+                ..Default::default()
+            }),
+        );
+
+        assert_eq!(
+            state.chat_state.chats[0].status.as_deref(),
+            Some("last seen 5m ago")
+        );
+        assert_eq!(
+            state
+                .chat_state
+                .open_chat
+                .as_ref()
+                .and_then(|open| open.chat.status.as_deref()),
+            Some("last seen 5m ago")
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_chat_status_update_preserves_existing_sidebar_metadata() {
+        let mut state = app_state().await;
+        let original_name = state.chat_state.chats[1].contact_name.clone();
+        let original_preview = state.chat_state.chats[1].last_message.clone();
+
+        state.handle_backend_event(
+            Provider::Telegram,
+            BackendEvent::ChatUpdated(Chat {
+                id: ChatId::Telegram(102),
+                status: Some("online".into()),
+                ..Default::default()
+            }),
+        );
+
+        let chat = &state.chat_state.chats[1];
+        assert_eq!(chat.contact_name, original_name);
+        assert_eq!(chat.last_message, original_preview);
+        assert_eq!(chat.status.as_deref(), Some("online"));
+    }
+
+    #[tokio::test]
     async fn incoming_message_to_unknown_chat_inserts_sidebar_entry() {
         let mut state = app_state().await;
         let before = state.chat_state.chats.len();

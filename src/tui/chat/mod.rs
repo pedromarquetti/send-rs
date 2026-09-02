@@ -222,10 +222,10 @@ impl ChatState {
                 entry.contact_name = chat.contact_name;
             }
 
-            if let Some(status) = chat.status.clone() {
-                if !status.trim().is_empty() {
-                    entry.status = Some(status);
-                }
+            if let Some(status) = chat.status.clone()
+                && !status.trim().is_empty()
+            {
+                entry.status = Some(status);
             }
 
             if chat.fixed {
