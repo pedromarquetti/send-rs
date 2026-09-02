@@ -25,6 +25,7 @@ the future?) in one TUI app!
 - [ ] Audio playback
 - [ ] Ordered chat list - All chats, ordered by pinned/most recent.
 - [ ] Dedicated chatlist for each provider
+- [ ] Chat List/Message search.
 
 ## Configuration
 

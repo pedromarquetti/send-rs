@@ -224,10 +224,14 @@ async fn run_app(
                 if app.state.sidebar_sync_in_flight {
                     continue;
                 }
+
                 app.state.sidebar_sync_in_flight = true;
+                app.state.sidebar_sync_pending = app.state.messengers.len();
+
                 for messenger in app.state.messengers.iter() {
                     let messenger = messenger.clone();
                     let tx = tx.clone();
+
                     tokio::spawn(async move {
                         let provider = messenger.provider();
                         let result = messenger.chats().await;
@@ -285,26 +289,18 @@ async fn run_app(
                             result,
                         } => app.state.apply_chat_load(chat, generation, result),
                     UiEvent::SidebarChats(provider, result) => {
-                        app.state.sidebar_sync_in_flight = false;
+                        app.state.sidebar_sync_pending =
+                            app.state.sidebar_sync_pending.saturating_sub(1);
+                        app.state.sidebar_sync_in_flight = app.state.sidebar_sync_pending > 0;
+
                         match result {
                             Ok(chats) => {
-                                for chat in chats {
-                                    let is_open = app.state.chat_state.is_open(&chat.id);
-                                    if let Some(entry) = app.state.chat_state.chats.iter_mut().find(|e| e.id == chat.id) {
-                                        if is_open {
-                                            entry.unread = false;
-                                            entry.unread_count = 0;
-                                        } else {
-                                            entry.unread = chat.unread;
-                                            entry.unread_count = chat.unread_count;
-                                        }
-                                        if chat.last_message.is_some() {
-                                            entry.last_message = chat.last_message;
-                                        }
-                                    }
-                                }
+                                app.state
+                                    .chat_state
+                                    .reconcile_provider_chats(provider, chats);
                                 debug!(provider = ?provider, "Sidebar sync OK");
                             }
+
                             Err(e) => error!(provider = ?provider, error = %e, "Sidebar sync failed"),
                         }
                     }

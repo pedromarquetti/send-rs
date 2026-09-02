@@ -46,6 +46,27 @@ pub struct ChatState {
 }
 
 impl ChatState {
+    fn deduplicate_chats(&mut self) {
+        let mut seen = std::collections::HashSet::new();
+        let mut duplicate_ids = Vec::new();
+
+        self.chats.retain(|chat| {
+            if seen.insert(chat.id.clone()) {
+                true
+            } else {
+                duplicate_ids.push(format!("{:?}", chat.id));
+                false
+            }
+        });
+
+        if !duplicate_ids.is_empty() {
+            tracing::warn!(
+                duplicates = ?duplicate_ids,
+                "Removed duplicate chat IDs from sidebar state"
+            );
+        }
+    }
+
     pub fn get_tag(&self) -> Option<&'static str> {
         match self.selected_chat() {
             Some(c) => Some(c.id.tag()),
@@ -208,6 +229,7 @@ impl ChatState {
     /// the existing order intact and preserving user-visible scroll state.
     pub fn upsert_chat(&mut self, chat: Chat) -> bool {
         let mut chat = chat;
+        self.deduplicate_chats();
 
         if chat.contact_name == "Unknown" || chat.contact_name == "You" {
             chat.contact_name.clear();
@@ -260,6 +282,7 @@ impl ChatState {
                 let selected = self.chats.iter().position(|item| item.id == selected_id);
                 self.chat_list_state.select(selected);
             }
+            self.deduplicate_chats();
             return true;
         }
 
@@ -271,7 +294,42 @@ impl ChatState {
             let selected = self.chats.iter().position(|item| item.id == selected_id);
             self.chat_list_state.select(selected);
         }
+        self.deduplicate_chats();
         true
+    }
+
+    /// Reconcile one provider's successful dialog snapshot while preserving
+    /// chats belonging to other providers and the current selection.
+    pub fn reconcile_provider_chats(
+        &mut self,
+        provider: crate::backend::Provider,
+        chats: Vec<Chat>,
+    ) {
+        let selected_id = self.selected_chat().map(|chat| chat.id.clone());
+
+        self.chats.retain(|chat| {
+            !matches!(
+                (&chat.id, provider),
+                (ChatId::Telegram(_), crate::backend::Provider::Telegram)
+                    | (ChatId::WhatsApp(_), crate::backend::Provider::WhatsApp)
+            )
+        });
+
+        let mut seen = std::collections::HashSet::new();
+
+        for chat in chats {
+            if seen.insert(chat.id.clone()) {
+                self.chats.push(chat);
+            }
+        }
+
+        self.sort_fixed_first();
+        self.deduplicate_chats();
+
+        if let Some(selected_id) = selected_id {
+            self.chat_list_state
+                .select(self.chats.iter().position(|chat| chat.id == selected_id));
+        }
     }
 
     /// Replace the open chat's history with freshly fetched data, preserving the
@@ -722,5 +780,72 @@ mod tests {
         state.prepend_history(&id, vec![existing]);
 
         assert_eq!(state.open_chat.as_ref().unwrap().history.len(), 1);
+    }
+
+    #[test]
+    fn provider_reconciliation_removes_stale_provider_chats_only() {
+        let mut state = ChatState {
+            chats: vec![
+                chat(ChatId::Telegram(1), "Old Telegram"),
+                chat(ChatId::Telegram(2), "Removed Telegram"),
+                chat(ChatId::WhatsApp("wa-1".into()), "WhatsApp"),
+            ],
+            ..Default::default()
+        };
+
+        state.reconcile_provider_chats(
+            crate::backend::Provider::Telegram,
+            vec![chat(ChatId::Telegram(1), "Updated Telegram")],
+        );
+
+        assert_eq!(state.chats.len(), 2);
+        assert!(
+            state
+                .chats
+                .iter()
+                .any(|chat| chat.id == ChatId::WhatsApp("wa-1".into()))
+        );
+        assert!(
+            !state
+                .chats
+                .iter()
+                .any(|chat| chat.id == ChatId::Telegram(2))
+        );
+        assert_eq!(
+            state
+                .chats
+                .iter()
+                .find(|chat| chat.id == ChatId::Telegram(1))
+                .unwrap()
+                .contact_name,
+            "Updated Telegram"
+        );
+    }
+
+    #[test]
+    fn provider_reconciliation_preserves_snapshot_order() {
+        let mut state = ChatState::default();
+
+        state.reconcile_provider_chats(
+            crate::backend::Provider::Telegram,
+            vec![
+                chat(ChatId::Telegram(1), "Newest"),
+                chat(ChatId::Telegram(2), "Older"),
+                chat(ChatId::Telegram(3), "Oldest"),
+            ],
+        );
+
+        assert_eq!(
+            state
+                .chats
+                .iter()
+                .map(|chat| chat.id.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                ChatId::Telegram(1),
+                ChatId::Telegram(2),
+                ChatId::Telegram(3)
+            ]
+        );
     }
 }

@@ -68,6 +68,7 @@ pub struct AppState {
     pub chat_load_generation: u64,
     pub history_refresh_in_flight: bool,
     pub sidebar_sync_in_flight: bool,
+    pub sidebar_sync_pending: usize,
     pub backend_status: Option<String>,
     pub retry_draft: Option<RetryDraft>,
 }
@@ -130,6 +131,7 @@ impl AppState {
             chat_load_generation: 0,
             history_refresh_in_flight: false,
             sidebar_sync_in_flight: false,
+            sidebar_sync_pending: 0,
             backend_status: None,
             retry_draft: None,
         };
@@ -155,13 +157,17 @@ impl AppState {
             .iter()
             .map(|chat| (chat.id.clone(), chat.scroll))
             .collect();
+
+        let mut seen = std::collections::HashSet::new();
         let chat_list: Vec<Chat> = chats
             .into_iter()
+            .filter(|chat| seen.insert(chat.id.clone()))
             .map(|chat| {
                 let scroll = saved_scrolls.get(&chat.id).copied().unwrap_or(0);
                 Chat { scroll, ..chat }
             })
             .collect();
+        debug!(total = chat_list.len(), "Applying deduplicated chat list");
 
         self.chat_state.chats = chat_list;
         self.chat_state.chats.sort_by_key(|chat| !chat.fixed);
@@ -193,7 +199,9 @@ impl AppState {
     /// one place.
     pub fn apply_fetched(&mut self, chats: Vec<Chat>, errors: Vec<BackendError>) {
         self.apply_chats(chats);
+
         self.chats_loaded = true;
+
         if !errors.is_empty() {
             self.create_popup(PopupKind::Error(
                 errors
@@ -1083,6 +1091,19 @@ mod tests {
         assert_eq!(state.chat_state.chats.len(), 4);
         assert!(state.selected_chat_idx().is_none());
         assert!(state.chat_state.open_chat.is_none());
+    }
+
+    #[tokio::test]
+    async fn applying_chats_deduplicates_chat_ids() {
+        let mut state = app_state().await;
+        let duplicate = state.chat_state.chats[0].clone();
+        let unique = state.chat_state.chats[1].clone();
+        let duplicate_id = duplicate.id.clone();
+
+        state.apply_chats(vec![duplicate.clone(), unique, duplicate]);
+
+        assert_eq!(state.chat_state.chats.len(), 2);
+        assert_eq!(state.chat_state.chats[0].id, duplicate_id);
     }
 
     #[test]

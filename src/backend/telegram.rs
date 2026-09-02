@@ -663,6 +663,7 @@ impl TelegramMessenger {
         let mut dialogs_iter = client.iter_dialogs();
         let mut chats = Vec::new();
         let mut raw_dialogs = Vec::new();
+        let mut seen_ids = std::collections::HashSet::new();
 
         while let Some(dialog) = dialogs_iter.next().await? {
             let peer = dialog.peer();
@@ -672,6 +673,15 @@ impl TelegramMessenger {
             };
             let id = ChatId::Telegram(bare_id);
             let contact_name = peer.name().unwrap_or("Unknown").to_string();
+
+            if !seen_ids.insert(bare_id) {
+                warn!(
+                    bare_id,
+                    contact_name = %contact_name,
+                    "Skipping duplicate Telegram dialog peer"
+                );
+                continue;
+            }
 
             let last_message = dialog.last_message.as_ref().map(|msg| {
                 let prefix = if msg.outgoing() {
@@ -711,8 +721,18 @@ impl TelegramMessenger {
             });
             raw_dialogs.push(dialog);
         }
-        info!("Loaded {} Telegram dialogs", chats.len());
+
+        info!(
+            dialogs = chats.len(),
+            names = ?chats
+                .iter()
+                .map(|chat| (&chat.contact_name, &chat.id))
+                .collect::<Vec<_>>(),
+            "Loaded Telegram dialogs"
+        );
+
         self.cache_dialogs(raw_dialogs);
+
         Ok(chats)
     }
 
