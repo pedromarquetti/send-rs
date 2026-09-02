@@ -431,21 +431,21 @@ impl App {
             return;
         }
 
-        let offset_id = open
-            .history
-            .first()
-            .and_then(|msg| msg.message_id.to_i32());
+        let offset_id = open.history.first().and_then(|msg| msg.message_id.to_i32());
 
-        let result: Result<Vec<_>, crate::backend::BackendError> = messenger
-            .history_page(&chat_id, offset_id, 25)
-            .await;
+        let result: Result<Vec<_>, crate::backend::BackendError> =
+            messenger.history_page(&chat_id, offset_id, 25).await;
 
         match result {
             Ok(older) if !older.is_empty() => {
                 let existing = open.history.clone();
                 let filtered = older
                     .into_iter()
-                    .filter(|msg| !existing.iter().any(|item| item.message_id == msg.message_id))
+                    .filter(|msg| {
+                        !existing
+                            .iter()
+                            .any(|item| item.message_id == msg.message_id)
+                    })
                     .collect::<Vec<_>>();
 
                 if !filtered.is_empty() {

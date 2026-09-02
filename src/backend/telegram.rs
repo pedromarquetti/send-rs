@@ -167,9 +167,10 @@ fn telegram_status_label(status: &grammers_tl_types::enums::UserStatus) -> Optio
     match status {
         grammers_tl_types::enums::UserStatus::Empty => None,
         grammers_tl_types::enums::UserStatus::Online(_) => Some("online".to_string()),
-        grammers_tl_types::enums::UserStatus::Offline(status) => {
-            Some(format!("last seen {}", telegram_relative_time(status.was_online)))
-        }
+        grammers_tl_types::enums::UserStatus::Offline(status) => Some(format!(
+            "last seen {}",
+            telegram_relative_time(status.was_online)
+        )),
         grammers_tl_types::enums::UserStatus::Recently(_) => Some("recently".to_string()),
         grammers_tl_types::enums::UserStatus::LastWeek(_) => Some("last week".to_string()),
         grammers_tl_types::enums::UserStatus::LastMonth(_) => Some("last month".to_string()),
@@ -781,7 +782,9 @@ impl Messenger for TelegramMessenger {
                     .find(|d| d.peer.id().bare_id() == Some(*bare_id))
                     .map(|d| d.peer_ref())
             })
-            .ok_or_else(|| BackendError::Other(format!("chat {bare_id} not found in dialog cache")))?;
+            .ok_or_else(|| {
+                BackendError::Other(format!("chat {bare_id} not found in dialog cache"))
+            })?;
 
         self.status_for_peer_ref(&client, &peer_ref).await
     }

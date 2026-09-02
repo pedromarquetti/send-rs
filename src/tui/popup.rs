@@ -138,7 +138,9 @@ impl StatefulWidget for &mut PopUp {
                     )));
                     content_lines.push(Line::from(Span::styled(
                         "  Terminal media preview is not implemented yet ",
-                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
                     )));
                     if let Some(caption) = media
                         .caption

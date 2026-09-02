@@ -285,7 +285,9 @@ impl ChatState {
             let mut merged = chat.history.clone();
 
             for message in history {
-                if let Some(existing) = merged.iter_mut().find(|item| item.message_id == message.message_id)
+                if let Some(existing) = merged
+                    .iter_mut()
+                    .find(|item| item.message_id == message.message_id)
                 {
                     let mut incoming = message;
 
@@ -335,7 +337,10 @@ impl ChatState {
             let mut merged = Vec::new();
 
             for message in older {
-                if !open.history.iter().any(|existing| existing.message_id == message.message_id)
+                if !open
+                    .history
+                    .iter()
+                    .any(|existing| existing.message_id == message.message_id)
                 {
                     merged.push(message);
                 }
@@ -351,11 +356,13 @@ impl ChatState {
 
             let selected = self.message_list_state.selected().unwrap_or(0);
 
-            self.message_list_state
-                .select(Some((selected + prepend_count).min(open.history.len().saturating_sub(1))));
+            self.message_list_state.select(Some(
+                (selected + prepend_count).min(open.history.len().saturating_sub(1)),
+            ));
 
             if current_len == 0 {
-                self.message_list_state.select(Some(open.history.len().saturating_sub(1)));
+                self.message_list_state
+                    .select(Some(open.history.len().saturating_sub(1)));
             }
         }
     }
@@ -669,5 +676,51 @@ mod tests {
 
         assert_eq!(state.message_list_state.selected(), Some(8));
         assert_eq!(state.open_chat.as_ref().unwrap().history.len(), 13);
+    }
+
+    #[test]
+    fn prepend_history_keeps_selection_on_same_message() {
+        let id = ChatId::Telegram(1);
+        let mut state = ChatState {
+            open_chat: Some(OpenChat {
+                chat: chat(id.clone(), "A"),
+                history: (0..3)
+                    .map(|i| message_with_id(id.clone(), &format!("current-{i}"), i))
+                    .collect(),
+                has_more_history: true,
+            }),
+            ..Default::default()
+        };
+        state.message_list_state.select(Some(1));
+
+        let older = (0..2)
+            .map(|i| message_with_id(id.clone(), &format!("older-{i}"), i - 2))
+            .collect();
+        state.prepend_history(&id, older);
+
+        assert_eq!(state.open_chat.as_ref().unwrap().history.len(), 5);
+        assert_eq!(state.message_list_state.selected(), Some(3));
+        assert_eq!(
+            state.open_chat.as_ref().unwrap().history[3].message_id,
+            MessageId::from("current-1")
+        );
+    }
+
+    #[test]
+    fn prepend_history_ignores_duplicate_messages() {
+        let id = ChatId::Telegram(1);
+        let existing = message_with_id(id.clone(), "existing", 0);
+        let mut state = ChatState {
+            open_chat: Some(OpenChat {
+                chat: chat(id.clone(), "A"),
+                history: vec![existing.clone()],
+                has_more_history: true,
+            }),
+            ..Default::default()
+        };
+
+        state.prepend_history(&id, vec![existing]);
+
+        assert_eq!(state.open_chat.as_ref().unwrap().history.len(), 1);
     }
 }
