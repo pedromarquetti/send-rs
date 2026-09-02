@@ -345,6 +345,7 @@ impl AppState {
                         ..chat.clone()
                     },
                     history: messages,
+                    has_more_history: true,
                 });
 
                 self.chat_state.restore_message_selection(history_len);
@@ -424,6 +425,7 @@ impl AppState {
                 self.chat_state.open_chat = Some(OpenChat {
                     chat: chat.clone(),
                     history: messages,
+                    has_more_history: true,
                 });
 
                 self.chat_state.restore_message_selection(history_len);

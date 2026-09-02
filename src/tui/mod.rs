@@ -404,6 +404,66 @@ impl App {
         self.state.cancel_chat_load();
     }
 
+    async fn load_more_history(&mut self) {
+        let Some(chat_id) = self
+            .state
+            .chat_state
+            .open_chat
+            .as_ref()
+            .map(|open| open.chat.id.clone())
+        else {
+            return;
+        };
+
+        let Some(messenger) = self
+            .state
+            .provider_to_messenger(chat_id.to_provider())
+            .cloned()
+        else {
+            return;
+        };
+
+        let Some(open) = self.state.chat_state.open_chat.as_mut() else {
+            return;
+        };
+
+        if !open.has_more_history {
+            return;
+        }
+
+        let offset_id = open
+            .history
+            .first()
+            .and_then(|msg| msg.message_id.to_i32());
+
+        let result: Result<Vec<_>, crate::backend::BackendError> = messenger
+            .history_page(&chat_id, offset_id, 25)
+            .await;
+
+        match result {
+            Ok(older) if !older.is_empty() => {
+                let existing = open.history.clone();
+                let filtered = older
+                    .into_iter()
+                    .filter(|msg| !existing.iter().any(|item| item.message_id == msg.message_id))
+                    .collect::<Vec<_>>();
+
+                if !filtered.is_empty() {
+                    let count = filtered.len();
+                    self.state.chat_state.prepend_history(&chat_id, filtered);
+                    self.state.chat_state.message_list_state.select(Some(count));
+                }
+            }
+            Ok(_) => {
+                open.has_more_history = false;
+            }
+            Err(err) => {
+                open.has_more_history = false;
+                error!(chat = ?chat_id, error = %err, "Lazy history load failed");
+            }
+        }
+    }
+
     async fn shutdown(&mut self) {
         self.cancel_chat_load();
 
@@ -541,7 +601,17 @@ impl App {
             }
             Focus::Chat => {
                 if key == km.scroll_up {
-                    self.state.chat_state.message_list_state.select_previous();
+                    if self
+                        .state
+                        .chat_state
+                        .message_list_state
+                        .selected()
+                        .is_some_and(|current| current == 0)
+                    {
+                        self.load_more_history().await;
+                    } else {
+                        self.state.chat_state.message_list_state.select_previous();
+                    }
                 } else if key == km.scroll_down {
                     self.state.chat_state.message_list_state.select_next();
                 } else if key == km.scroll_to_bottom {
@@ -553,15 +623,15 @@ impl App {
                         .map(|o| o.history.len().saturating_sub(1));
                     self.state.chat_state.message_list_state.select(last);
                 } else if key.code == KeyCode::PageUp {
-                    let page = self.state.chat_state.visible_page;
-                    let current = self
-                        .state
-                        .chat_state
-                        .message_list_state
-                        .selected()
-                        .unwrap_or(0);
-                    let new = current.saturating_sub(page);
-                    self.state.chat_state.message_list_state.select(Some(new));
+                    if let Some(current) = self.state.chat_state.message_list_state.selected()
+                        && current > 0
+                    {
+                        let page = self.state.chat_state.visible_page;
+                        let new = current.saturating_sub(page);
+                        self.state.chat_state.message_list_state.select(Some(new));
+                    } else {
+                        self.load_more_history().await;
+                    }
                 } else if key.code == KeyCode::PageDown {
                     // TODO: use scroll_up_by/ scroll_down_by here
                     let page = self.state.chat_state.visible_page;

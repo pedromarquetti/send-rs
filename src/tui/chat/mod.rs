@@ -12,6 +12,10 @@ pub mod chat_widget;
 pub struct OpenChat {
     pub chat: Chat,
     pub history: Vec<Message>,
+    /// Whether a further older-page fetch is still worth trying. Once a page
+    /// request returns empty, the chat is known to be at its oldest available
+    /// history in this provider.
+    pub has_more_history: bool,
 }
 
 /// A chat in the sidebar combined with its app-level metadata.
@@ -278,25 +282,29 @@ impl ChatState {
         {
             let old_len = chat.history.len();
             let old_selected = self.message_list_state.selected();
-            let mut refreshed = history;
+            let mut merged = chat.history.clone();
 
-            for message in &mut refreshed {
-                if let Some(previous) = chat
-                    .history
-                    .iter()
-                    .find(|item| item.message_id == message.message_id)
+            for message in history {
+                if let Some(existing) = merged.iter_mut().find(|item| item.message_id == message.message_id)
                 {
-                    if message.reply_to_id.is_none() {
-                        message.reply_to_id = previous.reply_to_id.clone();
+                    let mut incoming = message;
+
+                    if incoming.reply_to_id.is_none() {
+                        incoming.reply_to_id = existing.reply_to_id.clone();
                     }
 
-                    if message.reply_ctx.is_none() {
-                        message.reply_ctx = previous.reply_ctx.clone();
+                    if incoming.reply_ctx.is_none() {
+                        incoming.reply_ctx = existing.reply_ctx.clone();
                     }
+
+                    *existing = incoming;
+                } else {
+                    merged.push(message);
                 }
             }
-            refreshed.sort_by_key(|message| message.timestamp);
-            chat.history = refreshed;
+
+            merged.sort_by_key(|message| message.timestamp);
+            chat.history = merged;
 
             let new_len = chat.history.len();
 
@@ -312,6 +320,42 @@ impl ChatState {
             // If the user was already at the bottom and new messages arrived, follow them.
             if old_len > 0 && old_selected == Some(old_len - 1) && new_len > old_len {
                 self.message_list_state.select(Some(new_len - 1));
+            }
+        }
+    }
+
+    /// Prepend older messages to the open chat history without dropping the
+    /// current selection or duplicate entries. This is the foundation for lazy
+    /// history loading in phase 11.
+    pub fn prepend_history(&mut self, chat_id: &ChatId, older: Vec<Message>) {
+        if let Some(open) = &mut self.open_chat
+            && open.chat.id == *chat_id
+        {
+            let current_len = open.history.len();
+            let mut merged = Vec::new();
+
+            for message in older {
+                if !open.history.iter().any(|existing| existing.message_id == message.message_id)
+                {
+                    merged.push(message);
+                }
+            }
+
+            if merged.is_empty() {
+                return;
+            }
+
+            let prepend_count = merged.len();
+            open.history.splice(0..0, merged);
+            open.history.sort_by_key(|message| message.timestamp);
+
+            let selected = self.message_list_state.selected().unwrap_or(0);
+
+            self.message_list_state
+                .select(Some((selected + prepend_count).min(open.history.len().saturating_sub(1))));
+
+            if current_len == 0 {
+                self.message_list_state.select(Some(open.history.len().saturating_sub(1)));
             }
         }
     }
@@ -373,12 +417,16 @@ mod tests {
     }
 
     fn message(chat: ChatId) -> Message {
+        message_with_id(chat, "m", 0)
+    }
+
+    fn message_with_id(chat: ChatId, id: &str, timestamp: i64) -> Message {
         Message {
-            message_id: "m".into(),
+            message_id: id.into(),
             chat,
             sender: "Sender".into(),
             text: "hello".into(),
-            timestamp: 0,
+            timestamp,
             from_me: false,
             msg_actions: Vec::new(),
             media: None,
@@ -396,6 +444,7 @@ mod tests {
         state.open_chat = Some(OpenChat {
             chat: chat(ChatId::Telegram(1), "A"),
             history: Vec::new(),
+            has_more_history: true,
         });
         assert!(state.is_open(&ChatId::Telegram(1)));
         assert!(!state.is_open(&ChatId::Telegram(2)));
@@ -407,6 +456,7 @@ mod tests {
             open_chat: Some(OpenChat {
                 chat: chat(ChatId::Telegram(1), "A"),
                 history: Vec::new(),
+                has_more_history: true,
             }),
             ..Default::default()
         };
@@ -504,7 +554,10 @@ mod tests {
         let mut state = ChatState {
             open_chat: Some(OpenChat {
                 chat: chat(id.clone(), "A"),
-                history: vec![message(id.clone()); 10],
+                history: (0..10)
+                    .map(|i| message_with_id(id.clone(), &format!("old-{i}"), i))
+                    .collect(),
+                has_more_history: true,
             }),
             ..Default::default()
         };
@@ -513,7 +566,9 @@ mod tests {
         state.message_list_state.select(Some(3));
 
         // Replace with 12 messages (2 new ones appended at end).
-        let new_history: Vec<Message> = (0..12).map(|_| message(id.clone())).collect();
+        let new_history: Vec<Message> = (0..12)
+            .map(|i| message_with_id(id.clone(), &format!("new-{i}"), i))
+            .collect();
         state.refresh_chat_history(&id, new_history);
 
         // Selection should stay at 3 (preserved, since 3 < 12).
@@ -526,19 +581,24 @@ mod tests {
         let mut state = ChatState {
             open_chat: Some(OpenChat {
                 chat: chat(id.clone(), "A"),
-                history: vec![message(id.clone()); 5],
+                history: (0..5)
+                    .map(|i| message_with_id(id.clone(), &format!("old-{i}"), i))
+                    .collect(),
+                has_more_history: true,
             }),
             ..Default::default()
         };
         // User is at the bottom (index 4 = len - 1).
         state.message_list_state.select(Some(4));
 
-        // Replace with 7 messages (2 new ones).
-        let new_history: Vec<Message> = (0..7).map(|_| message(id.clone())).collect();
+        // Merge a refreshed snapshot containing 7 messages.
+        let new_history: Vec<Message> = (0..7)
+            .map(|i| message_with_id(id.clone(), &format!("new-{i}"), i))
+            .collect();
         state.refresh_chat_history(&id, new_history);
 
-        // Should follow to the new bottom (index 6).
-        assert_eq!(state.message_list_state.selected(), Some(6));
+        // The existing five plus seven refreshed messages are retained.
+        assert_eq!(state.message_list_state.selected(), Some(11));
     }
 
     #[test]
@@ -547,6 +607,7 @@ mod tests {
             open_chat: Some(OpenChat {
                 chat: chat(ChatId::Telegram(1), "A"),
                 history: vec![message(ChatId::Telegram(1)); 5],
+                has_more_history: true,
             }),
             ..Default::default()
         };
@@ -586,21 +647,27 @@ mod tests {
     }
 
     #[test]
-    fn replace_history_clamps_selection_when_history_shrinks() {
+    fn replace_history_preserves_lazy_loaded_history() {
         let id = ChatId::Telegram(1);
         let mut state = ChatState {
             open_chat: Some(OpenChat {
                 chat: chat(id.clone(), "A"),
-                history: vec![message(id.clone()); 10],
+                history: (0..10)
+                    .map(|i| message_with_id(id.clone(), &format!("old-{i}"), i))
+                    .collect(),
+                has_more_history: true,
             }),
             ..Default::default()
         };
         state.message_list_state.select(Some(8));
 
-        // Replace with only 3 messages — selection should be clamped.
-        let new_history: Vec<Message> = (0..3).map(|_| message(id.clone())).collect();
+        // A shorter refresh must not discard the older lazy-loaded messages.
+        let new_history: Vec<Message> = (0..3)
+            .map(|i| message_with_id(id.clone(), &format!("new-{i}"), i))
+            .collect();
         state.refresh_chat_history(&id, new_history);
 
-        assert_eq!(state.message_list_state.selected(), Some(2));
+        assert_eq!(state.message_list_state.selected(), Some(8));
+        assert_eq!(state.open_chat.as_ref().unwrap().history.len(), 13);
     }
 }

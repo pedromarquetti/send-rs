@@ -331,8 +331,21 @@ pub trait Messenger: Send + Sync {
     async fn chats(&self) -> Result<Vec<Chat>, BackendError>;
     /// mark a chat as read
     async fn set_read(&mut self, chat: &ChatId) -> Result<(), BackendError>;
-    /// Requests the Messenger provider for chat history
+    /// Requests the Messenger provider for chat history.
     async fn history(&self, chat: &ChatId) -> Result<Vec<Message>, BackendError>;
+    /// Fetch an older page of chat history, starting before `offset_id` when provided.
+    /// The default implementation falls back to the full history load for providers that do not
+    /// implement paginated loading yet.
+    async fn history_page(
+        &self,
+        chat: &ChatId,
+        offset_id: Option<i32>,
+        limit: usize,
+    ) -> Result<Vec<Message>, BackendError> {
+        let _ = offset_id;
+        let _ = limit;
+        self.history(chat).await
+    }
     /// Fetch full details for the message quoted by `message_id`, if any.
     async fn reply_context(
         &self,
@@ -480,6 +493,7 @@ impl MessengerKind {
         , async fn chats(&self) -> Result<Vec<Chat>, BackendError> ;
         , async fn set_read(&mut self, chat: &ChatId) -> Result<(), BackendError> ;
         , async fn history(&self, chat: &ChatId) -> Result<Vec<Message>, BackendError> ;
+        , async fn history_page(&self, chat: &ChatId, offset_id: Option<i32>, limit: usize) -> Result<Vec<Message>, BackendError> ;
         , async fn reply_context(&self, chat: &ChatId, message_id: &MessageId) -> Result<Option<ReplyContext>, BackendError> ;
         , async fn send(&self, chat: &ChatId, text: &str, reply_to: Option<MessageId>) -> Result<Message, BackendError> ;
         , async fn delete(&self, chat: &ChatId, id: &MessageId) -> Result<(), BackendError> ;

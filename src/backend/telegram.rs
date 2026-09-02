@@ -625,6 +625,7 @@ impl TelegramMessenger {
         pool.updates
     }
 
+    // BUG: this is not auto updating, add to tokio refresh maybe?
     async fn status_for_peer_ref(
         &self,
         client: &Client,
@@ -878,6 +879,15 @@ impl Messenger for TelegramMessenger {
     }
 
     async fn history(&self, chat: &ChatId) -> Result<Vec<Message>, BackendError> {
+        self.history_page(chat, None, 100).await
+    }
+
+    async fn history_page(
+        &self,
+        chat: &ChatId,
+        offset_id: Option<i32>,
+        limit: usize,
+    ) -> Result<Vec<Message>, BackendError> {
         let bare_id = match chat {
             ChatId::Telegram(id) => *id,
             _ => return Err(BackendError::Other("not a Telegram chat".into())),
@@ -887,12 +897,16 @@ impl Messenger for TelegramMessenger {
             .find_dialog_peer_ref(bare_id)
             .ok_or_else(|| BackendError::Other("chat not found in dialog cache".into()))?;
 
-        debug!(bare_id, "Fetching message history");
+        debug!(bare_id, offset_id, limit, "Fetching paged message history");
 
         let client = self.current_client().await;
         let own_chat = self_user_id(&client).await;
         let mut messages_rev = Vec::new();
-        let mut msg_iter = client.iter_messages(peer_ref).limit(100);
+        let mut msg_iter = client.iter_messages(peer_ref).limit(limit.max(1));
+
+        if let Some(offset) = offset_id {
+            msg_iter = msg_iter.offset_id(offset);
+        }
 
         while let Some(msg) = msg_iter.next().await? {
             let message =
@@ -900,10 +914,8 @@ impl Messenger for TelegramMessenger {
             messages_rev.push(message);
         }
 
-        // grammers iter_messages defaults to newest-to-oldest; reverse so
-        // oldest is first (chronological order for display).
         messages_rev.reverse();
-        debug!(bare_id, count = messages_rev.len(), "History loaded");
+        debug!(bare_id, count = messages_rev.len(), "History page loaded");
         Ok(messages_rev)
     }
 
