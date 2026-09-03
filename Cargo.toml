@@ -24,7 +24,10 @@ grammers-tl-types = "0.10"
 # bundled-sqlite even with default-features = false on our direct dependency.
 # This conflicts with grammers-session's libsql-ffi at link time (duplicate
 # sqlite3 symbols). Re-enable when whatsapp-rust adds a no-bundled feature.
-whatsapp-rust = { git = "https://github.com/jlucaso1/whatsapp-rust", tag = "v0.7.0", default-features = false, features = [
+# whatsapp-rust = { git = "https://github.com/jlucaso1/whatsapp-rust", tag = "v0.7.0", default-features = false, features = [
+# NOTE: This is a local fix that apparently works but needs to be tested 
+whatsapp-rust = { path = "/home/phlm/Documents/programming/rust/whatsapp-rust", default-features = false, features = [
+  "sqlite-storage",
   "tokio-transport",
   "tokio-runtime",
   "ureq-client",

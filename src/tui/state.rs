@@ -999,6 +999,11 @@ impl AppState {
 
                 self.chat_state.upsert_chat(chat);
             }
+            BackendEvent::QrCode(code) => {
+                self.create_popup(PopupKind::Info(format!(
+                    "Scan this QR code with your phone\n\n{code}\n\nIt expires shortly.",
+                )));
+            }
         }
     }
 }

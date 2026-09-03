@@ -1,3 +1,5 @@
+use crate::helpers::now;
+
 use super::{
     BackendError, BackendEvent, Chat, ChatId, Message, MessageAction, MessageId, Messenger,
     ReplyContext,
@@ -549,13 +551,6 @@ fn message(id: &str, chat: &ChatId, sender: &str, text: &str, from_me: bool) -> 
         pending: false,
         failed: false,
     }
-}
-
-fn now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock before unix epoch")
-        .as_secs() as i64
 }
 
 #[cfg(test)]

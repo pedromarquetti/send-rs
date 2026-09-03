@@ -2,6 +2,13 @@ use ratatui::{layout::Flex, prelude::*};
 
 use crate::backend::MessageAction;
 
+pub fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock before unix epoch")
+        .as_secs() as i64
+}
+
 pub fn available_message_actions(message: &crate::backend::Message) -> Vec<MessageAction> {
     if message.pending || message.failed {
         return Vec::new();

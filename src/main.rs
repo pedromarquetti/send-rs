@@ -79,5 +79,25 @@ async fn main() -> Result<()> {
         info!("Telegram: disabled and not configured, skipping");
     }
 
+    // Initialize WhatsApp when enabled. WhatsApp has no text-based login flow;
+    // authentication is event-driven (QR code / pair code surfaced via the TUI).
+    if config.providers.whatsapp {
+        let store_dir = config::Config::config_dir()?;
+        let store_path = store_dir.join("wa_session.sqlite");
+        match backend::whatsapp::WhatsAppMessenger::new(store_path.to_string_lossy().into_owned())
+            .await
+        {
+            Ok(wa) => {
+                info!("WhatsApp messenger initialized");
+                messengers.push(MessengerKind::WhatsApp(wa));
+            }
+            Err(e) => {
+                tracing::error!("WhatsApp init failed: {e}");
+            }
+        }
+    } else {
+        info!("WhatsApp: disabled, skipping");
+    }
+
     tui::run(config, keymap, messengers, first_boot).await
 }

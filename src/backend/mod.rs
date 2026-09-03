@@ -278,6 +278,7 @@ pub enum BackendEvent {
         unread_count: i32,
     },
     ChatUpdated(Chat),
+    QrCode(String),
     Error(String, BackendError),
 }
 
@@ -318,6 +319,17 @@ impl From<whatsapp_rust::ClientError> for BackendError {
         match err {
             ClientError::NotLoggedIn => BackendError::NotAuthenticated,
             ClientError::NotConnected => BackendError::Other("WhatsApp: not connected".into()),
+            other => BackendError::Other(format!("WhatsApp: {other}")),
+        }
+    }
+}
+
+impl From<whatsapp_rust::SendError> for BackendError {
+    fn from(err: whatsapp_rust::SendError) -> Self {
+        use whatsapp_rust::SendError;
+        match err {
+            SendError::NotLoggedIn => BackendError::NotAuthenticated,
+            SendError::Client(e) => BackendError::from(e),
             other => BackendError::Other(format!("WhatsApp: {other}")),
         }
     }
@@ -411,7 +423,7 @@ pub trait Messenger: Send + Sync {
 
 pub enum MessengerKind {
     Telegram(telegram::TelegramMessenger),
-    WhatsApp(mock::MockMessenger),
+    WhatsApp(whatsapp::WhatsAppMessenger),
     #[cfg(test)]
     Stub(Box<dyn Messenger>),
 }
