@@ -7,8 +7,9 @@ use super::{
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::sync::{RwLock, broadcast};
 use tracing::{debug, info, warn};
 use whatsapp_rust::prelude::{
     Bot, Event, Jid, MessageBuilderExt, MessageExt, MessageInfo, Server, SqliteStore, wa,
@@ -163,17 +164,22 @@ fn reply_stanza_id(msg: &wa::Message) -> Option<String> {
 #[derive(Clone)]
 pub struct WhatsAppMessenger {
     client: Arc<whatsapp_rust::Client>,
-    handle: Arc<Mutex<Option<BotHandle>>>,
+    /// The configured-but-not-yet-started bot. The bot is intentionally not
+    /// spawned in `new()`: it is spun up lazily on the first [`Self::subscribe`]
+    /// so the TUI (which subscribes before reading the event channel) can never
+    /// miss the initial `Connected` / `QrCode` events, which a `broadcast`
+    /// channel would otherwise drop for not-yet-registered receivers.
+    bot: Arc<Mutex<Option<Bot>>>,
+    run_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     tx: broadcast::Sender<BackendEvent>,
     state: SharedState,
     shutdown: Arc<AtomicBool>,
 }
 
-use whatsapp_rust::prelude::BotHandle;
-
 impl WhatsAppMessenger {
     /// Open (or create) the sqlite store, build the bot with event callbacks,
-    /// spawn it, and return a messenger bound to the live client.
+    /// and return a messenger bound to the live client. The bot is not started
+    /// until [`Self::subscribe`] is first called.
     pub async fn new(store_path: String) -> Result<Self, BackendError> {
         let store = SqliteStore::new(&store_path)
             .await
@@ -325,11 +331,11 @@ impl WhatsAppMessenger {
             .map_err(|e| BackendError::Other(format!("WhatsApp: failed to build bot: {e}")))?;
 
         let client = bot.client();
-        let handle = bot.spawn();
 
         Ok(Self {
             client,
-            handle: Arc::new(Mutex::new(Some(handle))),
+            bot: Arc::new(Mutex::new(Some(bot))),
+            run_task: Arc::new(Mutex::new(None)),
             tx,
             state,
             shutdown,
@@ -345,6 +351,37 @@ impl WhatsAppMessenger {
             return Err(BackendError::NotAuthenticated);
         }
         Ok(())
+    }
+
+    /// Start the bot (once) if it has not been started yet, and return whether
+    /// this call performed the start. Starting is idempotent: the first caller
+    /// spawns the bot and its failure-watcher; later calls are no-ops.
+    fn start_bot(&self) -> bool {
+        let bot = {
+            match self.bot.lock().unwrap().take() {
+                Some(bot) => bot,
+                None => return false,
+            }
+        };
+
+        let handle = bot.spawn();
+        let watch_tx = self.tx.clone();
+        let shutdown = self.shutdown.clone();
+
+        // Failure watcher: await the bot's run loop. If it ends for any reason
+        // other than an intentional shutdown, surface that to the TUI so it does
+        // not silently go blind.
+        let run_task = tokio::spawn(async move {
+            handle.await;
+            if !shutdown.load(Ordering::SeqCst) {
+                let _ = watch_tx.send(BackendEvent::Disconnected(
+                    "WhatsApp: connection lost".to_string(),
+                ));
+            }
+        });
+
+        *self.run_task.lock().unwrap() = Some(run_task);
+        true
     }
 }
 
@@ -659,23 +696,38 @@ impl Messenger for WhatsAppMessenger {
     }
 
     fn subscribe(&self) -> broadcast::Receiver<BackendEvent> {
+        // The TUI subscribes before it ever reads from the channel, so starting
+        // the bot here guarantees the first `Connected` / `QrCode` events are
+        // delivered rather than dropped. Idempotent: only the first call spawns.
+        self.start_bot();
         self.tx.subscribe()
     }
 
     async fn disconnect(&mut self) -> Result<(), BackendError> {
-        self.shutdown.store(true, Ordering::SeqCst);
-
-        if let Some(handle) = self.handle.lock().await.take() {
-            handle.shutdown().await;
+        // Idempotent: only the first call performs the actual teardown.
+        if self.shutdown.swap(true, Ordering::SeqCst) {
+            return Ok(());
         }
 
-        let _ = self.current_client().disconnect().await;
+        // Ensure the bot is running the run loop before requesting shutdown, in
+        // case nothing ever called `subscribe` (e.g. startup failed early).
+        self.start_bot();
+
+        // Graceful stop: disconnect (flushing the store) and wait for the bot's
+        // run loop to exit before returning.
+        self.current_client().disconnect().await;
+
+        let run_task = self.run_task.lock().unwrap().take();
+        if let Some(task) = run_task {
+            let _ = task.await;
+        }
+
         Ok(())
     }
 
     async fn login(&mut self) -> Result<(), BackendError> {
         // WhatsApp auth is event-driven (QR / pair code via BackendEvent).
-        // The bot is already spawned in `new`; nothing to do here.
+        // The bot is paired over the network; nothing to do here.
         Ok(())
     }
 
@@ -685,5 +737,3 @@ impl Messenger for WhatsAppMessenger {
         Ok(())
     }
 }
-
-

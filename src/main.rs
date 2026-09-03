@@ -79,12 +79,16 @@ async fn main() -> Result<()> {
         info!("Telegram: disabled and not configured, skipping");
     }
 
-    // Initialize WhatsApp when enabled. WhatsApp has no text-based login flow;
-    // authentication is event-driven (QR code / pair code surfaced via the TUI).
+    // Initialize WhatsApp when it is enabled. Unlike Telegram, WhatsApp pairing
+    // is event-driven (QR code), so the messenger is constructed unconditionally
+    // when enabled and the bot is started on first TUI subscription.
     if config.providers.whatsapp {
-        let store_dir = config::Config::config_dir()?;
-        let store_path = store_dir.join("wa_session.sqlite");
-        match backend::whatsapp::WhatsAppMessenger::new(store_path.to_string_lossy().into_owned())
+        let store_path = config::Config::config_dir()?.join("whatsapp").join("wa.db");
+        if let Some(parent) = store_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        match backend::whatsapp::WhatsAppMessenger::new(store_path.to_string_lossy().to_string())
             .await
         {
             Ok(wa) => {

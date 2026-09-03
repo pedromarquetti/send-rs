@@ -862,6 +862,14 @@ impl AppState {
                 warn!(message, "Backend disconnected");
                 self.create_popup(PopupKind::Error(message));
             }
+            BackendEvent::QrCode(code) => {
+                info!("WhatsApp QR code received");
+                self.backend_status =
+                    Some("Scan this WhatsApp QR code with your phone".to_string());
+                self.create_popup(PopupKind::Info(format!(
+                    "Scan this WhatsApp QR code with your phone\nto link this device.\n\n{code}\n\nIt expires shortly."
+                )));
+            }
             BackendEvent::Error(context, err) => {
                 error!(context, error = %err, "Backend error");
                 self.create_popup(PopupKind::Error(format!("{context}: {err}")))
@@ -998,11 +1006,6 @@ impl AppState {
                 }
 
                 self.chat_state.upsert_chat(chat);
-            }
-            BackendEvent::QrCode(code) => {
-                self.create_popup(PopupKind::Info(format!(
-                    "Scan this QR code with your phone\n\n{code}\n\nIt expires shortly.",
-                )));
             }
         }
     }
