@@ -1042,6 +1042,7 @@ pub async fn fetch_all_chats(
         let provider = messenger.provider();
 
         if !provider.is_enabled(providers) {
+            warn!("Provider {:#?} disabled! Skipping chat fetch", provider);
             continue;
         }
 

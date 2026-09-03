@@ -8,7 +8,7 @@ use ratatui::widgets::{StatefulWidget, Widget};
 use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, MissedTickBehavior};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::backend::{AuthSteps, BackendEvent, ChatId, MessageAction, MessengerKind, Provider};
 use crate::config::{Config, Keymap};
@@ -168,22 +168,27 @@ async fn run_app(
     // immediately (non-blocking startup). Results arrive via `ChatsLoaded`.
     let chat_loader_tx = tx.clone();
     let loader_messengers = app.state.messengers.clone();
-    let loader_providers = app.state.config.providers.clone();
+    let provider_configs = app.state.config.providers.clone();
 
-    tokio::spawn(async move {
-        let (chats, errors) =
-            crate::tui::state::fetch_all_chats(&loader_messengers, &loader_providers).await;
-        let _ = chat_loader_tx.send(UiEvent::ChatsLoaded { chats, errors });
-    });
+    {
+        let provider_configs = provider_configs.clone();
+        tokio::spawn(async move {
+            let (chats, errors) =
+                crate::tui::state::fetch_all_chats(&loader_messengers, &provider_configs).await;
+            let _ = chat_loader_tx.send(UiEvent::ChatsLoaded { chats, errors });
+        });
+    };
 
     let mut chat_poll_interval = tokio::time::interval(Duration::from_secs(
         app.state.config.chat_poll_interval_secs,
     ));
+
     chat_poll_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     let sidebar_period = Duration::from_secs(app.state.config.sidebar_sync_secs);
     let mut sidebar_sync_interval =
         tokio::time::interval_at(tokio::time::Instant::now() + sidebar_period, sidebar_period);
+
     sidebar_sync_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
@@ -206,10 +211,12 @@ async fn run_app(
                     if app.state.history_refresh_in_flight {
                         continue;
                     }
+
                     app.state.history_refresh_in_flight = true;
                     let messenger = app.state.messengers[idx].clone();
                     let tx = tx.clone();
                     let chat_for_task = chat_id.clone();
+
                     tokio::spawn(async move {
                         let result = messenger.history(&chat_for_task).await;
                         let _ = tx.send(UiEvent::HistoryRefreshResult(chat_for_task, result));
@@ -217,10 +224,12 @@ async fn run_app(
                 }
             }
 
+            // load chatlist task
             _ = sidebar_sync_interval.tick() => {
                 if !app.state.chats_loaded {
                     continue;
                 }
+
                 if app.state.sidebar_sync_in_flight {
                     continue;
                 }
@@ -229,6 +238,13 @@ async fn run_app(
                 app.state.sidebar_sync_pending = app.state.messengers.len();
 
                 for messenger in app.state.messengers.iter() {
+                    let provider = messenger.provider();
+
+                    if !provider.is_enabled(&provider_configs) {
+                        warn!("Provider {:#?} disabled! Skipping chat fetch background task", provider);
+                        continue;
+                    }
+
                     let messenger = messenger.clone();
                     let tx = tx.clone();
 

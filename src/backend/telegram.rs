@@ -285,6 +285,7 @@ impl TelegramMessenger {
         pool.updates
     }
 
+    // TODO: check if this should be called if telegram has credentials but is disabled
     fn spawn_update_listener(&self, updates: mpsc::UnboundedReceiver<UpdatesLike>) {
         let client = self.client.clone();
         let tx = self.tx.clone();
