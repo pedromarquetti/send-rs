@@ -1,8 +1,8 @@
 use crate::helpers::now;
 
 use super::{
-    BackendError, BackendEvent, Chat, ChatId, MediaKind, Message, MessageAction, MessageId,
-    MessageMedia, Messenger, ReplyContext,
+    AuthSteps, BackendError, BackendEvent, Chat, ChatId, LoginStepState, MediaKind, Message,
+    MessageAction, MessageId, MessageMedia, Messenger, ReplyContext,
 };
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{RwLock, broadcast};
+use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use whatsapp_rust::prelude::{
     Bot, Event, Jid, MessageBuilderExt, MessageExt, MessageInfo, Server, SqliteStore, wa,
@@ -22,6 +23,9 @@ type SharedState = Arc<RwLock<WhatsAppState>>;
 /// bot. SQLite persists the session/auth credentials; this cache drives the TUI.
 #[derive(Default)]
 struct WhatsAppState {
+    // TODO: check if needed: controls wether the provider is actually enabled in the config and if
+    // it should load
+    enabled: bool,
     chats: Vec<Chat>,
     history: HashMap<ChatId, Vec<Message>>,
     /// Stanza is a XML-like structure exchanged between client and server.
@@ -170,10 +174,13 @@ pub struct WhatsAppMessenger {
     /// miss the initial `Connected` / `QrCode` events, which a `broadcast`
     /// channel would otherwise drop for not-yet-registered receivers.
     bot: Arc<Mutex<Option<Bot>>>,
-    run_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    run_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     tx: broadcast::Sender<BackendEvent>,
     state: SharedState,
     shutdown: Arc<AtomicBool>,
+    /// The most recently issued pairing QR payload (if any), kept so the login
+    /// screen can query it synchronously on every frame and refresh on expiry.
+    current_qr: Arc<RwLock<Option<String>>>,
 }
 
 impl WhatsAppMessenger {
@@ -188,6 +195,7 @@ impl WhatsAppMessenger {
         let (tx, _) = broadcast::channel(128);
         let state: SharedState = Arc::new(RwLock::new(WhatsAppState::default()));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let current_qr: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
 
         let builder = Bot::builder()
             .with_backend(store)
@@ -203,10 +211,15 @@ impl WhatsAppMessenger {
             })
             .on_qr_code({
                 let tx = tx.clone();
+                let current_qr = current_qr.clone();
+
                 move |code, timeout| {
                     let tx = tx.clone();
+                    let current_qr = current_qr.clone();
+
                     async move {
                         info!("WhatsApp QR code (valid {}s)", timeout.as_secs());
+                        *current_qr.write().await = Some(code.clone());
                         let _ = tx.send(BackendEvent::QrCode(code));
                     }
                 }
@@ -226,12 +239,14 @@ impl WhatsAppMessenger {
             .on_event({
                 let state = state.clone();
                 let tx = tx.clone();
+                let current_qr = current_qr.clone();
                 move |event: Arc<Event>, _client: Arc<whatsapp_rust::Client>| {
                     let state = state.clone();
                     let tx = tx.clone();
+                    let current_qr = current_qr.clone();
                     async move {
-                        let ev = event;
-                        match &*ev {
+                        let event = event;
+                        match &*event {
                             Event::Connected(_) => {
                                 let _ = tx.send(BackendEvent::Connected);
                             }
@@ -243,19 +258,31 @@ impl WhatsAppMessenger {
                                 ));
                             }
                             Event::PairingQrCode(q) => {
+                                *current_qr.write().await = Some(q.code.clone());
                                 let _ = tx.send(BackendEvent::QrCode(q.code.clone()));
                             }
                             Event::Messages(batch) => {
-                                for im in batch.messages.iter() {
+                                // BUG:? Check if this is the root of the bug:
+                                // 1. Chats are not loading.
+                                // 2. WhatsApp 'Status' (24h status) appears as
+                                //    messages
+                                // 3. Only new incoming messages are being added to
+                                //    the chatlist
+                                // 4. Groups: in groups, contact names are appearing
+                                //    as the group name in chat view, while the group
+                                //    name in chat_list is appearing as one of the
+                                //    contact's name
+                                for inbound in batch.messages.iter() {
                                     let mut state = state.write().await;
-                                    let chat = chat_id_from_jid(&im.info.source.chat);
-                                    let msg = normalize_inbound(&im.info, &im.message, &state);
+                                    let chat = chat_id_from_jid(&inbound.info.source.chat);
+                                    let msg =
+                                        normalize_inbound(&inbound.info, &inbound.message, &state);
 
                                     if msg.text.is_empty() && msg.media.is_none() {
                                         continue;
                                     }
 
-                                    let stanza_id = im.info.id.to_string();
+                                    let stanza_id = inbound.info.id.to_string();
 
                                     state.by_stanza_id.insert(
                                         stanza_id.clone(),
@@ -276,10 +303,10 @@ impl WhatsAppMessenger {
                                             .push(msg.clone());
                                     }
 
-                                    let contact_name = if im.info.push_name.trim().is_empty() {
-                                        im.info.source.sender.to_string()
+                                    let contact_name = if inbound.info.push_name.trim().is_empty() {
+                                        inbound.info.source.sender.to_string()
                                     } else {
-                                        im.info.push_name.clone()
+                                        inbound.info.push_name.clone()
                                     };
 
                                     let preview = if msg.from_me {
@@ -339,6 +366,7 @@ impl WhatsAppMessenger {
             tx,
             state,
             shutdown,
+            current_qr,
         })
     }
 
@@ -356,11 +384,15 @@ impl WhatsAppMessenger {
     /// Start the bot (once) if it has not been started yet, and return whether
     /// this call performed the start. Starting is idempotent: the first caller
     /// spawns the bot and its failure-watcher; later calls are no-ops.
-    fn start_bot(&self) -> bool {
+    pub fn start(&self) {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+
         let bot = {
             match self.bot.lock().unwrap().take() {
                 Some(bot) => bot,
-                None => return false,
+                None => return,
             }
         };
 
@@ -381,7 +413,6 @@ impl WhatsAppMessenger {
         });
 
         *self.run_task.lock().unwrap() = Some(run_task);
-        true
     }
 }
 
@@ -696,25 +727,24 @@ impl Messenger for WhatsAppMessenger {
     }
 
     fn subscribe(&self) -> broadcast::Receiver<BackendEvent> {
-        // The TUI subscribes before it ever reads from the channel, so starting
-        // the bot here guarantees the first `Connected` / `QrCode` events are
-        // delivered rather than dropped. Idempotent: only the first call spawns.
-        self.start_bot();
+        // Install the event subscription only. The bot is NOT started here: a
+        // disabled provider must remain inactive (no transport, no QR) until the
+        // user enables it via `start()`. Because the receiver is registered now,
+        // a later `start()` can never drop the first `Connected` / `QrCode`
+        // event for a subscribed TUI.
         self.tx.subscribe()
     }
 
     async fn disconnect(&mut self) -> Result<(), BackendError> {
-        // Idempotent: only the first call performs the actual teardown.
+        // Idempotent: only the first call performs the actual teardown, and it
+        // is safe to call on a provider that was never started (disabled).
         if self.shutdown.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
 
-        // Ensure the bot is running the run loop before requesting shutdown, in
-        // case nothing ever called `subscribe` (e.g. startup failed early).
-        self.start_bot();
-
-        // Graceful stop: disconnect (flushing the store) and wait for the bot's
-        // run loop to exit before returning.
+        // If the bot is running, flush persistence and stop the run loop before
+        // returning. A never-started (disabled) instance has no run task to
+        // await; it is already fully inert.
         self.current_client().disconnect().await;
 
         let run_task = self.run_task.lock().unwrap().take();
@@ -729,6 +759,37 @@ impl Messenger for WhatsAppMessenger {
         // WhatsApp auth is event-driven (QR / pair code via BackendEvent).
         // The bot is paired over the network; nothing to do here.
         Ok(())
+    }
+
+    fn login_steps(&self) -> Vec<AuthSteps> {
+        // A single event-driven QR step. The payload is read live on every
+        // frame from `current_qr` so a replaced/refreshed code shows up
+        // immediately in the login screen.
+        vec![AuthSteps::QrCode(
+            self.current_qr
+                .try_read()
+                .ok()
+                .and_then(|qr| qr.clone())
+                .unwrap_or_default(),
+        )]
+    }
+
+    fn login_placeholder(&self, _step: usize) -> &'static str {
+        "Scan with your phone's WhatsApp > Linked devices"
+    }
+
+    async fn login_step(
+        &mut self,
+        _step: usize,
+        _input: &str,
+    ) -> Result<LoginStepState, BackendError> {
+        // The QR step has no text to submit. Consume the Enter as "keep
+        // waiting", and report Done only once the account is actually paired.
+        if self.is_authenticated().await {
+            Ok(LoginStepState::Done)
+        } else {
+            Ok(LoginStepState::NextStep)
+        }
     }
 
     async fn logout(&mut self) -> Result<(), BackendError> {

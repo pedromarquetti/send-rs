@@ -10,6 +10,11 @@ use anyhow::Result;
 use backend::MessengerKind;
 use tracing::info;
 
+use crate::{
+    backend::{telegram::TelegramMessenger, whatsapp::WhatsAppMessenger},
+    config::Config,
+};
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let log_path = dirs::data_local_dir()
@@ -57,8 +62,8 @@ async fn main() -> Result<()> {
         if !telegram.has_credentials() {
             info!("Telegram is enabled but has no credentials, skipping");
         } else {
-            let session_dir = config::Config::config_dir()?;
-            match backend::telegram::TelegramMessenger::new(
+            let session_dir = Config::config_dir()?;
+            match TelegramMessenger::new(
                 session_dir,
                 telegram.api_id,
                 &telegram.api_hash,
@@ -82,25 +87,28 @@ async fn main() -> Result<()> {
     // Initialize WhatsApp when it is enabled. Unlike Telegram, WhatsApp pairing
     // is event-driven (QR code), so the messenger is constructed unconditionally
     // when enabled and the bot is started on first TUI subscription.
-    if config.providers.whatsapp {
-        let store_path = config::Config::config_dir()?.join("whatsapp").join("wa.db");
-        if let Some(parent) = store_path.parent() {
+    {
+        let whatsapp_path = Config::config_dir()?.join("wa.db");
+        if let Some(parent) = whatsapp_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
 
-        match backend::whatsapp::WhatsAppMessenger::new(store_path.to_string_lossy().to_string())
-            .await
-        {
+        match WhatsAppMessenger::new(whatsapp_path.to_string_lossy().to_string()).await {
             Ok(wa) => {
                 info!("WhatsApp messenger initialized");
+                // Start the transport only when enabled; a disabled provider
+                // stays inert (no connection, no QR) until the user enables it.
+                if config.providers.whatsapp {
+                    wa.start();
+                } else {
+                    info!("WhatsApp: enabled=false, keeping provider inactive");
+                }
                 messengers.push(MessengerKind::WhatsApp(wa));
             }
             Err(e) => {
                 tracing::error!("WhatsApp init failed: {e}");
             }
         }
-    } else {
-        info!("WhatsApp: disabled, skipping");
     }
 
     tui::run(config, keymap, messengers, first_boot).await

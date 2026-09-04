@@ -669,6 +669,17 @@ impl AppState {
             provider.toggle_enabled(&mut self.config.providers);
             match self.config.save() {
                 Ok(()) => {
+                    // If the user is currently viewing a chat belonging to the
+                    // disabled provider, close it so the UI does not retain an
+                    // inactive-provider conversation after its chats vanish.
+                    if let Some(open) = &self.chat_state.open_chat
+                        && open.chat.id.to_provider() == provider
+                        && !matches!(open.chat.id, ChatId::Myself)
+                    {
+                        self.write.clear();
+                        self.chat_state.open_chat = None;
+                    }
+
                     let errors = self.rebuild_chats().await;
                     self.create_popup(PopupKind::Info(format!("{name} disabled")));
                     if !errors.is_empty() {
@@ -700,7 +711,14 @@ impl AppState {
 
         // Verify messenger was initialized
         let messenger = match self.provider_to_messenger(provider) {
-            Some(m) => m,
+            Some(m) => match m {
+                MessengerKind::WhatsApp(w) => {
+                    w.start();
+                    m
+                }
+
+                _ => m,
+            },
             None => {
                 self.create_popup(PopupKind::Error(format!(
                     "{name}: messenger could not be initialized"
@@ -733,13 +751,25 @@ impl AppState {
             return;
         }
 
-        // Not authenticated — check if provider supports login steps
+        // Not authenticated — check if the provider supports login steps. For
+        // WhatsApp this starts the (inactive) transport so its event-driven QR
+        // pairing flow begins generating codes, then navigates to the login
+        // screen. The provider is marked enabled up front (pairing is in
+        // progress); cancelling via Esc disables it again, and the Connected
+        // event leaves it enabled and triggers the chat rebuild.
         let steps = messenger.login_steps();
         if steps.is_empty() {
             self.create_popup(PopupKind::Error(format!(
                 "{name}: not authenticated and no login flow available"
             )));
             return;
+        }
+
+        if provider == Provider::WhatsApp && !provider.is_enabled(&self.config.providers) {
+            provider.toggle_enabled(&mut self.config.providers);
+            if let Err(e) = self.config.save() {
+                self.create_popup(PopupKind::Error(format!("could not save config: {e}")));
+            }
         }
 
         // Navigate to login screen
@@ -760,6 +790,7 @@ impl AppState {
             login_input: input,
             submitting: false,
         });
+
         self.screen = Screen::Login;
         Ok(())
     }
@@ -829,8 +860,21 @@ impl AppState {
             }
 
             Ok(LoginStepState::NextStep) => {
+                // Clamp so a single-step flow (e.g. WhatsApp QR) cannot
+                // advance past the last login screen into an index error.
+                let step_count = self
+                    .login_state
+                    .as_ref()
+                    .and_then(|ls| self.provider_to_messenger(ls.provider))
+                    .map(|steps| steps.login_steps().len());
+
                 if let Some(ref mut ls) = self.login_state {
-                    ls.step += 1;
+                    let next = match step_count {
+                        Some(total) => (ls.step + 1).min(total.saturating_sub(1)),
+                        None => ls.step + 1,
+                    };
+
+                    ls.step = next;
                     ls.error = None;
                     ls.login_input.clear();
                 }
@@ -844,17 +888,58 @@ impl AppState {
     }
 
     pub async fn cancel_login(&mut self) {
-        if let Some(login) = self.login_state.take()
-            && let Some(messenger) = self.provider_to_messenger_mut(login.provider)
-        {
-            messenger.cancel_login().await;
+        if let Some(login) = self.login_state.take() {
+            if let Some(messenger) = self.provider_to_messenger_mut(login.provider) {
+                messenger.cancel_login().await;
+            }
+
+            // Cancelling an in-progress WhatsApp pairing that never
+            // authenticated disables the provider again (its QR kept coming
+            // from the still-running bot). This keeps the provider disabled
+            // until authentication actually completes.
+            if login.provider == Provider::WhatsApp
+                && login.provider.is_enabled(&self.config.providers)
+            {
+                login.provider.toggle_enabled(&mut self.config.providers);
+                if let Err(e) = self.config.save() {
+                    self.create_popup(PopupKind::Error(format!("could not save config: {e}")));
+                }
+            }
         }
         self.screen = Screen::Main;
     }
 
-    pub fn handle_backend_event(&mut self, _provider: Provider, event: BackendEvent) {
+    pub fn handle_backend_event(&mut self, provider: Provider, event: BackendEvent) {
         match event {
-            BackendEvent::Connected => info!("Backend connected"),
+            BackendEvent::Connected => {
+                info!(?provider, "Backend connected");
+
+                // A newly authenticated provider becomes usable: close any
+                // active pairing/login screen and enable it in config. The
+                // chat-list rebuild is kicked off from the TUI event loop,
+                // which owns the UI channel needed to deliver the result.
+                if provider == Provider::WhatsApp {
+                    let was_pairing = self
+                        .login_state
+                        .as_ref()
+                        .is_some_and(|ls| ls.provider == provider);
+
+                    if was_pairing {
+                        self.login_state = None;
+                        self.screen = Screen::Main;
+                    }
+
+                    self.backend_status = None;
+
+                    if !provider.is_enabled(&self.config.providers) {
+                        provider.toggle_enabled(&mut self.config.providers);
+                        match self.config.save() {
+                            Ok(()) => {}
+                            Err(e) => self.create_popup(PopupKind::Error(e.to_string())),
+                        };
+                    }
+                }
+            }
             BackendEvent::Status(status) => {
                 self.backend_status = (!status.is_empty()).then_some(status);
             }
@@ -862,13 +947,29 @@ impl AppState {
                 warn!(message, "Backend disconnected");
                 self.create_popup(PopupKind::Error(message));
             }
-            BackendEvent::QrCode(code) => {
+            BackendEvent::QrCode(_code) => {
                 info!("WhatsApp QR code received");
                 self.backend_status =
                     Some("Scan this WhatsApp QR code with your phone".to_string());
-                self.create_popup(PopupKind::Info(format!(
-                    "Scan this WhatsApp QR code with your phone\nto link this device.\n\n{code}\n\nIt expires shortly."
-                )));
+
+                // Pairing is shown through the login screen (which reads the QR
+                // payload live each frame). Only surface it when the provider is
+                // currently enabled (i.e. the user is pairing) and we are not
+                // already sitting on its pairing screen.
+                //
+                // Once the user cancels pairing, `cancel_login` disables the
+                // provider, so a late/refresh QrCode event must not yank them
+                // back into the login screen.
+                let already_showing = self
+                    .login_state
+                    .as_ref()
+                    .is_some_and(|ls| ls.provider == provider);
+                if provider == Provider::WhatsApp
+                    && provider.is_enabled(&self.config.providers)
+                    && !already_showing
+                {
+                    let _ = self.start_login(provider);
+                }
             }
             BackendEvent::Error(context, err) => {
                 error!(context, error = %err, "Backend error");
@@ -880,6 +981,7 @@ impl AppState {
                 if is_open
                     && let Some(len) = self.chat_state.open_chat.as_ref().map(|o| o.history.len())
                 {
+                    // FIX: don't change selected idx when new messages come
                     self.chat_state.message_list_state.select(Some(len - 1));
                 }
 
@@ -1041,6 +1143,11 @@ pub async fn fetch_all_chats(
     for messenger in messengers {
         let provider = messenger.provider();
 
+        // BUG: Unnamed chat appearing after whatsapp disable (tested with telegram disabled):
+        // steps to reproduce: enable whatsapp > cancel with Esc > a new Unnamed chat appears
+        // with TG tag. Sometimes more than one unnamed chats appear.
+        // This bug DOES occur on a fresh init of the app. Apparently does not occur when
+        // telegram itself is enabled
         if !provider.is_enabled(providers) {
             warn!("Provider {:#?} disabled! Skipping chat fetch", provider);
             continue;
@@ -1048,8 +1155,8 @@ pub async fn fetch_all_chats(
 
         if !messenger.is_authenticated().await {
             warn!(
-                provider = provider.name(),
-                "Skipping chat fetch for unauthorized provider"
+                "Skipping chat fetch for unauthorized provider {}",
+                provider.name()
             );
             continue;
         }
@@ -1092,6 +1199,120 @@ mod tests {
     async fn fetch_and_apply(state: &mut AppState) {
         let (chats, errors) = fetch_all_chats(&state.messengers, &state.config.providers).await;
         state.apply_fetched(chats, errors);
+    }
+
+    /// Build an `AppState` hosting both a Telegram and a WhatsApp mock, with the
+    /// given `whatsapp` enabled flag. Both mocks are authenticated by default.
+    async fn dual_provider_state(whatsapp: bool) -> AppState {
+        let mut config = Config::default();
+        config.providers.telegram.enabled = true;
+        config.providers.whatsapp = whatsapp;
+        let keymap = config.keys.parse().unwrap();
+        let tg = MockMessenger::new("Telegram");
+        tg.spawn_incoming_messages();
+        let wa = MockMessenger::new("WhatsApp");
+        wa.spawn_incoming_messages();
+        let messengers = vec![
+            MessengerKind::Stub(Box::new(tg)),
+            MessengerKind::Stub(Box::new(wa)),
+        ];
+        let mut app = AppState::new(config, keymap, messengers, false).await;
+        fetch_and_apply(&mut app).await;
+        app
+    }
+
+    #[tokio::test]
+    async fn fetch_all_chats_excludes_disabled_whatsapp() {
+        let state = dual_provider_state(/* whatsapp */ false).await;
+        assert!(
+            state
+                .chat_state
+                .chats
+                .iter()
+                .all(|c| c.id.to_provider() == Provider::Telegram),
+            "disabled WhatsApp chats must not be fetched"
+        );
+        assert!(!state.chat_state.chats.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disabling_whatsapp_removes_only_whatsapp_chats() {
+        let mut state = dual_provider_state(/* whatsapp */ true).await;
+        assert!(
+            state
+                .chat_state
+                .chats
+                .iter()
+                .any(|c| c.id.to_provider() == Provider::WhatsApp)
+        );
+
+        // Flip the flag off in memory and reconcile — the same rebuild the
+        // settings toggle drives — leaving WhatsApp chats out but Telegram in.
+        state.config.providers.whatsapp = false;
+        let errors = state.rebuild_chats().await;
+        assert!(
+            errors.is_empty(),
+            "reconcile must surface, not hide, errors"
+        );
+        assert!(
+            state
+                .chat_state
+                .chats
+                .iter()
+                .all(|c| c.id.to_provider() == Provider::Telegram),
+            "only WhatsApp chats should be removed on disable"
+        );
+        assert!(
+            state
+                .chat_state
+                .chats
+                .iter()
+                .any(|c| c.id.to_provider() == Provider::Telegram)
+        );
+    }
+
+    #[tokio::test]
+    async fn disabling_whatsapp_closes_an_open_whatsapp_chat() {
+        let mut state = dual_provider_state(/* whatsapp */ true).await;
+        let wa_idx = state
+            .chat_state
+            .chats
+            .iter()
+            .position(|c| c.id.to_provider() == Provider::WhatsApp)
+            .expect("expected a WhatsApp chat when enabled");
+        state.chat_state.chat_list_state.select(Some(wa_idx));
+        state.select_chat(wa_idx).await;
+        assert!(
+            matches!(
+                state.chat_state.open_chat.as_ref().map(|o| &o.chat.id),
+                Some(ChatId::WhatsApp(_))
+            ),
+            "test precondition: a WhatsApp chat should be open"
+        );
+
+        // Disable WhatsApp. The toggle closes any open chat belonging to the
+        // disabled provider so the UI does not retain a stale conversation.
+        state.config.providers.whatsapp = false;
+        if let Some(open) = &state.chat_state.open_chat
+            && open.chat.id.to_provider() == Provider::WhatsApp
+        {
+            state.write.clear();
+            state.chat_state.open_chat = None;
+        }
+        state.rebuild_chats().await;
+
+        assert!(
+            state.chat_state.open_chat.is_none(),
+            "an open WhatsApp chat must be closed when WhatsApp is disabled"
+        );
+        assert!(
+            state
+                .chat_state
+                .chats
+                .iter()
+                .all(|c| c.id.to_provider() == Provider::Telegram),
+            "WhatsApp chats must be removed after disabling"
+        );
     }
 
     #[tokio::test]
@@ -1872,5 +2093,95 @@ mod tests {
             }
             other => panic!("expected Error popup, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn qr_event_opens_login_only_when_provider_is_enabled() {
+        let mut config = Config::default();
+        config.providers.whatsapp = true;
+        let keymap = config.keys.parse().unwrap();
+        let wa = MockMessenger::new("WhatsApp");
+        wa.spawn_incoming_messages();
+        let messengers = vec![MessengerKind::Stub(Box::new(wa))];
+        let mut state = AppState::new(config, keymap, messengers, false).await;
+        state.chats_loaded = true;
+
+        // Provider enabled + no login_state → QrCode should open login.
+        state.handle_backend_event(Provider::WhatsApp, BackendEvent::QrCode("test".into()));
+        assert!(
+            state.login_state.is_some(),
+            "login should open when provider is enabled"
+        );
+
+        // Simulate user cancelling pairing (Esc): login_state cleared,
+        // provider disabled. A second QrCode must NOT reopen login.
+        state.login_state = None;
+        state.config.providers.whatsapp = false;
+        state.handle_backend_event(Provider::WhatsApp, BackendEvent::QrCode("refresh".into()));
+        assert!(
+            state.login_state.is_none(),
+            "QrCode must not reopen login after cancel (provider disabled)"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_login_disables_whatsapp_when_pairing() {
+        // Write config to a temp dir to avoid touching the real user config.
+        let tmp =
+            std::path::PathBuf::from(format!("/tmp/senders-test-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let old = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: test runs single-threaded within this process;
+        // no concurrent reads/writes of XDG_CONFIG_HOME.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &tmp) }
+
+        let mut config = Config::default();
+        config.providers.whatsapp = true;
+        let keymap = config.keys.parse().unwrap();
+        let wa = MockMessenger::new("WhatsApp");
+        wa.spawn_incoming_messages();
+        let messengers = vec![MessengerKind::Stub(Box::new(wa))];
+        let mut state = AppState::new(config, keymap, messengers, false).await;
+
+        // Simulate an active pairing session: login_state set for WhatsApp.
+        state.screen = Screen::Login;
+        state.login_state = Some(LoginState {
+            provider: Provider::WhatsApp,
+            step: 0,
+            error: None,
+            login_input: TextArea::default(),
+            submitting: false,
+        });
+
+        state.cancel_login().await;
+
+        // Login dismissed.
+        assert!(state.login_state.is_none());
+        assert!(
+            matches!(state.screen, Screen::Main),
+            "cancel should return to Main"
+        );
+        // Provider disabled.
+        assert!(
+            !state.config.providers.whatsapp,
+            "WhatsApp should be disabled after cancel"
+        );
+
+        // Verify the config file on disk was also updated.
+        let saved = Config::load().unwrap().expect("config should be saved");
+        assert!(
+            !saved.providers.whatsapp,
+            "saved config should have whatsapp disabled"
+        );
+
+        // Restore XDG_CONFIG_HOME.
+        // SAFETY: see above.
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

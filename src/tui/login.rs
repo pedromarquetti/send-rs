@@ -1,7 +1,9 @@
+use ratatui::layout::Flex;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Paragraph, StatefulWidget, Widget, Wrap};
 
 use crate::backend::AuthSteps;
+use crate::helpers::render_qr;
 use crate::tui::state::LoginState;
 
 pub struct LoginScreen<'a> {
@@ -15,8 +17,8 @@ impl StatefulWidget for LoginScreen<'_> {
     type State = LoginState;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
-        let step_name = &self.steps[state.step];
-        let title = format!(" {} — {} ", self.provider_name, step_name);
+        let step = &self.steps[state.step];
+        let title = format!(" {} — {} ", self.provider_name, step);
 
         let block = Block::bordered()
             .title(Span::styled(
@@ -70,6 +72,40 @@ impl StatefulWidget for LoginScreen<'_> {
             Line::from("")
         };
 
+        // WhatsApp QR code block
+        if let AuthSteps::QrCode(qr) = step {
+            let qr_art = render_qr(qr);
+            let qr_height = qr_art.lines().count().max(1) as u16;
+            let qr_width = qr_art
+                .lines()
+                .map(|l| l.chars().count())
+                .max()
+                .unwrap_or(0)
+                .max(1) as u16;
+
+            // Reserve the progress line, then center the QR within the rest of
+            // the box. Sizing to the QR's exact content height means the code
+            // can never overflow the block vertically on short terminals.
+            let [progress_area, body] =
+                Layout::vertical([Constraint::Length(1), Constraint::Min(0)])
+                    .areas(block.inner(area));
+
+            let progress_widget = Paragraph::new(progress_line);
+            progress_widget.render(progress_area, buf);
+
+            let [qr_area] = Layout::vertical([Constraint::Length(qr_height)])
+                .flex(Flex::Center)
+                .areas(body);
+            let [qr_area] = Layout::horizontal([Constraint::Length(qr_width)])
+                .flex(Flex::Center)
+                .areas(qr_area);
+
+            Paragraph::new(qr_art).render(qr_area, buf);
+
+            Widget::render(block, area, buf);
+            return;
+        }
+
         let split = Layout::vertical([
             Constraint::Length(1), // progress
             Constraint::Length(1), // blank
@@ -85,7 +121,7 @@ impl StatefulWidget for LoginScreen<'_> {
         progress_widget.render(split[0], buf);
 
         let label = Paragraph::new(Line::from(Span::styled(
-            format!("{step_name}:"),
+            format!("{step}:"),
             Style::default().fg(Color::White),
         )));
         label.render(split[2], buf);

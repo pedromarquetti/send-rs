@@ -1,9 +1,12 @@
+use std::time::SystemTime;
+
+use qrcode::{QrCode, render::unicode::Dense1x2};
 use ratatui::{layout::Flex, prelude::*};
 
 use crate::backend::MessageAction;
 
 pub fn now() -> i64 {
-    std::time::SystemTime::now()
+    SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock before unix epoch")
         .as_secs() as i64
@@ -103,6 +106,26 @@ pub fn parse_text<'l>(lines: &mut Vec<Line<'l>>, text: String, width: usize) {
     lines.push(Line::from(""));
 }
 
+/// Render a QR code payload as a monospace string suitable for a terminal.
+///
+/// Uses the crate's [`qrcode::render::unicode::Dense1x2`] renderer, which packs
+/// two vertical modules into each half-block glyph. This halves the line count
+/// (e.g. a 45×45 module QR becomes 45 cols × ~23 lines) while keeping the code
+/// square on screen, so it fits on short terminals and remains scannable.
+///
+/// Falls back to the raw payload (or a notice) when the payload cannot be
+/// encoded as a QR code, so pairing output is never dropped silently.
+pub fn render_qr(payload: &str) -> String {
+    if payload.trim().is_empty() {
+        return String::from("Waiting for a QR code...");
+    }
+
+    match QrCode::new(payload) {
+        Ok(code) => code.render::<Dense1x2>().quiet_zone(true).build(),
+        Err(_) => format!("QR encoding failed; scan this pairing payload:\n{payload}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::available_message_actions;
@@ -152,5 +175,54 @@ mod tests {
         let failed = sample_message(false, false, true);
         assert!(available_message_actions(&pending).is_empty());
         assert!(available_message_actions(&failed).is_empty());
+    }
+
+    #[test]
+    fn render_qr_produces_a_block_qr_for_a_valid_payload() {
+        let art = super::render_qr("wa.me/some-pairing-payload");
+        assert!(!art.is_empty(), "QR should render to a non-empty string");
+        // A rendered QR contains the dark block glyph and newlines.
+        assert!(art.contains('█'), "QR should use the dark block character");
+        assert!(art.contains('\n'), "QR should be multi-line");
+        // Quiet zone means a leading blank line of spaces.
+        let first = art.lines().next().unwrap_or_default();
+        assert!(
+            first.chars().all(|c| c == ' '),
+            "quiet zone should be blank"
+        );
+
+        // Dense1x2 packs two vertical modules per line, so the result is compact
+        // (~half as many rows as columns). This keeps the QR square on screen
+        // while fitting short terminals, and is the property login.rs relies on
+        // to size the QR area.
+        let width = art.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+        let height = art.lines().count();
+        assert!(
+            height < width,
+            "QR should be packed vertically (height {height} < width {width})"
+        );
+    }
+
+    #[test]
+    fn render_qr_fits_a_small_terminal() {
+        // A realistic WhatsApp pairing payload must render compactly enough to
+        // fit a roughly 50-col x 30-row login box (borders/rows included).
+        let art =
+            super::render_qr("2@uc_GT9B2wFQ6s8dVçY7tXm4pRjLnH3cKaZbNeMfDhOgPiAkJwE0xS1yT5uVzC9qWo");
+        let width = art.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+        let height = art.lines().count();
+        assert!(
+            width <= 50 && height <= 30,
+            "QR should fit a small terminal, got {width}x{height}"
+        );
+    }
+
+    #[test]
+    fn render_qr_falls_back_for_empty_payload() {
+        let art = super::render_qr("");
+        assert!(
+            art.contains("Waiting for a QR code..."),
+            "empty payload should show a waiting notice, got: {art:?}"
+        );
     }
 }

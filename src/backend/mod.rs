@@ -7,7 +7,10 @@ use std::fmt::Display;
 use anyhow::Result;
 use tokio::sync::broadcast;
 
-use crate::config::ProvidersConfig;
+use crate::{
+    backend::{telegram::TelegramMessenger, whatsapp::WhatsAppMessenger},
+    config::ProvidersConfig,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 /// Main struct that defines available Messengers
@@ -66,6 +69,9 @@ pub enum AuthSteps {
     Phone,
     Password,
     Code,
+    /// Event-driven pairing that shows a QR code instead of a text input.
+    /// Carries the current QR payload (e.g. the WhatsApp pairing URL).
+    QrCode(String),
 }
 
 impl Display for AuthSteps {
@@ -75,6 +81,7 @@ impl Display for AuthSteps {
             Self::Code => f.write_str("code"),
             Self::Password => f.write_str("password"),
             Self::Username => f.write_str("username"),
+            Self::QrCode(_) => f.write_str("qr code"),
         }
     }
 }
@@ -422,8 +429,8 @@ pub trait Messenger: Send + Sync {
 }
 
 pub enum MessengerKind {
-    Telegram(telegram::TelegramMessenger),
-    WhatsApp(whatsapp::WhatsAppMessenger),
+    Telegram(TelegramMessenger),
+    WhatsApp(WhatsAppMessenger),
     #[cfg(test)]
     Stub(Box<dyn Messenger>),
 }

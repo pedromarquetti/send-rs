@@ -272,7 +272,29 @@ async fn run_app(
                             event = ?std::mem::discriminant(&backend_event),
                             "TUI processing backend event, pending render"
                         );
+
+                        let rebuild = matches!(backend_event, BackendEvent::Connected);
+
                         app.state.handle_backend_event(provider, backend_event);
+
+                        // On a newly established connection (e.g. WhatsApp just
+                        // paired via QR), refresh the shared chat list so the
+                        // new provider's dialogs appear without a restart.
+                        if rebuild {
+                            let chat_loader_tx = tx.clone();
+                            let loader_messengers = app.state.messengers.clone();
+                            let loader_providers = app.state.config.providers.clone();
+
+                            tokio::spawn(async move {
+                                let (chats, errors) = crate::tui::state::fetch_all_chats(
+                                    &loader_messengers,
+                                    &loader_providers,
+                                )
+                                .await;
+                                let _ = chat_loader_tx
+                                    .send(UiEvent::ChatsLoaded { chats, errors });
+                            });
+                        }
                     }
                     UiEvent::Resize(..) => {}
                     UiEvent::HistoryRefresh(chat_id, history) => {
