@@ -2,10 +2,12 @@ pub mod mock;
 pub mod telegram;
 pub mod whatsapp;
 
-use std::fmt::Display;
+use std::{fmt::Display, str::FromStr};
 
 use anyhow::Result;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tokio::sync::broadcast;
+use whatsapp_rust::Jid;
 
 use crate::{
     backend::{telegram::TelegramMessenger, whatsapp::WhatsAppMessenger},
@@ -65,7 +67,6 @@ pub enum LoginStepState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthSteps {
-    Username,
     Phone,
     Password,
     Code,
@@ -80,7 +81,6 @@ impl Display for AuthSteps {
             Self::Phone => f.write_str("phone"),
             Self::Code => f.write_str("code"),
             Self::Password => f.write_str("password"),
-            Self::Username => f.write_str("username"),
             Self::QrCode(_) => f.write_str("qr code"),
         }
     }
@@ -95,32 +95,15 @@ pub enum ChatId {
     Myself,
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct Chat {
-    pub id: ChatId,
-    pub contact_name: String,
-    pub last_message: Option<String>,
-    pub status: Option<String>,
-    /// True when the user has pinned/fixed this chat at the top of the list.
-    pub fixed: bool,
-    /// keeps track of current chat scroll
-    /// TODO: make this configurable? should the user be able to config if the chat keeps track of
-    /// scroll?
-    pub scroll: usize,
-    // Keeps track of unread state for the chat
-    pub unread: bool,
-    pub unread_count: i32,
-}
-
-impl Chat {
-    pub fn status_label(&self) -> Option<&str> {
-        self.status
-            .as_deref()
-            .filter(|status| !status.trim().is_empty())
-    }
-}
-
 impl ChatId {
+    /// Converts `&str` to ChatId, needed for whatsapp-rust
+    pub fn jid_to_chat_id(data: &str) -> Self {
+        match Jid::from_str(data) {
+            Ok(jid) => Self::WhatsApp(jid.to_non_ad_string()),
+            Err(_) => ChatId::WhatsApp(data.to_string()),
+        }
+    }
+
     pub fn to_provider(&self) -> Provider {
         match &self {
             ChatId::Telegram(_) => Provider::Telegram,
@@ -150,9 +133,63 @@ impl ChatId {
     }
 }
 
+impl Serialize for ChatId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&match self {
+            ChatId::Telegram(id) => format!("tg:{id}"),
+            ChatId::WhatsApp(jid) => format!("wa:{jid}"),
+            ChatId::Myself => "me".to_string(),
+        })
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ChatId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        match raw.split_once(':') {
+            Some(("tg", id)) => id
+                .parse::<i64>()
+                .map(ChatId::Telegram)
+                .map_err(serde::de::Error::custom),
+            Some(("wa", jid)) => Ok(ChatId::WhatsApp(jid.to_string())),
+            _ if raw == "me" => Ok(ChatId::Myself),
+            _ => Err(serde::de::Error::custom("invalid ChatId")),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct Chat {
+    pub id: ChatId,
+    pub contact_name: String,
+    pub last_message: Option<String>,
+    pub status: Option<String>,
+    /// True when the user has pinned/fixed this chat at the top of the list.
+    pub fixed: bool,
+    /// keeps track of current chat scroll
+    /// TODO: make this configurable? should the user be able to config if the chat keeps track of
+    /// scroll?
+    pub scroll: usize,
+    // Keeps track of unread state for the chat
+    pub unread: bool,
+    pub unread_count: i32,
+    /// Whether the peer is a verified business (WhatsApp usync); the chat list
+    /// and chat pane render a check mark next to the name.
+    #[serde(default)]
+    pub verified: bool,
+}
+
+impl Chat {
+    pub fn status_label(&self) -> Option<&str> {
+        self.status
+            .as_deref()
+            .filter(|status| !status.trim().is_empty())
+    }
+}
+
 /// A universal message identifier. Opaque to the UI; backends interpret it
 /// (e.g. Telegram parses it to a numeric i32 for edit/delete calls).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct MessageId(pub String);
 
 impl MessageId {
@@ -197,7 +234,7 @@ impl std::fmt::Display for MessageId {
 
 /// Context about the original message a reply quotes: who wrote it, when, and
 /// a preview of its text.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplyContext {
     pub id: MessageId,
     pub sender: String,
@@ -205,7 +242,7 @@ pub struct ReplyContext {
     pub timestamp: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageAction {
     Reply,
     Edit,
@@ -214,7 +251,7 @@ pub enum MessageAction {
     Retry,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MediaKind {
     Image,
     Audio,
@@ -237,14 +274,14 @@ impl MediaKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageMedia {
     pub kind: MediaKind,
     pub caption: Option<String>,
     pub file_name: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub message_id: MessageId,
     pub chat: ChatId,
@@ -285,6 +322,13 @@ pub enum BackendEvent {
         unread_count: i32,
     },
     ChatUpdated(Chat),
+    /// A chat was deleted on a linked device (removed entirely from the list).
+    ChatRemoved {
+        chat: Chat,
+    },
+    /// A complete provider chat-list snapshot, emitted once per history sync so
+    /// a large burst is not flood-sent as many tiny events.
+    ChatList(Vec<Chat>),
     QrCode(String),
     Error(String, BackendError),
 }
@@ -494,6 +538,10 @@ macro_rules! delegate {
 }
 
 impl MessengerKind {
+    pub fn is_enabled(&self, config: &ProvidersConfig) -> bool {
+        Provider::is_enabled(&self.provider(), config)
+    }
+
     pub fn provider(&self) -> Provider {
         match self {
             Self::Telegram(_) => Provider::Telegram,

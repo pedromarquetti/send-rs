@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tokio::time::{Duration, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 
-use crate::backend::{AuthSteps, BackendEvent, ChatId, MessageAction, MessengerKind, Provider};
+use crate::backend::{self, AuthSteps, BackendEvent, ChatId, MessageAction, MessengerKind, Provider};
 use crate::config::{Config, Keymap};
 use crate::helpers::available_message_actions;
 use crate::tui::chat::chat_list::ChatList;
@@ -35,23 +35,23 @@ enum UiEvent {
     Shutdown,
     Backend(Provider, BackendEvent),
     Resize(u16, u16),
-    HistoryRefresh(ChatId, Vec<crate::backend::Message>),
+    HistoryRefresh(ChatId, Vec<backend::Message>),
     HistoryRefreshResult(
         ChatId,
-        std::result::Result<Vec<crate::backend::Message>, crate::backend::BackendError>,
+        Result<Vec<backend::Message>, backend::BackendError>,
     ),
     ChatLoaded {
-        chat: crate::backend::Chat,
+        chat: backend::Chat,
         generation: u64,
-        result: std::result::Result<Vec<crate::backend::Message>, crate::backend::BackendError>,
+        result: Result<Vec<backend::Message>, backend::BackendError>,
     },
-    SidebarChats(
+    ChatList(
         Provider,
-        std::result::Result<Vec<crate::backend::Chat>, crate::backend::BackendError>,
+        Result<Vec<backend::Chat>, backend::BackendError>,
     ),
     ChatsLoaded {
-        chats: Vec<crate::backend::Chat>,
-        errors: Vec<crate::backend::BackendError>,
+        chats: Vec<backend::Chat>,
+        errors: Vec<backend::BackendError>,
     },
 }
 
@@ -136,13 +136,31 @@ async fn run_app(
 
     // handling new events for each messenger type
     for messenger in messengers.iter() {
+        if !messenger.is_enabled(&config.providers) {
+            continue;
+        }
+
         let mut backend_rx = messenger.subscribe();
         let forward_tx = tx.clone();
         let provider = messenger.provider();
+
         tokio::spawn(async move {
-            while let Ok(event) = backend_rx.recv().await {
-                if forward_tx.send(UiEvent::Backend(provider, event)).is_err() {
-                    break;
+            loop {
+                match backend_rx.recv().await {
+                    Ok(event) => {
+                        if forward_tx.send(UiEvent::Backend(provider, event)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(
+                            provider = ?provider,
+                            skipped,
+                            "Backend event lagged; dropping missed events"
+                        );
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
@@ -251,7 +269,7 @@ async fn run_app(
                     tokio::spawn(async move {
                         let provider = messenger.provider();
                         let result = messenger.chats().await;
-                        let _ = tx.send(UiEvent::SidebarChats(provider, result));
+                        let _ = tx.send(UiEvent::ChatList(provider, result));
                     });
                 }
             }
@@ -326,7 +344,7 @@ async fn run_app(
                             generation,
                             result,
                         } => app.state.apply_chat_load(chat, generation, result),
-                    UiEvent::SidebarChats(provider, result) => {
+                    UiEvent::ChatList(provider, result) => {
                         app.state.sidebar_sync_pending =
                             app.state.sidebar_sync_pending.saturating_sub(1);
                         app.state.sidebar_sync_in_flight = app.state.sidebar_sync_pending > 0;
@@ -336,6 +354,7 @@ async fn run_app(
                                 app.state
                                     .chat_state
                                     .reconcile_provider_chats(provider, chats);
+                                app.state.persist_chats();
                                 debug!(provider = ?provider, "Sidebar sync OK");
                             }
 
@@ -467,7 +486,7 @@ impl App {
 
         let offset_id = open.history.first().and_then(|msg| msg.message_id.to_i32());
 
-        let result: Result<Vec<_>, crate::backend::BackendError> =
+        let result: Result<Vec<_>, backend::BackendError> =
             messenger.history_page(&chat_id, offset_id, 25).await;
 
         match result {

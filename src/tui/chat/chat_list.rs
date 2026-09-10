@@ -61,6 +61,10 @@ impl StatefulWidget for ChatList<'_> {
 
                 let display_name = item.contact_name.trim();
 
+                if item.verified {
+                    spans.push(Span::styled("✓ ", Style::default().fg(Color::LightGreen)));
+                }
+
                 spans.push(Span::styled(display_name.to_string(), name_style));
 
                 if let Some(status) = item.status_label() {

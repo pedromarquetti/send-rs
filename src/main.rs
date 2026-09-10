@@ -1,3 +1,4 @@
+// TODO: remove this and fix all clippy warnings
 #![allow(dead_code)]
 
 mod backend;
@@ -47,7 +48,7 @@ async fn main() -> Result<()> {
     let keymap = config.keys.parse()?;
 
     if first_boot {
-        config.save()?;
+        config.save_config()?;
     }
 
     info!("sender v{} starting", env!("CARGO_PKG_VERSION"));
@@ -57,12 +58,14 @@ async fn main() -> Result<()> {
     // Initialize Telegram only when it is enabled or configured. A configured
     // but disabled account is retained so it can be enabled or authenticated
     // from settings; disabled providers are still excluded from chat loading.
+    // TODO: Telegram: Make telegram NOT load if disabled: app still listens fot events even if
+    // disabled
     let telegram = &config.providers.telegram;
     if telegram.enabled || telegram.has_credentials() {
         if !telegram.has_credentials() {
             info!("Telegram is enabled but has no credentials, skipping");
         } else {
-            let session_dir = Config::config_dir()?;
+            let session_dir = Config::user_config_dir()?;
             match TelegramMessenger::new(
                 session_dir,
                 telegram.api_id,
@@ -88,7 +91,8 @@ async fn main() -> Result<()> {
     // is event-driven (QR code), so the messenger is constructed unconditionally
     // when enabled and the bot is started on first TUI subscription.
     {
-        let whatsapp_path = Config::config_dir()?.join("wa.db");
+        let whatsapp_path = Config::user_config_dir()?.join("wa.db");
+
         if let Some(parent) = whatsapp_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }

@@ -46,13 +46,14 @@ impl StatefulWidget for ChatWidget<'_> {
         let title: Line<'_> = state
             .selected_chat()
             .map(|chat| {
+                let verified = if chat.verified { "✓ " } else { "" };
                 let name = chat.contact_name.trim();
                 let status = chat.status_label().unwrap_or("");
 
                 let label = if name.is_empty() {
                     "Unnamed chat".to_string()
                 } else {
-                    name.to_string()
+                    format!("{verified}{name}")
                 };
 
                 let bullet = match status {

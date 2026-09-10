@@ -2,7 +2,7 @@ use anyhow::Result;
 use ratatui::style::{Color, Style};
 use ratatui::widgets::ListState;
 use ratatui_textarea::{TextArea, WrapMode};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::backend::{
     BackendError, BackendEvent, Chat, ChatId, LoginStepState, Message, MessageId, MessengerKind,
@@ -136,6 +136,11 @@ impl AppState {
             retry_draft: None,
         };
 
+        if let Ok(chat_cache) = Config::load_chats() {
+            debug!(chat_count = chat_cache.len(), "Loaded persisted chat list");
+            app.apply_chats(chat_cache);
+        }
+
         if open_settings {
             app.create_popup(PopupKind::Info(String::from(
                 "Welcome! Press Enter on a provider to enable it.",
@@ -149,7 +154,10 @@ impl AppState {
     }
 
     /// Apply a previously fetched chat list to the TUI chat state, preserving
-    /// each chat's saved scroll position.
+    /// each chat's saved scroll position. Chats already loaded for an enabled
+    /// provider that returned no live entries (e.g. WhatsApp after a cold
+    /// restart, where the realtime client does not re-sync its full history)
+    /// are kept rather than wiped out.
     pub fn apply_chats(&mut self, chats: Vec<Chat>) {
         let saved_scrolls: HashMap<ChatId, usize> = self
             .chat_state
@@ -158,8 +166,8 @@ impl AppState {
             .map(|chat| (chat.id.clone(), chat.scroll))
             .collect();
 
-        let mut seen = std::collections::HashSet::new();
-        let chat_list: Vec<Chat> = chats
+        let mut seen = HashSet::new();
+        let mut chat_list: Vec<Chat> = chats
             .into_iter()
             .filter(|chat| seen.insert(chat.id.clone()))
             .map(|chat| {
@@ -168,6 +176,55 @@ impl AppState {
             })
             .collect();
         debug!(total = chat_list.len(), "Applying deduplicated chat list");
+
+        let live_providers: HashSet<Provider> =
+            chat_list.iter().map(|chat| chat.id.to_provider()).collect();
+
+        // Grow-only: a live provider that returned a *smaller* snapshot than
+        // the chats already loaded (e.g. WhatsApp after a cold restart re-syncs
+        // only a partial subset) must not shrink the fuller cached list. Track
+        // such shrunken providers so their missing chats are preserved below.
+        let shrunken_enabled: HashSet<Provider> = live_providers
+            .iter()
+            .copied()
+            .filter(|provider| {
+                let old = self
+                    .chat_state
+                    .chats
+                    .iter()
+                    .filter(|old_chat| {
+                        matches!(&old_chat.id, ChatId::Telegram(_) | ChatId::WhatsApp(_))
+                    })
+                    .filter(|old_chat| old_chat.id.to_provider() == *provider)
+                    .count();
+
+                let new = chat_list
+                    .iter()
+                    .filter(|new_chat| new_chat.id.to_provider() == *provider)
+                    .count();
+
+                new < old && provider.is_enabled(&self.config.providers)
+            })
+            .collect();
+
+        let preserved: Vec<Chat> = self
+            .chat_state
+            .chats
+            .iter()
+            .filter(|old| match &old.id {
+                ChatId::Myself => false,
+                id => {
+                    let provider = id.to_provider();
+                    !chat_list.iter().any(|c| c.id == *id)
+                        && (!live_providers.contains(&provider)
+                            || shrunken_enabled.contains(&provider))
+                        && provider.is_enabled(&self.config.providers)
+                }
+            })
+            .cloned()
+            .collect();
+
+        chat_list.extend(preserved);
 
         self.chat_state.chats = chat_list;
         self.chat_state.chats.sort_by_key(|chat| !chat.fixed);
@@ -210,6 +267,15 @@ impl AppState {
                     .collect::<Vec<_>>()
                     .join("\n"),
             ));
+        }
+
+        self.persist_chats();
+    }
+
+    /// Persist the current sidebar chat list so it survives a cold restart.
+    pub(crate) fn persist_chats(&self) {
+        if let Err(e) = Config::save_chats(&self.chat_state.chats) {
+            error!(error = %e, "Failed to persist chat list");
         }
     }
 
@@ -317,6 +383,7 @@ impl AppState {
             Some(messenger) => messenger.set_read(&chat.id).await,
             None => Ok(()),
         };
+
         if let Err(e) = read_result {
             warn!(chat = %chat.contact_name, error = %e, "Failed to mark chat as read");
             self.create_popup(PopupKind::Error(format!(
@@ -667,7 +734,7 @@ impl AppState {
         // --- Disabling is always straightforward ---
         if provider.is_enabled(&self.config.providers) {
             provider.toggle_enabled(&mut self.config.providers);
-            match self.config.save() {
+            match self.config.save_config() {
                 Ok(()) => {
                     // If the user is currently viewing a chat belonging to the
                     // disabled provider, close it so the UI does not retain an
@@ -730,7 +797,7 @@ impl AppState {
         // Check if already authenticated — if so, just enable
         if messenger.is_authenticated().await {
             provider.toggle_enabled(&mut self.config.providers);
-            match self.config.save() {
+            match self.config.save_config() {
                 Ok(()) => {
                     let errors = self.rebuild_chats().await;
                     self.create_popup(PopupKind::Info(format!("{name} enabled")));
@@ -767,7 +834,7 @@ impl AppState {
 
         if provider == Provider::WhatsApp && !provider.is_enabled(&self.config.providers) {
             provider.toggle_enabled(&mut self.config.providers);
-            if let Err(e) = self.config.save() {
+            if let Err(e) = self.config.save_config() {
                 self.create_popup(PopupKind::Error(format!("could not save config: {e}")));
             }
         }
@@ -832,7 +899,7 @@ impl AppState {
                     if !provider.is_enabled(&self.config.providers) {
                         provider.toggle_enabled(&mut self.config.providers);
                     }
-                    match self.config.save() {
+                    match self.config.save_config() {
                         Ok(()) => {}
                         Err(e) => {
                             self.create_popup(PopupKind::Warn(format!(
@@ -901,9 +968,11 @@ impl AppState {
                 && login.provider.is_enabled(&self.config.providers)
             {
                 login.provider.toggle_enabled(&mut self.config.providers);
-                if let Err(e) = self.config.save() {
+
+                if let Err(e) = self.config.save_config() {
                     self.create_popup(PopupKind::Error(format!("could not save config: {e}")));
                 }
+
             }
         }
         self.screen = Screen::Main;
@@ -933,7 +1002,8 @@ impl AppState {
 
                     if !provider.is_enabled(&self.config.providers) {
                         provider.toggle_enabled(&mut self.config.providers);
-                        match self.config.save() {
+
+                        match self.config.save_config() {
                             Ok(()) => {}
                             Err(e) => self.create_popup(PopupKind::Error(e.to_string())),
                         };
@@ -1024,7 +1094,15 @@ impl AppState {
                     .iter()
                     .any(|chat| chat.id == message.chat);
 
-                self.chat_state.upsert_chat(chat_update);
+                // Guard against polluting the sidebar with a brand-new chat whose
+                // sender name we cannot resolve (sender came through as
+                // "Unknown" -> empty). Such a chat would only render as an
+                // "Unnamed chat" and, when the provider is mid-lifecycle, can
+                // appear spuriously. Existing chats still get their preview
+                // bumped; only genuinely-new nameless entries are suppressed.
+                if sidebar_found || !contact_name.is_empty() {
+                    self.chat_state.upsert_chat(chat_update);
+                }
 
                 if is_open {
                     self.chat_state.mark_read(&message.chat);
@@ -1109,6 +1187,24 @@ impl AppState {
 
                 self.chat_state.upsert_chat(chat);
             }
+            BackendEvent::ChatRemoved { chat } => {
+                debug!(chat = ?chat.id, "TUI ChatRemoved");
+
+                self.chat_state.chats.retain(|c| c.id != chat.id);
+
+                if let Some(open) = self.chat_state.open_chat.as_mut()
+                    && open.chat.id == chat.id
+                {
+                    self.chat_state.open_chat = None;
+                }
+
+                self.persist_chats();
+            }
+            BackendEvent::ChatList(chats) => {
+                debug!(provider = ?provider, total = chats.len(), "TUI ChatList applied");
+                self.chat_state.reconcile_provider_chats(provider, chats);
+                self.persist_chats();
+            }
         }
     }
 }
@@ -1143,11 +1239,6 @@ pub async fn fetch_all_chats(
     for messenger in messengers {
         let provider = messenger.provider();
 
-        // BUG: Unnamed chat appearing after whatsapp disable (tested with telegram disabled):
-        // steps to reproduce: enable whatsapp > cancel with Esc > a new Unnamed chat appears
-        // with TG tag. Sometimes more than one unnamed chats appear.
-        // This bug DOES occur on a fresh init of the app. Apparently does not occur when
-        // telegram itself is enabled
         if !provider.is_enabled(providers) {
             warn!("Provider {:#?} disabled! Skipping chat fetch", provider);
             continue;
@@ -1327,13 +1418,130 @@ mod tests {
     async fn applying_chats_deduplicates_chat_ids() {
         let mut state = app_state().await;
         let duplicate = state.chat_state.chats[0].clone();
-        let unique = state.chat_state.chats[1].clone();
         let duplicate_id = duplicate.id.clone();
+        // Snapshot at least as large as the loaded set so the grow-only guard
+        // does not kick in; the injected duplicate must still be collapsed.
+        let snapshot: Vec<_> = state
+            .chat_state
+            .chats
+            .iter()
+            .cloned()
+            .chain([duplicate])
+            .collect();
 
-        state.apply_chats(vec![duplicate.clone(), unique, duplicate]);
+        state.apply_chats(snapshot);
 
-        assert_eq!(state.chat_state.chats.len(), 2);
-        assert_eq!(state.chat_state.chats[0].id, duplicate_id);
+        assert_eq!(state.chat_state.chats.len(), 4);
+        assert_eq!(
+            state
+                .chat_state
+                .chats
+                .iter()
+                .filter(|chat| chat.id == duplicate_id)
+                .count(),
+            1,
+            "duplicate chat id must be deduplicated"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_chats_is_grow_only_for_live_providers() {
+        let mut state = app_state().await;
+        let original_ids: Vec<_> = state
+            .chat_state
+            .chats
+            .iter()
+            .map(|chat| chat.id.clone())
+            .collect();
+        assert!(
+            original_ids.len() > 1,
+            "test precondition: a populated sidebar"
+        );
+
+        // A one-chat subset of what is already loaded must not shrink the list.
+        let partial = vec![state.chat_state.chats[0].clone()];
+        state.apply_chats(partial);
+
+        let ids: Vec<_> = state
+            .chat_state
+            .chats
+            .iter()
+            .map(|chat| chat.id.clone())
+            .collect();
+        assert_eq!(
+            ids, original_ids,
+            "a smaller live snapshot must never shrink the fuller cached list"
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_start_keeps_enabled_provider_chats_when_live_fetch_empty() {
+        let mut state = app_state().await;
+        state.config.providers.whatsapp = true;
+        state.chat_state.chats.push(crate::backend::Chat {
+            id: ChatId::WhatsApp("wa-1".into()),
+            contact_name: "WA One".into(),
+            ..Default::default()
+        });
+        state.chat_state.chats.push(crate::backend::Chat {
+            id: ChatId::WhatsApp("wa-2".into()),
+            contact_name: "WA Two".into(),
+            ..Default::default()
+        });
+
+        // The live fetch yields only Telegram chats: there is no WhatsApp
+        // messenger connected (WhatsApp does not re-sync its history on a cold
+        // restart), so the persisted WhatsApp chats must be preserved.
+        let (telegram_only, _errors) =
+            fetch_all_chats(&state.messengers, &state.config.providers).await;
+        assert!(
+            telegram_only
+                .iter()
+                .all(|c| c.id.to_provider() == Provider::Telegram),
+            "test precondition: live fetch has no WhatsApp chats"
+        );
+
+        state.apply_chats(telegram_only);
+
+        assert!(
+            state
+                .chat_state
+                .chats
+                .iter()
+                .any(|c| c.id == ChatId::WhatsApp("wa-1".into())),
+            "persisted WhatsApp chats must survive a cold start without a live sync"
+        );
+        assert!(
+            state
+                .chat_state
+                .chats
+                .iter()
+                .any(|c| c.id == ChatId::WhatsApp("wa-2".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_fetched_drops_disabled_provider_chats() {
+        let mut state = app_state().await;
+        state.chat_state.chats.push(crate::backend::Chat {
+            id: ChatId::WhatsApp("wa-1".into()),
+            contact_name: "WA One".into(),
+            ..Default::default()
+        });
+        state.config.providers.whatsapp = false;
+
+        let (telegram_only, _errors) =
+            fetch_all_chats(&state.messengers, &state.config.providers).await;
+        state.apply_fetched(telegram_only, Vec::new());
+
+        assert!(
+            state
+                .chat_state
+                .chats
+                .iter()
+                .all(|c| c.id.to_provider() == Provider::Telegram),
+            "disabled providers' chats must be dropped"
+        );
     }
 
     #[test]
@@ -1582,6 +1790,46 @@ mod tests {
         );
         assert!(state.chat_state.chats[0].unread);
         assert_eq!(state.chat_state.chats[0].unread_count, 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_sender_message_does_not_insert_nameless_sidebar_chat() {
+        let mut state = app_state().await;
+        let before = state.chat_state.chats.len();
+
+        // A brand-new chat with an unresolved ("Unknown") sender must not
+        // appear as an "Unnamed chat" entry in the sidebar.
+        state.handle_backend_event(
+            Provider::Telegram,
+            BackendEvent::MessageReceived(Message {
+                message_id: "transient".into(),
+                chat: ChatId::Telegram(4242),
+                sender: "Unknown".into(),
+                text: "system ping".into(),
+                timestamp: 0,
+                from_me: false,
+                msg_actions: Vec::new(),
+                media: None,
+                reply_to_id: None,
+                reply_ctx: None,
+                pending: false,
+                failed: false,
+            }),
+        );
+
+        assert_eq!(
+            state.chat_state.chats.len(),
+            before,
+            "an unresolved sender must not create a nameless sidebar chat"
+        );
+        assert!(
+            state
+                .chat_state
+                .chats
+                .iter()
+                .all(|c| c.id != ChatId::Telegram(4242)),
+            "no entry should exist for the unknown-chat id"
+        );
     }
 
     #[tokio::test]

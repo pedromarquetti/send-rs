@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use ratatui::widgets::ListState;
 
-use crate::backend::{Chat, ChatId, Message, MessageAction, MessageId};
+use crate::backend::{Chat, ChatId, Message, MessageAction, MessageId, Provider};
 
 pub mod chat_list;
 pub mod chat_widget;
@@ -242,6 +242,7 @@ impl ChatState {
                 && chat.contact_name != "You"
             {
                 entry.contact_name = chat.contact_name;
+                entry.verified = chat.verified;
             }
 
             if let Some(status) = chat.status.clone()
@@ -305,6 +306,26 @@ impl ChatState {
         provider: crate::backend::Provider,
         chats: Vec<Chat>,
     ) {
+        // Grow-only: a snapshot may refresh the list, but a smaller snapshot
+        // (e.g. WhatsApp after a cold restart where the connection re-syncs
+        // only a partial subset) must never shrink the fuller cached list.
+        // An empty snapshot is the extreme case and is likewise ignored.
+        let current = self
+            .chats
+            .iter()
+            .filter(|chat| {
+                matches!(
+                    (&chat.id, provider),
+                    (ChatId::Telegram(_), Provider::Telegram)
+                        | (ChatId::WhatsApp(_), Provider::WhatsApp)
+                )
+            })
+            .count();
+
+        if chats.len() < current {
+            return;
+        }
+
         let selected_id = self.selected_chat().map(|chat| chat.id.clone());
 
         self.chats.retain(|chat| {
@@ -471,6 +492,8 @@ impl ChatState {
 
 #[cfg(test)]
 mod tests {
+    use crate::backend::Provider;
+
     use super::*;
 
     fn chat(id: ChatId, name: &str) -> Chat {
@@ -783,18 +806,63 @@ mod tests {
     }
 
     #[test]
-    fn provider_reconciliation_removes_stale_provider_chats_only() {
+    fn provider_reconciliation_is_grow_only() {
         let mut state = ChatState {
             chats: vec![
                 chat(ChatId::Telegram(1), "Old Telegram"),
-                chat(ChatId::Telegram(2), "Removed Telegram"),
+                chat(ChatId::Telegram(2), "Second"),
                 chat(ChatId::WhatsApp("wa-1".into()), "WhatsApp"),
             ],
             ..Default::default()
         };
 
+        // A smaller snapshot (1 < 2 loaded Telegram chats) must never shrink
+        // the fuller cached list: it is ignored wholesale.
         state.reconcile_provider_chats(
-            crate::backend::Provider::Telegram,
+            Provider::Telegram,
+            vec![chat(ChatId::Telegram(1), "Partial Telegram")],
+        );
+
+        assert_eq!(state.chats.len(), 3);
+        assert!(
+            state
+                .chats
+                .iter()
+                .any(|chat| chat.id == ChatId::WhatsApp("wa-1".into()))
+        );
+        assert!(
+            state
+                .chats
+                .iter()
+                .any(|chat| chat.id == ChatId::Telegram(2)),
+            "a smaller snapshot must not drop already-loaded chats"
+        );
+        assert_eq!(
+            state
+                .chats
+                .iter()
+                .find(|chat| chat.id == ChatId::Telegram(1))
+                .unwrap()
+                .contact_name,
+            "Old Telegram",
+            "an ignored partial snapshot must not rename existing chats"
+        );
+    }
+
+    #[test]
+    fn provider_reconciliation_applies_snapshot_with_at_least_as_many_chats() {
+        let mut state = ChatState {
+            chats: vec![
+                chat(ChatId::Telegram(1), "Old Telegram"),
+                chat(ChatId::WhatsApp("wa-1".into()), "WhatsApp"),
+            ],
+            ..Default::default()
+        };
+
+        // A same-size snapshot is a legitimate refresh: names are updated and
+        // the other provider's chats are left alone.
+        state.reconcile_provider_chats(
+            Provider::Telegram,
             vec![chat(ChatId::Telegram(1), "Updated Telegram")],
         );
 
@@ -804,12 +872,6 @@ mod tests {
                 .chats
                 .iter()
                 .any(|chat| chat.id == ChatId::WhatsApp("wa-1".into()))
-        );
-        assert!(
-            !state
-                .chats
-                .iter()
-                .any(|chat| chat.id == ChatId::Telegram(2))
         );
         assert_eq!(
             state
@@ -827,7 +889,7 @@ mod tests {
         let mut state = ChatState::default();
 
         state.reconcile_provider_chats(
-            crate::backend::Provider::Telegram,
+            Provider::Telegram,
             vec![
                 chat(ChatId::Telegram(1), "Newest"),
                 chat(ChatId::Telegram(2), "Older"),
@@ -847,5 +909,45 @@ mod tests {
                 ChatId::Telegram(3)
             ]
         );
+    }
+
+    #[test]
+    fn empty_snapshot_does_not_wipe_provider_chats() {
+        let mut state = ChatState {
+            chats: vec![chat(ChatId::WhatsApp("wa-1".into()), "WhatsApp")],
+            ..Default::default()
+        };
+
+        state.reconcile_provider_chats(Provider::WhatsApp, Vec::new());
+
+        assert!(
+            state
+                .chats
+                .iter()
+                .any(|c| c.id == ChatId::WhatsApp("wa-1".into())),
+            "an empty snapshot (cold start / no re-sync) must not clear the provider's chats"
+        );
+    }
+
+    #[test]
+    fn chat_serde_round_trip() {
+        let original = vec![
+            chat(ChatId::WhatsApp("g.us".into()), "Group"),
+            Chat {
+                id: ChatId::Telegram(123),
+                contact_name: "TG".into(),
+                unread_count: 3,
+                ..Default::default()
+            },
+        ];
+
+        let json = serde_json::to_string(&original).unwrap();
+        let decoded: Vec<Chat> = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].id, ChatId::WhatsApp("g.us".into()));
+        assert_eq!(decoded[0].contact_name, "Group");
+        assert_eq!(decoded[1].id, ChatId::Telegram(123));
+        assert_eq!(decoded[1].unread_count, 3);
     }
 }

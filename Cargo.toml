@@ -25,6 +25,7 @@ grammers-tl-types = "0.10"
 # This conflicts with grammers-session's libsql-ffi at link time (duplicate
 # sqlite3 symbols). Re-enable when whatsapp-rust adds a no-bundled feature.
 # NOTE: This is a local fix that apparently works but needs to be tested 
+# whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", default-features = false, features = [
 whatsapp-rust = { path = "/home/phlm/Documents/programming/rust/whatsapp-rust", default-features = false, features = [
   "sqlite-storage",
   "tokio-transport",
@@ -37,6 +38,7 @@ qrcode = "0.14"
 notify-rust = "4"
 dirs = "6"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "1.1"
 ratatui-textarea = "0.9.2"
 chrono = "0.4"

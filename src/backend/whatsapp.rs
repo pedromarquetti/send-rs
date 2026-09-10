@@ -1,27 +1,34 @@
+use crate::config::Config;
 use crate::helpers::now;
 
 use super::{
     AuthSteps, BackendError, BackendEvent, Chat, ChatId, LoginStepState, MediaKind, Message,
     MessageAction, MessageId, MessageMedia, Messenger, ReplyContext,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::broadcast::Sender;
 use tokio::sync::{RwLock, broadcast};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
+use whatsapp_rust::Client;
 use whatsapp_rust::prelude::{
     Bot, Event, Jid, MessageBuilderExt, MessageExt, MessageInfo, Server, SqliteStore, wa,
 };
+use whatsapp_rust::wacore_binary::JidExt;
+use whatsapp_rust::waproto::whatsapp::HistorySync;
+use whatsapp_rust::waproto::whatsapp::Message as WaMessage;
 
 type SharedState = Arc<RwLock<WhatsAppState>>;
 
 /// In-memory mirror of the account's conversations and messages, populated from
 /// `Event::HistorySync` and `Event::Messages` delivered by the whatsapp-rust
 /// bot. SQLite persists the session/auth credentials; this cache drives the TUI.
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct WhatsAppState {
     // TODO: check if needed: controls wether the provider is actually enabled in the config and if
     // it should load
@@ -32,6 +39,29 @@ struct WhatsAppState {
     /// Each Stanza contains data that identifies and populates the message
     /// So basically, Stanza == Message
     by_stanza_id: HashMap<String, (ChatId, MessageId)>,
+
+    /// JID -> push name cache populated from HistorySync pushnames.
+    pushnames: HashMap<String, String>,
+    /// JID string -> display name learned from usync (the peer's username or
+    /// verified business name), keyed the way `pushnames` are (peer PN or LID).
+    /// Names the phone itself declines to sync still resolve to something
+    /// human-readable across restarts.
+    #[serde(default)]
+    usync_names: HashMap<String, String>,
+    /// JID strings (same keys as `usync_names`) whose peer is a verified
+    /// business; the TUI renders a check mark next to the name.
+    #[serde(default)]
+    usync_verified: HashSet<String>,
+    /// JID strings already queried through usync, kept so a peer that has no
+    /// username/business name is not re-queried on every history sync.
+    #[serde(default)]
+    usync_attempted: HashSet<String>,
+    /// Epoch seconds of the first `Event::HistorySync` after a connect. The
+    /// connect-time retry loop parks on `None`: it must not stop re-requesting
+    /// the snapshot just because the chat list was seeded from the cache
+    /// (`state.chats` is non-empty even when no conversation sync ever lands).
+    #[serde(default)]
+    sync_seen_at: Option<i64>,
 }
 
 fn message_actions(from_me: bool) -> Vec<MessageAction> {
@@ -42,11 +72,33 @@ fn message_actions(from_me: bool) -> Vec<MessageAction> {
     actions
 }
 
-fn chat_id_from_jid(jid: &Jid) -> ChatId {
-    ChatId::WhatsApp(jid.to_string())
+/// Canonicalize the chat key for a message sent by the user's own account.
+///
+/// Live self-messages arrive with the chat keyed by the account's own LID, but
+/// the HistorySync snapshot (and thus the persisted cache) stores the
+/// self-chat under the own phone number. Rewrite the former to the latter so
+/// both paths land in the same chat and no transient LID chat appears that
+/// would vanish on the next restart.
+fn own_chat_id(own_lid: Option<&Jid>, own_pn: Option<&Jid>, chat: ChatId, from_me: bool) -> ChatId {
+    if !from_me {
+        return chat;
+    }
+
+    let ChatId::WhatsApp(raw) = &chat else {
+        return chat;
+    };
+
+    let is_own_lid = own_lid.is_some_and(|lid| lid.to_non_ad_string().as_str() == raw.as_str());
+
+    if is_own_lid && let Some(pn) = own_pn {
+        return ChatId::WhatsApp(pn.to_non_ad_string());
+    }
+
+    chat
 }
 
-fn wa_message_media(msg: &wa::Message) -> Option<MessageMedia> {
+/// Convert [`WaMessage`] to [`MessageMedia`]
+fn handle_wa_media(msg: &WaMessage) -> Option<MessageMedia> {
     let base = msg.get_base_message();
     let kind = if base.image_message.is_set() {
         MediaKind::Image
@@ -76,19 +128,30 @@ fn wa_message_media(msg: &wa::Message) -> Option<MessageMedia> {
     })
 }
 
-/// Build a normalized [`Message`] from a proto and its [`MessageInfo`].
-fn normalize_inbound(info: &MessageInfo, msg: &wa::Message, state: &WhatsAppState) -> Message {
-    let chat = chat_id_from_jid(&info.source.chat);
+/// Converts [`Message`] to [`WaMessage`] / [`MessageInfo`]
+///
+/// `info.source.chat` is the conversation JID (used as the chat id);
+/// `info.source.sender` is the per-message author JID (the participant inside a
+/// group, or the peer in a one-to-one chat). `info.push_name` already holds the
+/// author's display name when `from_me` is false.
+fn to_senders_msg(
+    chat: ChatId,
+    info: &MessageInfo,
+    msg: &WaMessage,
+    state: &WhatsAppState,
+) -> Message {
     let from_me = info.source.is_from_me;
     let sender = if from_me {
         "You".to_string()
-    } else if !info.push_name.trim().is_empty() {
-        info.push_name.clone()
     } else {
-        info.source.sender.to_string()
+        resolve_sender_name(
+            info.push_name.as_str(),
+            &info.source.sender,
+            &state.pushnames,
+        )
     };
 
-    let media = wa_message_media(msg);
+    let media = handle_wa_media(msg);
     let text = if let Some(media) = &media {
         media
             .caption
@@ -136,6 +199,148 @@ fn normalize_inbound(info: &MessageInfo, msg: &wa::Message, state: &WhatsAppStat
     }
 }
 
+/// Resolve a human-readable sender name for an inbound message.
+///
+/// Order: the message's own `push_name` (authoritative), then the push name
+/// cache for the author JID, then a bare JID fallback. `"Unknown"` is reserved
+/// for the truly unresolvable case so the TUI can keep a friendlier fallback.
+fn resolve_sender_name(
+    push_name: &str,
+    sender: &Jid,
+    pushnames: &HashMap<String, String>,
+) -> String {
+    if !push_name.trim().is_empty() {
+        return push_name.to_string();
+    }
+
+    let key = sender.to_non_ad_string();
+
+    if let Some(name) = pushnames.get(&key)
+        && !name.trim().is_empty()
+    {
+        return name.clone();
+    }
+
+    let bare = sender.user_base();
+
+    if !bare.is_empty() {
+        bare.to_string()
+    } else {
+        "Unknown".to_string()
+    }
+}
+
+/// Format a peer phone number the way WhatsApp does for contacts it has no
+/// name for: `5516992499381` -> `+55 16 99249-9381`. Non-numeric input (a bare
+/// LID, a JID string) degrades to `+{digits}`.
+fn format_pn(pn: &str) -> String {
+    let digits: String = pn.chars().filter(|c| c.is_ascii_digit()).collect();
+
+    if digits.len() < 8 {
+        return format!("+{digits}");
+    }
+
+    let (cc, rest) = digits.split_at(2);
+    let (area, number) = rest.split_at(2);
+    let (prefix, suffix) = number.split_at(number.len() - 4);
+    format!("+{cc} {area} {prefix}-{suffix}")
+}
+
+/// Name for a peer whose phone number we only learned locally from the LID↔PN
+/// mapping (`Client::get_lid_pn_entry`): the synced push name wins when the
+/// cache has one, otherwise the formatted number — the same fallback a thread
+/// keyed by PN gets from `resolve_conversation_name`.
+fn name_from_lid_pn(pn_user: &str, pushnames: &HashMap<String, String>) -> String {
+    let pn_key = Jid::pn(pn_user).to_non_ad_string();
+
+    pushnames
+        .get(&pn_key)
+        .filter(|n| !n.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| format_pn(pn_user))
+}
+
+/// Resolve the display name for a conversation from a history-sync record.
+///
+/// For groups the subject (`conversation.name`) is authoritative. For one-to-one
+/// chats the saved contact name (`conversation.name`) or display name wins, with
+/// the push-name cache, a usync-learned name (username or verified business
+/// name), the formatted phone number and a bare JID as fallbacks.
+///
+/// Chats may be keyed by LID (`...@lid`); the thread's `pn_jid` (when present) is used as the
+/// push-name / usync lookup key so a LID-keyed chat still resolves to the
+/// contact's saved name.
+///
+/// The returned `bool` flags verified-business peers so the TUI can render a check mark.
+fn resolve_conversation_name(
+    conv: &wa::Conversation,
+    pushnames: &HashMap<String, String>,
+    usync_names: &HashMap<String, String>,
+    usync_verified: &HashSet<String>,
+) -> (String, bool) {
+    if let Ok(jid) = Jid::from_str(&conv.id)
+        && jid.is_group()
+    {
+        debug!("{jid} is a group named '{:?}' ", conv.name);
+        return (
+            conv.name
+                .clone()
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or_else(|| conv.id.clone()),
+            false,
+        );
+    }
+
+    // The peer's phone number when the thread is keyed by LID.
+    let pn_key = conv
+        .pn_jid
+        .clone()
+        .filter(|j| !j.trim().is_empty())
+        .unwrap_or_else(|| conv.id.clone());
+
+    if let Some(name) = conv
+        .name
+        .clone()
+        .filter(|n| !n.trim().is_empty())
+        .or_else(|| conv.display_name.clone().filter(|n| !n.trim().is_empty()))
+    {
+        return (name, false);
+    }
+
+    if let Some(name) = pushnames.get(&pn_key).filter(|n| !n.trim().is_empty()) {
+        return (name.clone(), false);
+    }
+
+    if let Some(name) = usync_names.get(&pn_key).filter(|n| !n.trim().is_empty()) {
+        return (name.clone(), usync_verified.contains(&pn_key));
+    }
+
+    if let Ok(jid) = Jid::from_str(&pn_key)
+        && jid.is_pn()
+    {
+        return (format_pn(jid.user_base()), false);
+    }
+
+    if let Ok(jid) = Jid::from_str(&conv.id) {
+        let bare = jid.user_base().to_string();
+        if !bare.is_empty() {
+            return (bare, false);
+        }
+    }
+
+    (conv.id.clone(), false)
+}
+
+/// Build a preview line for the chat list from the most recent message.
+/// TODO: check this func: isn't this used elsewhere also?
+fn preview_line(sender: &str, text: &str, from_me: bool) -> String {
+    if from_me {
+        format!("You: {text}")
+    } else {
+        format!("{sender}: {text}")
+    }
+}
+
 /// The stanza id this message quotes, if any, from its `ContextInfo`.
 ///
 /// Stanza is a XML-like structure exchanged between client and server.
@@ -167,7 +372,7 @@ fn reply_stanza_id(msg: &wa::Message) -> Option<String> {
 
 #[derive(Clone)]
 pub struct WhatsAppMessenger {
-    client: Arc<whatsapp_rust::Client>,
+    client: Arc<Client>,
     /// The configured-but-not-yet-started bot. The bot is intentionally not
     /// spawned in `new()`: it is spun up lazily on the first [`Self::subscribe`]
     /// so the TUI (which subscribes before reading the event channel) can never
@@ -175,12 +380,15 @@ pub struct WhatsAppMessenger {
     /// channel would otherwise drop for not-yet-registered receivers.
     bot: Arc<Mutex<Option<Bot>>>,
     run_task: Arc<Mutex<Option<JoinHandle<()>>>>,
-    tx: broadcast::Sender<BackendEvent>,
+    tx: Sender<BackendEvent>,
     state: SharedState,
     shutdown: Arc<AtomicBool>,
     /// The most recently issued pairing QR payload (if any), kept so the login
     /// screen can query it synchronously on every frame and refresh on expiry.
     current_qr: Arc<RwLock<Option<String>>>,
+    /// Path to the JSON cache backing this account's chats/history/pushnames,
+    /// derived from the sqlite store path so both survive the same data dir.
+    cache_path: PathBuf,
 }
 
 impl WhatsAppMessenger {
@@ -193,7 +401,29 @@ impl WhatsAppMessenger {
             .map_err(|e| BackendError::Other(format!("WhatsApp: failed to open store: {e}")))?;
 
         let (tx, _) = broadcast::channel(128);
-        let state: SharedState = Arc::new(RwLock::new(WhatsAppState::default()));
+
+        // Dedicated WhatsApp cache. Must NOT share the TUI's `chats.json`:
+        // that file holds a plain Vec<Chat> (see Config::save_chats) while this
+        // cache holds the full WhatsAppState (history + pushnames + usync), and
+        // the two schemas silently clobbered each other, leaving WhatsApp with
+        // an empty state on every cold start.
+        let chat_cache = Config::user_config_dir()?.join("wp_cache.json");
+
+        let mut state = WhatsAppState::load_from(chat_cache.to_string_lossy().as_ref());
+
+        // First run with the dedicated cache (or a fresh account): seed the
+        // chat list from the TUI's persisted rows so usync enrichment can
+        // backfill names immediately, even before the first history sync lands.
+        if state.chats.is_empty()
+            && let Ok(chat_cache) = Config::load_chats()
+        {
+            state.chats = chat_cache
+                .into_iter()
+                .filter(|c| c.id.tag() == "WA")
+                .collect();
+        }
+
+        let state: SharedState = Arc::new(RwLock::new(state));
         let shutdown = Arc::new(AtomicBool::new(false));
         let current_qr: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
 
@@ -201,26 +431,26 @@ impl WhatsAppMessenger {
             .with_backend(store)
             .on_connected({
                 let tx = tx.clone();
-                move |_client| {
+                let state = state.clone();
+                let cache_path = chat_cache.clone();
+
+                move |client| {
                     let tx = tx.clone();
+                    let state = state.clone();
+                    let cache_path = cache_path.clone();
                     async move {
-                        info!("WhatsApp connected");
-                        let _ = tx.send(BackendEvent::Connected);
+                        Self::handle_connect(&client, &tx, &state, &cache_path);
                     }
                 }
             })
             .on_qr_code({
                 let tx = tx.clone();
                 let current_qr = current_qr.clone();
-
                 move |code, timeout| {
                     let tx = tx.clone();
                     let current_qr = current_qr.clone();
-
                     async move {
-                        info!("WhatsApp QR code (valid {}s)", timeout.as_secs());
-                        *current_qr.write().await = Some(code.clone());
-                        let _ = tx.send(BackendEvent::QrCode(code));
+                        Self::handle_qr(&code, timeout, &tx, &current_qr).await;
                     }
                 }
             })
@@ -229,125 +459,23 @@ impl WhatsAppMessenger {
                 move |_info| {
                     let tx = tx.clone();
                     async move {
-                        warn!("WhatsApp logged out");
-                        let _ = tx.send(BackendEvent::Disconnected(
-                            "WhatsApp logged out".to_string(),
-                        ));
+                        Self::handle_logged_out(&tx);
                     }
                 }
             })
             .on_event({
-                let state = state.clone();
                 let tx = tx.clone();
+                let state = state.clone();
                 let current_qr = current_qr.clone();
-                move |event: Arc<Event>, _client: Arc<whatsapp_rust::Client>| {
-                    let state = state.clone();
+                let cache_path = chat_cache.clone();
+                move |event, client| {
                     let tx = tx.clone();
+                    let state = state.clone();
                     let current_qr = current_qr.clone();
+                    let cache_path = cache_path.clone();
                     async move {
-                        let event = event;
-                        match &*event {
-                            Event::Connected(_) => {
-                                let _ = tx.send(BackendEvent::Connected);
-                            }
-                            Event::Disconnected(_)
-                            | Event::StreamError(_)
-                            | Event::ConnectFailure(_) => {
-                                let _ = tx.send(BackendEvent::Disconnected(
-                                    "WhatsApp: Connection Failure!".into(),
-                                ));
-                            }
-                            Event::PairingQrCode(q) => {
-                                *current_qr.write().await = Some(q.code.clone());
-                                let _ = tx.send(BackendEvent::QrCode(q.code.clone()));
-                            }
-                            Event::Messages(batch) => {
-                                // BUG:? Check if this is the root of the bug:
-                                // 1. Chats are not loading.
-                                // 2. WhatsApp 'Status' (24h status) appears as
-                                //    messages
-                                // 3. Only new incoming messages are being added to
-                                //    the chatlist
-                                // 4. Groups: in groups, contact names are appearing
-                                //    as the group name in chat view, while the group
-                                //    name in chat_list is appearing as one of the
-                                //    contact's name
-                                for inbound in batch.messages.iter() {
-                                    let mut state = state.write().await;
-                                    let chat = chat_id_from_jid(&inbound.info.source.chat);
-                                    let msg =
-                                        normalize_inbound(&inbound.info, &inbound.message, &state);
-
-                                    if msg.text.is_empty() && msg.media.is_none() {
-                                        continue;
-                                    }
-
-                                    let stanza_id = inbound.info.id.to_string();
-
-                                    state.by_stanza_id.insert(
-                                        stanza_id.clone(),
-                                        (chat.clone(), msg.message_id.clone()),
-                                    );
-
-                                    let is_dup = state
-                                        .history
-                                        .get(&chat)
-                                        .map(|h| h.iter().any(|m| m.message_id == msg.message_id))
-                                        .unwrap_or(false);
-
-                                    if !is_dup {
-                                        state
-                                            .history
-                                            .entry(chat.clone())
-                                            .or_default()
-                                            .push(msg.clone());
-                                    }
-
-                                    let contact_name = if inbound.info.push_name.trim().is_empty() {
-                                        inbound.info.source.sender.to_string()
-                                    } else {
-                                        inbound.info.push_name.clone()
-                                    };
-
-                                    let preview = if msg.from_me {
-                                        format!("You: {}", msg.text)
-                                    } else {
-                                        format!("{}: {}", contact_name, msg.text)
-                                    };
-
-                                    match state.chats.iter_mut().find(|c| c.id == chat) {
-                                        Some(c) => {
-                                            c.last_message = Some(preview);
-                                            if !msg.from_me {
-                                                c.unread = true;
-                                                c.unread_count += 1;
-                                            }
-                                        }
-                                        None => state.chats.push(Chat {
-                                            id: chat.clone(),
-                                            contact_name: contact_name.clone(),
-                                            last_message: Some(preview),
-                                            unread: !msg.from_me,
-                                            unread_count: if msg.from_me { 0 } else { 1 },
-                                            ..Default::default()
-                                        }),
-                                    }
-                                    drop(state);
-                                    let _ = tx.send(BackendEvent::MessageReceived(msg));
-                                }
-                            }
-                            Event::HistorySync(hs) => {
-                                if let Some(parsed) = hs.get() {
-                                    handle_history_sync(parsed, &state, &tx).await;
-                                }
-                            }
-                            other => {
-                                debug!(
-                                    "Unhandled WhatsApp event: {:?}",
-                                    std::mem::discriminant(other)
-                                );
-                            }
-                        }
+                        Self::handle_event(&event, &client, &state, &tx, &current_qr, &cache_path)
+                            .await;
                     }
                 }
             });
@@ -367,10 +495,309 @@ impl WhatsAppMessenger {
             state,
             shutdown,
             current_qr,
+            cache_path: chat_cache,
         })
     }
 
-    fn current_client(&self) -> Arc<whatsapp_rust::Client> {
+    /// Called once when the underlying server connection is established.
+    /// Past here, message routing is done by `handle_event`.
+    fn handle_connect(
+        client: &Arc<Client>,
+        tx: &Sender<BackendEvent>,
+        state: &SharedState,
+        cache_path: &Path,
+    ) {
+        info!("WhatsApp connected");
+
+        let client = client.clone();
+        let tx_for_enrich = tx.clone();
+        let state = state.clone();
+        let cache_path = cache_path.to_path_buf();
+
+        tokio::spawn(async move {
+            match client.request_syncd_snapshot_recovery("regular_high").await {
+                Ok(response) => debug!("WA snapshot recovery accepted: {response}"),
+                Err(e) => warn!("WA snapshot recovery failed: {e}"),
+            }
+
+            // Backfill names for chats already cached (or seeded from the TUI)
+            // right away; this also republishes the list so stale names get
+            // replaced without waiting for a sync.
+            enrich_chat_names(&client, &state, &cache_path, &tx_for_enrich).await;
+
+            // whatsapp-rust occasionally fails to decompress the snapshot PDO
+            // ("data error") and never delivers the conversation list. Retry in
+            // place until a history sync actually arrives, bounded, so a cold
+            // start still recovers its history/pushnames. The chat list by
+            // itself is not proof of delivery: it is seeded from the cache, so
+            // a non-empty `chats` cannot gate the retry.
+            for attempt in 0..2u32 {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                if state.read().await.sync_seen_at.is_some() {
+                    break;
+                }
+                warn!(
+                    "WA no history sync after recovery (attempt {}); re-requesting snapshot",
+                    attempt + 1
+                );
+                if let Err(e) = client.request_syncd_snapshot_recovery("regular_high").await {
+                    warn!("WA snapshot re-request failed: {e}");
+                }
+            }
+        });
+
+        let _ = tx.send(BackendEvent::Connected);
+    }
+
+    /// Called when a QR code is required for pairing.
+    async fn handle_qr(
+        code: &str,
+        timeout: std::time::Duration,
+        tx: &Sender<BackendEvent>,
+        current_qr: &Arc<RwLock<Option<String>>>,
+    ) {
+        info!("WhatsApp QR code (valid {}s)", timeout.as_secs());
+        *current_qr.write().await = Some(code.to_string());
+        let _ = tx.send(BackendEvent::QrCode(code.to_string()));
+    }
+
+    /// Called when the WhatsApp session is logged out / invalidated.
+    fn handle_logged_out(tx: &Sender<BackendEvent>) {
+        warn!("WhatsApp logged out");
+        let _ = tx.send(BackendEvent::Disconnected(
+            "WhatsApp logged out".to_string(),
+        ));
+    }
+
+    /// Dispatch a routed `Event` coming from the server stream.
+    /// Also handles reconnect/QR state and the chat list mutations (deletion,
+    /// clear, mute/archive/pin/mark-as-read) that arrive over the syncd channel.
+    async fn handle_event(
+        event: &Arc<Event>,
+        client: &Arc<Client>,
+        state: &SharedState,
+        tx: &Sender<BackendEvent>,
+        current_qr: &Arc<RwLock<Option<String>>>,
+        cache_path: &PathBuf,
+    ) {
+        match &**event {
+            Event::Connected(_) => {
+                let _ = tx.send(BackendEvent::Connected);
+            }
+            Event::Disconnected(_) | Event::StreamError(_) | Event::ConnectFailure(_) => {
+                let _ = tx.send(BackendEvent::Disconnected(
+                    "WhatsApp: Connection Failure!".into(),
+                ));
+            }
+            Event::PairingQrCode(q) => {
+                *current_qr.write().await = Some(q.code.clone());
+                let _ = tx.send(BackendEvent::QrCode(q.code.clone()));
+            }
+            Event::Messages(batch) => {
+                for inbound in batch.messages.iter() {
+                    // Skip status/24h broadcasts and any
+                    // message with no payload: they do not
+                    // belong in the chat list.
+                    if inbound.info.source.chat.server == Server::Broadcast
+                        || inbound.info.source.chat.is_status_broadcast()
+                    {
+                        continue;
+                    }
+
+                    let mut state = state.write().await;
+
+                    let chat = own_chat_id(
+                        client.lid().as_ref(),
+                        client.pn().as_ref(),
+                        ChatId::jid_to_chat_id(&inbound.info.source.chat.to_string()),
+                        inbound.info.source.is_from_me,
+                    );
+
+                    let msg = to_senders_msg(chat.clone(), &inbound.info, &inbound.message, &state);
+
+                    if (msg.text.is_empty() && msg.media.is_none()) || msg.sender == "Unknown" {
+                        drop(state);
+                        continue;
+                    }
+
+                    let stanza_id = inbound.info.id.to_string();
+
+                    state
+                        .by_stanza_id
+                        .insert(stanza_id.clone(), (chat.clone(), msg.message_id.clone()));
+
+                    let is_dup = state
+                        .history
+                        .get(&chat)
+                        .map(|h| h.iter().any(|m| m.message_id == msg.message_id))
+                        .unwrap_or(false);
+
+                    if !is_dup {
+                        state
+                            .history
+                            .entry(chat.clone())
+                            .or_default()
+                            .push(msg.clone());
+                    }
+
+                    state.upsert_chat_from_message(chat.clone(), &msg);
+
+                    drop(state);
+                    let _ = tx.send(BackendEvent::MessageReceived(msg));
+                }
+                state.read().await.save_to(cache_path);
+            }
+            Event::HistorySync(hs) => {
+                info!(
+                    "WA HistorySync event received sync_type={} order={:?} progress={:?} bytes={}",
+                    hs.sync_type(),
+                    hs.chunk_order(),
+                    hs.progress(),
+                    hs.compressed_bytes().len(),
+                );
+
+                match hs.get() {
+                    Some(parsed) => {
+                        info!(
+                            "WA HistorySync decoded conversations={} pushnames={}",
+                            parsed.conversations.len(),
+                            parsed.pushnames.len(),
+                        );
+                        handle_history_sync(parsed, state, tx).await;
+                        state.read().await.save_to(cache_path);
+
+                        // Backfill names the phone did not sync (pushnames) from
+                        // usync, for chat partners without a saved contact name.
+                        let client = client.clone();
+                        let state = state.clone();
+                        let cache_path = cache_path.clone();
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            enrich_chat_names(&client, &state, &cache_path, &tx).await;
+                        });
+                    }
+                    None => {
+                        warn!(
+                            "WA HistorySync decode FAILED sync_type={} bytes={}",
+                            hs.sync_type(),
+                            hs.compressed_bytes().len(),
+                        );
+                    }
+                }
+            }
+            Event::DeleteChatUpdate(u) => {
+                if let Some(chat) = remove_chat(state, &u.jid).await {
+                    let _ = tx.send(BackendEvent::ChatRemoved { chat });
+                }
+            }
+            Event::ClearChatUpdate(u) => {
+                let chat_id = ChatId::jid_to_chat_id(&u.jid.to_string());
+                let mut state = state.write().await;
+                let ids: Vec<MessageId> = state
+                    .history
+                    .get(&chat_id)
+                    .map(|h| h.iter().map(|m| m.message_id.clone()).collect())
+                    .unwrap_or_default();
+                if ids.is_empty() {
+                    return;
+                }
+                if let Some(history) = state.history.get_mut(&chat_id) {
+                    history.clear();
+                }
+                state.refresh_preview(&chat_id);
+                drop(state);
+                let _ = tx.send(BackendEvent::MessageDeleted {
+                    chat: Some(chat_id),
+                    message_ids: ids,
+                });
+            }
+            Event::DeleteMessageForMeUpdate(u) => {
+                let chat_id = ChatId::jid_to_chat_id(&u.chat_jid.to_string());
+                let id = MessageId(u.message_id.clone());
+                let mut state = state.write().await;
+                let mut removed = false;
+                if let Some(history) = state.history.get_mut(&chat_id) {
+                    let before = history.len();
+                    history.retain(|m| m.message_id != id);
+                    removed = history.len() != before;
+                }
+                if removed {
+                    state.refresh_preview(&chat_id);
+                    drop(state);
+                    let _ = tx.send(BackendEvent::MessageDeleted {
+                        chat: Some(chat_id),
+                        message_ids: vec![id],
+                    });
+                }
+            }
+            Event::MuteUpdate(u) => {
+                let mut state = state.write().await;
+                if let Some(chat) = state
+                    .chats
+                    .iter_mut()
+                    .find(|c| c.id == ChatId::jid_to_chat_id(&u.jid.to_string()))
+                {
+                    chat.status = Some(if u.action.muted.unwrap_or(false) {
+                        "muted".to_string()
+                    } else {
+                        "".to_string()
+                    });
+                    let _ = tx.send(BackendEvent::ChatUpdated(chat.clone()));
+                }
+            }
+            Event::PinUpdate(u) => {
+                let mut state = state.write().await;
+                if let Some(chat) = state
+                    .chats
+                    .iter_mut()
+                    .find(|c| c.id == ChatId::jid_to_chat_id(&u.jid.to_string()))
+                {
+                    chat.fixed = u.action.pinned.unwrap_or(false);
+                    let _ = tx.send(BackendEvent::ChatUpdated(chat.clone()));
+                }
+            }
+            Event::ArchiveUpdate(u) => {
+                let mut state = state.write().await;
+                if let Some(chat) = state
+                    .chats
+                    .iter_mut()
+                    .find(|c| c.id == ChatId::jid_to_chat_id(&u.jid.to_string()))
+                {
+                    chat.status = Some(if u.action.archived.unwrap_or(false) {
+                        "archived".to_string()
+                    } else {
+                        "".to_string()
+                    });
+                    let _ = tx.send(BackendEvent::ChatUpdated(chat.clone()));
+                }
+            }
+            Event::MarkChatAsReadUpdate(u) => {
+                let mut state = state.write().await;
+                if let Some(chat) = state
+                    .chats
+                    .iter_mut()
+                    .find(|c| c.id == ChatId::jid_to_chat_id(&u.jid.to_string()))
+                {
+                    chat.unread = false;
+                    chat.unread_count = 0;
+                    let _ = tx.send(BackendEvent::UnreadUpdated {
+                        chat: chat.id.clone(),
+                        unread: false,
+                        unread_count: 0,
+                    });
+                }
+            }
+            other => {
+                debug!(
+                    "Unhandled WhatsApp event: {:?}, {:?}",
+                    std::mem::discriminant(other),
+                    other
+                );
+            }
+        }
+    }
+
+    fn current_client(&self) -> Arc<Client> {
         self.client.clone()
     }
 
@@ -416,89 +843,355 @@ impl WhatsAppMessenger {
     }
 }
 
-async fn handle_history_sync(
-    hs: &wa::HistorySync,
-    state: &SharedState,
-    tx: &broadcast::Sender<BackendEvent>,
-) {
-    let mut state = state.write().await;
+impl WhatsAppState {
+    /// Restore a previously persisted account snapshot (chats, history,
+    /// pushnames) so a cold restart does not start with an empty chat list or
+    /// empty history. Missing/corrupt cache falls back to a fresh state.
+    fn load_from(cache_path: &str) -> Self {
+        match std::fs::read_to_string(cache_path) {
+            Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
+            Err(_) => Self::default(),
+        }
+    }
 
-    for conversation in hs.conversations.iter() {
-        let chat = ChatId::WhatsApp(conversation.id.clone());
-        let contact_name = conversation
-            .name
-            .clone()
-            .filter(|n| !n.trim().is_empty())
-            .unwrap_or_else(|| conversation.id.clone());
-        let unread_count = conversation.unread_count.unwrap_or(0) as i32;
-
-        match state.chats.iter_mut().find(|c| c.id == chat) {
-            Some(c) => {
-                c.contact_name = contact_name.clone();
-                c.unread_count = unread_count;
-                c.unread = unread_count > 0;
+    /// Persist the account snapshot to the JSON cache. Best-effort:
+    /// a failure only logs (the next successful save retries) and never aborts ingestion.
+    fn save_to(&self, cache_path: &PathBuf) {
+        let raw = match serde_json::to_string_pretty(self) {
+            Ok(raw) => raw,
+            Err(e) => {
+                warn!("Failed to serialize WA state: {e}");
+                return;
             }
-            None => state.chats.push(Chat {
-                id: chat.clone(),
-                contact_name: contact_name.clone(),
+        };
+
+        if let Some(parent) = std::path::Path::new(cache_path).parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            warn!("Failed to create WA cache dir: {e}");
+            return;
+        }
+
+        if let Err(e) = std::fs::write(cache_path, raw) {
+            warn!(
+                "Failed to write WA cache {}: {e}",
+                cache_path.to_string_lossy()
+            );
+        }
+    }
+
+    /// Insert or update the sidebar entry for `chat` from a freshly normalized
+    /// message, bumping preview and unread state. Used by the live
+    /// `Event::Messages` path.
+    fn upsert_chat_from_message(&mut self, chat: ChatId, msg: &Message) {
+        let preview = preview_line(&msg.sender, &msg.text, msg.from_me);
+
+        match self.chats.iter_mut().find(|c| c.id == chat) {
+            Some(c) => {
+                c.last_message = Some(preview);
+
+                if !msg.from_me {
+                    c.unread = true;
+                    c.unread_count += 1;
+                }
+            }
+            None => {
+                let sender = if msg.from_me {
+                    "You".to_string()
+                } else {
+                    msg.sender.clone()
+                };
+
+                let contact_name = if sender.is_empty() || sender == "Unknown" {
+                    match &chat {
+                        ChatId::WhatsApp(jid) => Jid::from_str(&jid)
+                            .map(|j| j.user_base().to_string())
+                            .unwrap_or_else(|_| jid.clone()),
+                        _ => "Unknown".to_string(),
+                    }
+                } else {
+                    sender
+                };
+
+                self.chats.push(Chat {
+                    id: chat.clone(),
+                    contact_name,
+                    last_message: Some(preview),
+                    unread: !msg.from_me,
+                    unread_count: if msg.from_me { 0 } else { 1 },
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
+    /// Upsert the given conversation into the sidebar using history-sync
+    /// metadata (name, unread, pinned). Preserves any newer `last_message` set
+    /// by live data. Conversations that are not really chats on the phone (see
+    /// [`should_skip_conversation`]) are not inserted.
+    fn upsert_conversation(&mut self, conv: &wa::Conversation) {
+        if let Some(reason) = should_skip_conversation(conv) {
+            debug!("WA skipping conversation id={:?} reason={reason}", &conv.id);
+            return;
+        }
+
+        let chat = ChatId::jid_to_chat_id(&conv.id.to_string());
+        let (contact_name, verified) = resolve_conversation_name(
+            conv,
+            &self.pushnames,
+            &self.usync_names,
+            &self.usync_verified,
+        );
+
+        let unread_count = conv.unread_count.unwrap_or(0) as i32;
+        let fixed = conv.pinned.unwrap_or(0) > 0;
+
+        let exists = self.chats.iter().any(|c| c.id == chat);
+        let name_for_log = contact_name.clone();
+
+        match self.chats.iter_mut().find(|c| c.id == chat) {
+            Some(c) => {
+                c.contact_name = contact_name;
+                c.verified = verified;
+                c.unread_count = unread_count
+                    .max(c.unread_count)
+                    .max(if c.unread { 1 } else { 0 });
+                c.unread = unread_count > 0 || c.unread;
+                c.fixed = fixed;
+            }
+            None => self.chats.push(Chat {
+                id: chat,
+                contact_name,
                 unread: unread_count > 0,
                 unread_count,
+                fixed,
+                verified,
                 ..Default::default()
             }),
         }
+        debug!(
+            "WA upsert_conversation id={:?} name={:?} existed={}",
+            &conv.id, name_for_log, exists,
+        );
+    }
+
+    /// Refresh the `last_message` preview for a chat from its newest stored
+    /// history message (used by history sync after ingestion).
+    fn refresh_preview(&mut self, chat: &ChatId) {
+        let preview = self
+            .history
+            .get(chat)
+            .and_then(|h| h.iter().max_by_key(|m| m.timestamp))
+            .map(|lm| preview_line(&lm.sender, &lm.text, lm.from_me));
+
+        if let Some(c) = self.chats.iter_mut().find(|c| c.id == *chat) {
+            c.last_message = preview;
+        }
+    }
+}
+
+/// Whether a history-sync `Conversation` record is not actually a chat on the
+/// phone and should be excluded from the chat list.
+///
+/// A row that is flagged on the primary as archived / read-only / etc. is
+/// still a real thread; only threads the primary itself no longer presents as
+/// chats are dropped here. The "never-started LID" case catches ghost rows the
+/// primary syncs without any thread metadata (no first/last timestamp, no
+/// peer phone number): they are not chats one opened.
+fn should_skip_conversation(conv: &wa::Conversation) -> Option<&'static str> {
+    if conv.is_parent_group.unwrap_or(false) {
+        return Some("parent community group (no direct chat)");
+    }
+
+    if conv.is_marketing_message_thread.unwrap_or(false) {
+        return Some("marketing message thread");
+    }
+
+    if conv.pnh_duplicate_lid_thread.unwrap_or(false) {
+        return Some("pnh duplicate lid thread");
+    }
+
+    if conv.suspended.unwrap_or(false) {
+        return Some("suspended conversation");
+    }
+
+    if conv.terminated.unwrap_or(false) {
+        return Some("terminated conversation");
+    }
+
+    // TODO: hide archived chats from the main list once the TUI has an
+    // Archived section; until then they stay visible to match the phone.
+    if conv.read_only.unwrap_or(false) {
+        return Some("read-only (left/declined) conversation");
+    }
+
+    let is_lid = conv.id.ends_with("@lid");
+    let never_lid_thread = is_lid
+        && conv.pn_jid.is_none()
+        && conv.conversation_timestamp.is_none()
+        && conv.unread_count.is_none();
+    if never_lid_thread {
+        // LID-only row with no thread activity at all: the phone syncs it as a
+        // ghost (a contact seen in groups, an account_id never opened).
+        return Some("lid chat never started (ghost row)");
+    }
+
+    None
+}
+
+/// Remove a chat (and its history + stanza index) from the shared state.
+async fn remove_chat(state: &SharedState, jid: &Jid) -> Option<Chat> {
+    let mut state = state.write().await;
+    let chat_id = ChatId::jid_to_chat_id(&jid.to_string());
+    let removed = state
+        .chats
+        .iter()
+        .position(|c| c.id == chat_id)
+        .map(|i| state.chats.remove(i));
+    state.history.remove(&chat_id);
+    state.by_stanza_id.retain(|_, (c, _)| c != &chat_id);
+    removed
+}
+
+async fn handle_history_sync(hs: &HistorySync, state: &SharedState, tx: &Sender<BackendEvent>) {
+    let mut state = state.write().await;
+
+    if state.sync_seen_at.is_none() {
+        state.sync_seen_at = Some(now());
+    }
+
+    debug!(
+        "WA handle_history_sync: {} conversations, {} pushnames",
+        hs.conversations.len(),
+        hs.pushnames.len(),
+    );
+
+    // Index the push names so both conversation and per-message resolutions can
+    // reach them. Newer syncs overwrite stale entries keyed by the same JID.
+    for pn in hs.pushnames.iter() {
+        if let (Some(id), Some(name)) = (pn.id.as_deref(), pn.pushname.as_deref())
+            && !name.trim().is_empty()
+        {
+            state.pushnames.insert(id.to_string(), name.to_string());
+        }
+    }
+
+    for conversation in hs.conversations.iter() {
+        let chat = ChatId::jid_to_chat_id(&conversation.id.to_string());
+
+        state.upsert_conversation(conversation);
 
         let mut new_messages: Vec<(String, Message)> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
 
+        debug!(
+            "WA conversation id={:?} name={:?} messages={} unread={:?} pinned={:?}",
+            &conversation.id,
+            resolve_conversation_name(
+                conversation,
+                &state.pushnames,
+                &state.usync_names,
+                &state.usync_verified,
+            )
+            .0,
+            conversation.messages.len(),
+            conversation.unread_count,
+            conversation.pinned,
+        );
+
+        // Collect messages (WhatsApp may stream them newest-first or across
+        // chunks); chronological order is restored below by timestamp.
         for history in conversation.messages.iter() {
             let Some(web) = history.message.as_option() else {
                 continue;
             };
-
-            let Some(stanza_id) = web.key.as_option().and_then(|k| k.id.clone()) else {
+            let Some(key) = web.key.as_option() else {
                 continue;
             };
-
+            let Some(stanza_id) = key.id.as_deref() else {
+                continue;
+            };
             let Some(msg) = web.message.as_option() else {
                 continue;
             };
 
+            // Dedupe within this sync chunk (status V3, repeats, etc.).
+            if !seen.insert(stanza_id.to_string()) {
+                continue;
+            }
+
             let already = state
                 .history
                 .get(&chat)
-                .map(|h| h.iter().any(|m| &*m.message_id == stanza_id.as_str()))
+                .map(|h| h.iter().any(|m| &*m.message_id == stanza_id))
                 .unwrap_or(false);
 
             if already {
                 continue;
             }
 
-            let from_me = web
-                .key
-                .as_option()
-                .map(|k| k.from_me.unwrap_or(false))
-                .unwrap_or(false);
+            let from_me = key.from_me.unwrap_or(false);
+            let sender_jid = key
+                .participant
+                .as_deref()
+                .and_then(|p| Jid::from_str(p).ok())
+                .unwrap_or_else(|| {
+                    // Own messages and one-to-one chats are authored by the chat
+                    // itself; the per-message participant slot is absent.
+                    Jid::from_str(&conversation.id)
+                        .unwrap_or_else(|_| Jid::new(&conversation.id, Server::Pn))
+                });
 
-            let info = history_info(&conversation.id, from_me, conversation.name.as_ref());
+            let info = history_info(
+                &conversation.id,
+                stanza_id,
+                from_me,
+                &sender_jid,
+                web,
+                &state.pushnames,
+            );
 
-            let mut normalized = normalize_inbound(&info, msg, &state);
+            let mut normalized = to_senders_msg(
+                ChatId::jid_to_chat_id(&info.source.chat.to_string()),
+                &info,
+                msg,
+                &state,
+            );
             normalized.timestamp = web
                 .message_timestamp
                 .map(|ts| ts as i64)
                 .unwrap_or_else(now);
 
-            if normalized.text.is_empty() && normalized.media.is_none() {
+            if (normalized.text.is_empty() && normalized.media.is_none())
+                || (!from_me && normalized.sender == "Unknown")
+            {
                 continue;
             }
 
-            new_messages.push((stanza_id, normalized));
+            new_messages.push((stanza_id.to_string(), normalized));
         }
 
+        // Revert to chronological (oldest first) regardless of the order the
+        // sync chunk delivered them in. WhatsApp may stream a conversation
+        // newest-first or split across chunks; sorting by timestamp is the only
+        // order guarantee we need to expose to the TUI.
+        new_messages.sort_by_key(|(_, m)| m.timestamp);
+
+        // Only accept a history-sync message if we do not already hold a newer
+        // copy: older sync chunks must not overwrite live data.
         for (stanza_id, normalized) in new_messages {
+            let dup = state
+                .history
+                .get(&chat)
+                .map(|h| h.iter().any(|m| m.message_id == normalized.message_id))
+                .unwrap_or(false);
+            if dup {
+                continue;
+            }
             state.by_stanza_id.insert(
                 stanza_id.clone(),
                 (chat.clone(), normalized.message_id.clone()),
             );
-
             state
                 .history
                 .entry(chat.clone())
@@ -506,28 +1199,204 @@ async fn handle_history_sync(
                 .push(normalized);
         }
 
-        let last_message_text = state.history.get(&chat).and_then(|h| h.last()).map(|lm| {
-            format!(
-                "{}: {}",
-                if lm.from_me { "You" } else { &lm.sender },
-                lm.text
-            )
-        });
-
-        if let Some(c) = state.chats.iter_mut().find(|c| c.id == chat) {
-            c.last_message = last_message_text;
-        }
+        // Always finish with an up-to-date preview.
+        state.refresh_preview(&chat);
     }
+    let chats_total = state.chats.len();
+    let chats_snapshot = state.chats.clone();
     drop(state);
+
+    info!("WA handle_history_sync done: chats={}", chats_total);
+
+    // Publish the whole dialog list as a single snapshot so a large history
+    // sync is not flood-sent as hundreds of tiny ChatUpdated events over the
+    // bounded broadcast channel.
+    let _ = tx.send(BackendEvent::ChatList(chats_snapshot));
     let _ = tx.send(BackendEvent::Status("history synced".into()));
 }
 
-/// Minimal [`MessageInfo`] for messages recovered from a HistorySync conversation.
-fn history_info(chat: &str, from_me: bool, push_name: Option<&String>) -> MessageInfo {
-    let mut info = MessageInfo::default();
+/// One round of usync enrichment for 1:1 chats that still show a bare number or
+/// LID (the phone declined to sync a name for them via pushnames). Runs a
+/// single `is_on_whatsapp` batch for every candidate, stores the learned name
+/// (the peer's username, verified business name, or failing those the formatted
+/// phone number) under both the peer LID and PN keys, refreshes the cached chat
+/// rows, and persists the cache. Already-queried peers are skipped so a contact
+/// without a username/business name is not re-queried on every history sync.
+async fn enrich_chat_names(
+    client: &Arc<Client>,
+    state: &SharedState,
+    cache_path: &PathBuf,
+    tx: &Sender<BackendEvent>,
+) {
+    let candidates: Vec<Jid> = {
+        let st = state.read().await;
+        let own: Vec<String> = [client.pn(), client.lid()]
+            .into_iter()
+            .flatten()
+            .map(|j| j.to_non_ad_string())
+            .collect();
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for chat in st.chats.iter() {
+            let ChatId::WhatsApp(raw) = &chat.id else {
+                continue;
+            };
+            let Ok(jid) = Jid::from_str(raw) else {
+                continue;
+            };
+            if !jid.is_pn() && !jid.is_lid() {
+                continue;
+            }
+            let key = jid.to_non_ad_string();
+            if own.contains(&key)
+                || st.usync_names.contains_key(raw)
+                || st.usync_attempted.contains(raw)
+                || !seen.insert(key)
+            {
+                continue;
+            }
+            out.push(jid);
+        }
+        out
+    };
+    if candidates.is_empty() {
+        return;
+    }
+
+    debug!("WA usync enrichment: {}-chat batch", candidates.len());
+    let mut updated = false;
+    for chunk in candidates.chunks(100) {
+        match client.contacts().is_on_whatsapp(chunk).await {
+            Ok(results) => {
+                // Read the push-name cache once for the whole batch; the write
+                // lock is not held while awaiting the local LID→PN lookups below.
+                let pushnames = state.read().await.pushnames.clone();
+                let mut applied: Vec<(String, String, bool, Option<String>)> = Vec::new();
+
+                for result in results {
+                    let asked_key = result.jid.to_non_ad_string();
+                    let pn_key = result.pn_jid.as_ref().map(|p| p.to_non_ad_string());
+                    let mut name = result
+                        .username
+                        .as_deref()
+                        .filter(|u| !u.trim().is_empty())
+                        .map(|u| u.to_string())
+                        .or_else(|| {
+                            result
+                                .verified_name
+                                .as_ref()
+                                .and_then(|v| v.name.clone())
+                                .filter(|n| !n.trim().is_empty())
+                        })
+                        .or_else(|| {
+                            // No profile name: a LID-keyed chat still wins a
+                            // readable fallback when usync disclosed the peer's
+                            // phone number.
+                            result
+                                .pn_jid
+                                .as_ref()
+                                .filter(|_| result.jid.is_lid())
+                                .map(|pn| format_pn(pn.user_base()))
+                        });
+
+                    // usync hides the phone number of non-business 1:1 peers
+                    // (privacy), so a username-less LID chat gets nothing from
+                    // the server. Consult the client's local LID↔PN cache
+                    // instead — it is populated from past message traffic — and
+                    // fall back to the formatted number (or a push name when
+                    // one happens to be cached under that PN).
+                    if name.is_none() && result.jid.is_lid() {
+                        match client.get_lid_pn_entry(&result.jid).await {
+                            Ok(Some(entry)) => {
+                                name = Some(name_from_lid_pn(&entry.phone_number, &pushnames));
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                warn!("WA LID→PN lookup failed for {asked_key}: {e}");
+                            }
+                        }
+                    }
+
+                    let Some(name) = name.filter(|n| !n.trim().is_empty()) else {
+                        continue;
+                    };
+
+                    let business = result.is_business && result.verified_name.is_some();
+                    applied.push((asked_key, name, business, pn_key));
+                }
+
+                let mut st = state.write().await;
+                for (asked_key, name, business, pn_key) in applied {
+                    st.usync_attempted.insert(asked_key.clone());
+                    let mut keys = vec![asked_key];
+                    if let Some(pn_key) = pn_key {
+                        keys.push(pn_key);
+                    }
+                    for key in &keys {
+                        st.usync_names.insert(key.clone(), name.clone());
+                        if business {
+                            st.usync_verified.insert(key.clone());
+                        }
+                    }
+                    for key in &keys {
+                        if let Some(chat) = st
+                            .chats
+                            .iter_mut()
+                            .find(|c| matches!(&c.id, ChatId::WhatsApp(raw) if raw == key))
+                        {
+                            chat.contact_name = name.clone();
+                            chat.verified = business;
+                        }
+                    }
+                }
+                updated = true;
+            }
+            Err(err) => {
+                warn!(
+                    "WA usync name enrichment failed for {} JIDs: {err}",
+                    chunk.len(),
+                );
+            }
+        }
+    }
+    if updated {
+        // Persist the learned names and immediately republish the dialog list
+        // so the running TUI refreshes without waiting for the next history
+        // sync (a cold start would otherwise keep showing cached bare JIDs
+        // until a sync happens to re-announce the chats).
+        let chats_snapshot = state.read().await.chats.clone();
+        state.read().await.save_to(cache_path);
+        let _ = tx.send(BackendEvent::ChatList(chats_snapshot));
+        let _ = tx.send(BackendEvent::Status("names updated".into()));
+        info!("WA usync name enrichment finished");
+    }
+}
+
+/// Minimal [`MessageInfo`] for messages recovered from a HistorySync
+/// conversation. Sets the authoritative per-message push name and author JID so
+/// group senders render with their contact name rather than the group title.
+fn history_info(
+    chat: &str,
+    stanza_id: &str,
+    from_me: bool,
+    sender_jid: &Jid,
+    web: &wa::WebMessageInfo,
+    pushnames: &HashMap<String, String>,
+) -> MessageInfo {
+    let mut info = MessageInfo {
+        id: stanza_id.into(),
+        ..Default::default()
+    };
+
     info.source.chat = Jid::from_str(chat).unwrap_or_else(|_| Jid::new(chat, Server::Pn));
     info.source.is_from_me = from_me;
-    info.push_name = push_name.cloned().unwrap_or_default();
+    info.source.sender = sender_jid.clone();
+    info.push_name = resolve_sender_name(
+        web.push_name.as_deref().unwrap_or_default(),
+        sender_jid,
+        pushnames,
+    )
+    .into();
     info
 }
 
@@ -543,6 +1412,7 @@ impl Messenger for WhatsAppMessenger {
 
     async fn chats(&self) -> Result<Vec<Chat>, BackendError> {
         let state = self.state.read().await;
+        debug!("WA chats() returning {} chats", state.chats.len());
         Ok(state.chats.clone())
     }
 
@@ -558,20 +1428,30 @@ impl Messenger for WhatsAppMessenger {
 
         let client = self.current_client();
         let _ = client.mark_as_read(&jid, None, &[]).await;
-        let mut state = self.state.write().await;
 
+        let mut state = self.state.write().await;
         for c in state.chats.iter_mut() {
             if c.id == *chat {
                 c.unread = false;
                 c.unread_count = 0;
             }
         }
+        drop(state);
+
+        let _ = self.tx.send(BackendEvent::UnreadUpdated {
+            chat: chat.clone(),
+            unread: false,
+            unread_count: 0,
+        });
         Ok(())
     }
 
     async fn history(&self, chat: &ChatId) -> Result<Vec<Message>, BackendError> {
         let state = self.state.read().await;
-        let messages = state.history.get(chat).cloned().unwrap_or_default();
+        // The cache is kept oldest-to-newest; re-sort defensively by timestamp so
+        // the TUI always renders chronological order regardless of ingest path.
+        let mut messages = state.history.get(chat).cloned().unwrap_or_default();
+        messages.sort_by_key(|m| m.timestamp);
         Ok(messages)
     }
 
@@ -796,5 +1676,564 @@ impl Messenger for WhatsAppMessenger {
         self.check_logged_in().await?;
         self.current_client().disconnect().await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use whatsapp_rust::prelude::MessageField;
+
+    fn pn(num: &str) -> Jid {
+        Jid::pn(num)
+    }
+
+    fn text_message(text: &str) -> wa::Message {
+        wa::Message::text(text.to_string())
+    }
+
+    fn msg_info(chat: &Jid, sender: &Jid, push_name: &str, id: &str, from_me: bool) -> MessageInfo {
+        let mut info = MessageInfo::default();
+        info.id = id.into();
+        info.source.chat = chat.clone();
+        info.source.sender = sender.clone();
+        info.source.is_from_me = from_me;
+        info.push_name = push_name.into();
+        info.timestamp = chrono::Utc.timestamp_opt(1000, 0).unwrap();
+        info
+    }
+
+    /// Build a HistorySync message record mirroring the shape the bot decodes.
+    fn web_msg(
+        chat: &str,
+        participant: Option<&str>,
+        id: &str,
+        ts: u64,
+        from_me: bool,
+        push_name: &str,
+        text: &str,
+    ) -> wa::HistorySyncMsg {
+        wa::HistorySyncMsg {
+            message: MessageField::some(wa::WebMessageInfo {
+                key: MessageField::some(wa::MessageKey {
+                    id: Some(id.to_string()),
+                    remote_jid: Some(chat.to_string()),
+                    from_me: Some(from_me),
+                    participant: participant.map(str::to_string),
+                }),
+                message: MessageField::some(wa::Message::text(text.to_string())),
+                message_timestamp: Some(ts),
+                push_name: Some(push_name.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn conversation(id: &str, messages: Vec<wa::HistorySyncMsg>) -> wa::Conversation {
+        wa::Conversation {
+            id: id.to_string(),
+            messages,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn skip_filter_drops_ghost_lid_rows() {
+        let ghost = wa::Conversation {
+            id: "255202829570287@lid".to_string(),
+            ..Default::default()
+        };
+        assert!(
+            should_skip_conversation(&ghost).is_some(),
+            "never-started LID row with no pn is a ghost"
+        );
+
+        // A real LID chat has thread metadata and/or a peer phone number.
+        let real_lid = wa::Conversation {
+            id: "255202829570287@lid".to_string(),
+            pn_jid: Some("15550000001@s.whatsapp.net".to_string()),
+            ..Default::default()
+        };
+        assert!(should_skip_conversation(&real_lid).is_none());
+
+        let real_pn = wa::Conversation {
+            id: "15550000002@s.whatsapp.net".to_string(),
+            ..Default::default()
+        };
+        assert!(should_skip_conversation(&real_pn).is_none());
+
+        // A group the account left (read_only) is not a chat anymore.
+        let left_group = wa::Conversation {
+            id: "111222333@g.us".to_string(),
+            read_only: Some(true),
+            ..Default::default()
+        };
+        assert!(should_skip_conversation(&left_group).is_some());
+
+        // A live joined group is kept.
+        let joined_group = wa::Conversation {
+            id: "111222333@g.us".to_string(),
+            read_only: Some(false),
+            ..Default::default()
+        };
+        assert!(should_skip_conversation(&joined_group).is_none());
+
+        // pnh duplicate / marketing / suspended / parent community are junk.
+        for conv in [
+            wa::Conversation {
+                id: "255202829570287@lid".to_string(),
+                pnh_duplicate_lid_thread: Some(true),
+                ..Default::default()
+            },
+            wa::Conversation {
+                id: "15550000003@s.whatsapp.net".to_string(),
+                is_marketing_message_thread: Some(true),
+                ..Default::default()
+            },
+            wa::Conversation {
+                id: "15550000003@s.whatsapp.net".to_string(),
+                suspended: Some(true),
+                ..Default::default()
+            },
+        ] {
+            assert!(should_skip_conversation(&conv).is_some());
+        }
+    }
+
+    #[test]
+    fn lid_conversation_resolves_name_via_pn_jid() {
+        let mut pushnames = HashMap::new();
+        pushnames.insert(
+            "15550000001@s.whatsapp.net".to_string(),
+            "Alice".to_string(),
+        );
+        let empty = HashMap::new();
+        let no_verified = HashSet::new();
+
+        // LID-keyed thread; the contact name must come from the PN pushname.
+        let lid = wa::Conversation {
+            id: "255202829570287@lid".to_string(),
+            pn_jid: Some("15550000001@s.whatsapp.net".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_conversation_name(&lid, &pushnames, &empty, &no_verified),
+            ("Alice".to_string(), false),
+            "LID chat resolves through pn_jid"
+        );
+
+        // PN-keyed thread without a name/display_name falls back to pushname.
+        let pn_chat = wa::Conversation {
+            id: "15550000001@s.whatsapp.net".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_conversation_name(&pn_chat, &pushnames, &empty, &no_verified),
+            ("Alice".to_string(), false)
+        );
+
+        // A LID thread with no PN, no pushname and no usync name now falls
+        // back to the formatted phone number when usync supplied it.
+        let mut usync = HashMap::new();
+        usync.insert(
+            "169509608489037@lid".to_string(),
+            "+55 11 9509-6084".to_string(),
+        );
+        let lid_learned = wa::Conversation {
+            id: "169509608489037@lid".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_conversation_name(&lid_learned, &pushnames, &usync, &no_verified),
+            ("+55 11 9509-6084".to_string(), false)
+        );
+
+        // A verified business peer: name resolves from usync with verified=true.
+        usync.insert(
+            "5516992499381@s.whatsapp.net".to_string(),
+            "ACME Bots".to_string(),
+        );
+        let mut verified = HashSet::new();
+        verified.insert("5516992499381@s.whatsapp.net".to_string());
+        let biz = wa::Conversation {
+            id: "109818203390040@lid".to_string(),
+            pn_jid: Some("5516992499381@s.whatsapp.net".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_conversation_name(&biz, &pushnames, &usync, &verified),
+            ("ACME Bots".to_string(), true),
+            "usync entry found via pn_jid overrides the raw LID"
+        );
+
+        // A LID thread with no PN, no pushname, no usync name and no phone
+        // fallback keeps the bare LID.
+        let bare = wa::Conversation {
+            id: "255202829570287@lid".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_conversation_name(&bare, &pushnames, &empty, &no_verified),
+            ("255202829570287".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn format_pn_matches_whatsapp_layout() {
+        assert_eq!(format_pn("5516992499381"), "+55 16 99249-9381");
+        assert_eq!(format_pn("15551234567"), "+15 55 123-4567");
+        assert_eq!(format_pn("123"), "+123");
+        assert_eq!(format_pn("169509608489037@lid"), "+16 95 0960848-9037");
+    }
+
+    #[test]
+    fn name_from_lid_pn_formats_numbers_for_lid_keyed_chats() {
+        // Real LID↔PN mappings learned locally from message traffic, with no
+        // push name cached: the formatted number must be the fallback so a
+        // LID-keyed chat never shows as a bare LID.
+        let empty = HashMap::new();
+        let cases = [
+            ("5511974186171", "+55 11 97418-6171"),
+            ("5519996739798", "+55 19 99673-9798"),
+            ("5511953041920", "+55 11 95304-1920"),
+            ("553285061750", "+55 32 8506-1750"),
+        ];
+        for (pn, expected) in cases {
+            assert_eq!(name_from_lid_pn(pn, &empty), expected, "for {pn}");
+        }
+    }
+
+    #[test]
+    fn name_from_lid_pn_prefers_synced_pushname() {
+        let mut pushnames = HashMap::new();
+        pushnames.insert(
+            "5511953041920@s.whatsapp.net".to_string(),
+            "Leonardo Lima".to_string(),
+        );
+        assert_eq!(
+            name_from_lid_pn("5511953041920", &pushnames),
+            "Leonardo Lima"
+        );
+    }
+
+    #[test]
+    fn chat_id_drops_device_qualifier() {
+        let jids = [
+            Jid::from_str("15551234567@s.whatsapp.net").unwrap(),
+            pn("15551234567").with_device(7),
+            pn("15551234567"),
+        ];
+        let expected = ChatId::WhatsApp("15551234567@s.whatsapp.net".to_string());
+        for jid in &jids {
+            assert_eq!(
+                ChatId::jid_to_chat_id(&jid.to_string()),
+                expected,
+                "for {jid}"
+            );
+        }
+    }
+
+    #[test]
+    fn chat_id_from_str_normalizes_group() {
+        let id = ChatId::jid_to_chat_id("123456789@g.us");
+        assert_eq!(id, ChatId::WhatsApp("123456789@g.us".to_string()));
+        // A non-parseable string is preserved rather than dropped.
+        assert_eq!(
+            ChatId::jid_to_chat_id("garbage-not-a-jid"),
+            ChatId::WhatsApp("garbage-not-a-jid".to_string())
+        );
+    }
+
+    #[test]
+    fn sender_uses_push_name_then_cache_then_jid() {
+        let sender = pn("15550000001");
+        let mut pushnames = HashMap::new();
+        pushnames.insert(
+            "15550000001@s.whatsapp.net".to_string(),
+            "Cached Name".to_string(),
+        );
+
+        // 1. Message push name wins.
+        assert_eq!(resolve_sender_name("Alice", &sender, &pushnames), "Alice");
+        // 2. Falls back to the push-name cache.
+        assert_eq!(resolve_sender_name("", &sender, &pushnames), "Cached Name");
+        // 3. Falls back to the bare JID user part.
+        let empty = HashMap::new();
+        assert_eq!(resolve_sender_name("", &sender, &empty), "15550000001");
+    }
+
+    #[test]
+    fn normalize_inbound_detects_from_me_and_unknown() {
+        let state = WhatsAppState::default();
+        let chat = pn("15551234567");
+        let info = msg_info(&chat, &chat, "Alice", "stanza-1", false);
+        let msg = to_senders_msg(
+            ChatId::jid_to_chat_id(&chat.to_string()),
+            &info,
+            &text_message("hello"),
+            &state,
+        );
+        assert_eq!(msg.sender, "Alice");
+        assert!(!msg.from_me);
+        assert_eq!(
+            msg.chat,
+            ChatId::WhatsApp("15551234567@s.whatsapp.net".to_string())
+        );
+        assert!(msg.msg_actions.contains(&MessageAction::Reply));
+        assert!(!msg.msg_actions.contains(&MessageAction::Edit));
+
+        let mine = msg_info(&chat, &chat, "", "stanza-2", true);
+        let m = to_senders_msg(
+            ChatId::jid_to_chat_id(&chat.to_string()),
+            &mine,
+            &text_message("hi"),
+            &state,
+        );
+        assert_eq!(m.sender, "You");
+        assert!(m.from_me);
+        assert!(m.msg_actions.contains(&MessageAction::Edit));
+        assert!(m.msg_actions.contains(&MessageAction::Delete));
+    }
+
+    #[test]
+    fn own_chat_id_rewrites_self_lid_messages_to_own_pn() {
+        let own_pn = Jid::pn("15551234567");
+        let own_lid = Jid::lid("96018372800539");
+
+        // Self message keyed by our own LID -> own PN chat.
+        let lid_chat = ChatId::WhatsApp("96018372800539@lid".to_string());
+        assert_eq!(
+            own_chat_id(Some(&own_lid), Some(&own_pn), lid_chat.clone(), true),
+            ChatId::WhatsApp("15551234567@s.whatsapp.net".to_string())
+        );
+
+        // A same-JID chat addressed to someone else (not from_me) is untouched.
+        let other_lid_chat = ChatId::WhatsApp("214082762317966@lid".to_string());
+        assert_eq!(
+            own_chat_id(Some(&own_lid), Some(&own_pn), other_lid_chat.clone(), false),
+            other_lid_chat
+        );
+
+        // From-me message in a personal chat is left alone.
+        let dm_chat = ChatId::WhatsApp("15559998877@s.whatsapp.net".to_string());
+        assert_eq!(
+            own_chat_id(Some(&own_lid), Some(&own_pn), dm_chat.clone(), true),
+            dm_chat
+        );
+
+        // Missing own credentials fall back to the original chat.
+        assert_eq!(own_chat_id(None, None, lid_chat.clone(), true), lid_chat);
+    }
+
+    #[test]
+    fn whatsapp_state_round_trips_through_json() {
+        let mut state = WhatsAppState::default();
+        state.chats.push(Chat {
+            id: ChatId::WhatsApp("15551234567@s.whatsapp.net".to_string()),
+            contact_name: "Self".to_string(),
+            ..Default::default()
+        });
+        state.history.insert(
+            ChatId::WhatsApp("15551234567@s.whatsapp.net".to_string()),
+            vec![to_senders_msg(
+                ChatId::jid_to_chat_id(&pn("15551234567").to_string()),
+                &msg_info(&pn("15551234567"), &pn("15551234567"), "Self", "s-1", true),
+                &text_message("hello"),
+                &state,
+            )],
+        );
+        state.pushnames.insert(
+            "15559998877@s.whatsapp.net".to_string(),
+            "Alice".to_string(),
+        );
+
+        let encoded = serde_json::to_string(&state).unwrap();
+        let restored: WhatsAppState = serde_json::from_str(&encoded).unwrap();
+        let encoded_again = serde_json::to_string(&restored).unwrap();
+
+        assert_eq!(encoded_again, encoded);
+        assert_eq!(restored.chats.len(), 1);
+        assert_eq!(restored.history.len(), 1);
+        assert_eq!(
+            restored
+                .pushnames
+                .get("15559998877@s.whatsapp.net")
+                .unwrap(),
+            "Alice"
+        );
+        assert_eq!(
+            restored
+                .history
+                .get(&ChatId::WhatsApp("15551234567@s.whatsapp.net".to_string()))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn whatsapp_state_load_falls_back_on_tui_chats_schema() {
+        // `chats.json` historically held a bare Vec<Chat> (the TUI's
+        // persistence schema), which is incompatible with WhatsAppState.
+        // Loading it must never panic; it degrades to a fresh state so a cold
+        // restart can rebuild from sync + usync instead of churning on a
+        // mismatched file.
+        let path = std::env::temp_dir().join("senders_wa_tui_schema_test.json");
+        let foreign = serde_json::to_string(&[Chat {
+            id: ChatId::WhatsApp("5516993643032@s.whatsapp.net".to_string()),
+            contact_name: "Beatriz".to_string(),
+            ..Default::default()
+        }])
+        .unwrap();
+        std::fs::write(&path, foreign).unwrap();
+
+        let state = WhatsAppState::load_from(path.to_string_lossy().as_ref());
+        std::fs::remove_file(&path).ok();
+
+        assert!(state.chats.is_empty());
+        assert!(state.pushnames.is_empty());
+    }
+
+    #[tokio::test]
+    async fn history_sync_ingests_chats_oldest_to_newest_and_resolves_group_senders() {
+        let (tx, _rx) = broadcast::channel(128);
+        let state: SharedState = Arc::new(RwLock::new(WhatsAppState::default()));
+
+        // One-to-one chat with a saved name in `display_name` (name empty).
+        let dm_messages = vec![
+            web_msg(
+                "15550000002@s.whatsapp.net",
+                None,
+                "dm-1",
+                1000,
+                false,
+                "DmName",
+                "first",
+            ),
+            web_msg(
+                "15550000002@s.whatsapp.net",
+                None,
+                "dm-2",
+                1001,
+                true,
+                "own",
+                "reply",
+            ),
+        ];
+        let dm = wa::Conversation {
+            id: "15550000002@s.whatsapp.net".to_string(),
+            name: None,
+            display_name: Some("Dm Contact".to_string()),
+            messages: dm_messages,
+            pinned: Some(1),
+            unread_count: Some(3),
+            ..Default::default()
+        };
+
+        // Group chat: subject name, sender resolved from participant push name.
+        let group_messages = vec![
+            web_msg(
+                "111222333@g.us",
+                Some("15550000003@s.whatsapp.net"),
+                "g-1",
+                2000,
+                false,
+                "Bob",
+                "hey group",
+            ),
+            web_msg("111222333@g.us", None, "g-2", 2001, true, "own", "yes"),
+        ];
+        let group_conv = wa::Conversation {
+            id: "111222333@g.us".to_string(),
+            name: Some("My Group".to_string()),
+            messages: group_messages,
+            ..Default::default()
+        };
+
+        let pushnames = vec![wa::Pushname {
+            id: Some("15550000003@s.whatsapp.net".to_string()),
+            pushname: Some("Bob".to_string()),
+        }];
+
+        let hs = wa::HistorySync {
+            conversations: vec![dm, group_conv],
+            pushnames,
+            ..Default::default()
+        };
+
+        super::handle_history_sync(&hs, &state, &tx).await;
+        let s = state.read().await;
+
+        assert_eq!(s.chats.len(), 2);
+
+        let dm_chat = s
+            .chats
+            .iter()
+            .find(|c| c.id == ChatId::WhatsApp("15550000002@s.whatsapp.net".to_string()))
+            .unwrap();
+
+        assert_eq!(dm_chat.contact_name, "Dm Contact");
+        assert!(dm_chat.fixed, "pinned conversation should be marked fixed");
+        assert_eq!(dm_chat.unread_count, 3);
+        assert!(dm_chat.unread);
+        // Preview from the newest message.
+        assert_eq!(dm_chat.last_message.as_deref(), Some("You: reply"));
+
+        let group_chat = s
+            .chats
+            .iter()
+            .find(|c| c.id == ChatId::WhatsApp("111222333@g.us".to_string()))
+            .unwrap();
+        assert_eq!(group_chat.contact_name, "My Group");
+
+        // History oldest-to-newest (dm-1 before dm-2).
+        let dm_history = s
+            .history
+            .get(&ChatId::WhatsApp("15550000002@s.whatsapp.net".to_string()))
+            .unwrap();
+        let ids: Vec<_> = dm_history.iter().map(|m| m.message_id.0.clone()).collect();
+        assert_eq!(ids, vec!["dm-1".to_string(), "dm-2".to_string()]);
+
+        // Group message sender resolved to the participant's name, not the group title.
+        let group_history = s
+            .history
+            .get(&ChatId::WhatsApp("111222333@g.us".to_string()))
+            .unwrap();
+        let bob = group_history.iter().find(|m| !m.from_me).unwrap();
+        assert_eq!(bob.sender, "Bob");
+        assert_ne!(bob.sender, "My Group");
+    }
+
+    #[tokio::test]
+    async fn history_sync_deduplicates_and_skips_empty_messages() {
+        let (tx, _rx) = broadcast::channel(128);
+        let state: SharedState = Arc::new(RwLock::new(WhatsAppState::default()));
+        let chat_id = "15550000009@s.whatsapp.net";
+
+        // Two copies of the same stanza + one empty protocol record.
+        let messages = vec![
+            web_msg(chat_id, None, "dup-1", 1000, false, "Alice", "hello"),
+            web_msg(chat_id, None, "dup-1", 1000, false, "Alice", "hello"),
+            wa::HistorySyncMsg::default(),
+        ];
+        let hs = wa::HistorySync {
+            conversations: vec![conversation(chat_id, messages)],
+            pushnames: vec![],
+            ..Default::default()
+        };
+
+        super::handle_history_sync(&hs, &state, &tx).await;
+        let s = state.read().await;
+        let history = s
+            .history
+            .get(&ChatId::WhatsApp(chat_id.to_string()))
+            .unwrap();
+        assert_eq!(
+            history.len(),
+            1,
+            "duplicate + empty must collapse to one message"
+        );
     }
 }
