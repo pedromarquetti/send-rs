@@ -26,6 +26,7 @@ the future?) in one TUI app!
 - [ ] Ordered chat list - All chats, ordered by pinned/most recent.
 - [ ] Dedicated chatlist for each provider
 - [ ] Chat List/Message search.
+- [ ] Chat rename
 
 ## Configuration
 

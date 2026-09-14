@@ -20,13 +20,13 @@ grammers-client = "0.10"
 grammers-session = { version = "0.10", features = ["sqlite-storage"] }
 grammers-tl-types = "0.10"
 
-# BUG: whatsapp-rust's internal dep on whatsapp-rust-sqlite-storage forces
-# bundled-sqlite even with default-features = false on our direct dependency.
-# This conflicts with grammers-session's libsql-ffi at link time (duplicate
-# sqlite3 symbols). Re-enable when whatsapp-rust adds a no-bundled feature.
-# NOTE: This is a local fix that apparently works but needs to be tested 
-# whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", default-features = false, features = [
-whatsapp-rust = { path = "/home/phlm/Documents/programming/rust/whatsapp-rust", default-features = false, features = [
+# whatsapp-rust's `sqlite-storage` feature (upstream >= PR #1499) no longer
+# bundles SQLite by default: bundling moved to a separate `sqlite-storage-bundled`
+# feature. We keep `default-features = false` + `sqlite-storage` so the storage
+# links against system libsqlite3 and does NOT collide with grammers-session's
+# libsql-ffi at link time (duplicate sqlite3 symbols). Do NOT enable
+# `sqlite-storage-bundled`.
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", default-features = false, features = [
   "sqlite-storage",
   "tokio-transport",
   "tokio-runtime",
