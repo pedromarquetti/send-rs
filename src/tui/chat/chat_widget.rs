@@ -6,6 +6,7 @@ use ratatui::widgets::{
 use ratatui_textarea::TextArea;
 
 use crate::backend::Message;
+use crate::helpers::wrap_text;
 use crate::tui::chat::ChatState;
 use crate::tui::state::Focus;
 
@@ -114,20 +115,22 @@ impl StatefulWidget for ChatWidget<'_> {
             let scrollbar_col = columns[2];
 
             let max_lines = Some(5);
-            let item_heights: Vec<usize> = history
+
+            // Render each message once; the ListItem line count IS the item
+            // height, so the scrollbar and the list always agree.
+            let rendered: Vec<Vec<Line<'static>>> = history
                 .iter()
-                .map(|msg| message_line_count(msg, content.width, max_lines).0)
+                .map(|msg| message_lines(msg, content.width, max_lines))
                 .collect();
+
+            let item_heights: Vec<usize> = rendered.iter().map(Vec::len).collect();
 
             let total_lines: usize = item_heights.iter().sum();
 
             let visible = inner.height as usize;
             state.visible_page = visible;
 
-            let items: Vec<ListItem> = history
-                .iter()
-                .map(|msg| ListItem::new(message_lines(msg, content.width, max_lines)))
-                .collect();
+            let items: Vec<ListItem> = rendered.into_iter().map(ListItem::new).collect();
 
             let highlight = if self.focus == Focus::Chat {
                 match tag {
@@ -229,51 +232,6 @@ impl StatefulWidget for ChatWidget<'_> {
     }
 }
 
-/// Word-wraps a text line into chunks that fit within `max_width` characters.
-/// Words exceeding the limit are truncated and get `…` appended.
-pub(crate) fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
-    if max_width == 0 {
-        return vec![text.to_string()];
-    }
-
-    let words: Vec<&str> = text.split_whitespace().collect();
-
-    if words.is_empty() {
-        return vec![text.to_string()];
-    }
-
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-    for word in words {
-        if current.is_empty() {
-            if word.len() > max_width {
-                let truncated: String = word.chars().take(max_width.saturating_sub(1)).collect();
-                chunks.push(format!("{truncated}…"));
-            } else {
-                current = word.to_string();
-            }
-        } else if current.len() + 1 + word.len() <= max_width {
-            current.push(' ');
-            current.push_str(word);
-        } else {
-            chunks.push(std::mem::take(&mut current));
-            if word.len() > max_width {
-                let truncated: String = word.chars().take(max_width.saturating_sub(1)).collect();
-                chunks.push(format!("{truncated}…"));
-            } else {
-                current = word.to_string();
-            }
-        }
-    }
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    if chunks.is_empty() {
-        chunks.push(text.to_string());
-    }
-    chunks
-}
-
 /// Renders one message as one or more physical lines, word-wrapped to fit `width` columns.
 /// If `max_lines` is set, output is capped and a "Press Enter for full message…" hint is added.
 /// A reply indicator ("X replied") is rendered as a line above the message, and outgoing
@@ -329,6 +287,9 @@ fn message_lines(message: &Message, width: u16, max_lines: Option<usize>) -> Vec
 
     let header_width = head.len();
 
+    // A chunk is only "truncated" when word-wrapping had to cut a word short
+    // and append `…`. Merely soft-wrapping a multi-word line is not truncation:
+    // the full text is still in the list, so no hint line is warranted.
     let mut any_truncated = false;
     let mut text_lines = message.text.lines();
 
@@ -341,9 +302,8 @@ fn message_lines(message: &Message, width: u16, max_lines: Option<usize>) -> Vec
             } else {
                 wrap_text(first, available.max(1))
             };
-            if first.len() > first_chunks.first().map_or(0, |c| c.len()) {
-                any_truncated = true;
-            }
+
+            any_truncated = first_chunks.iter().any(|c| c.ends_with('…'));
             if let Some((first_chunk, rest)) = first_chunks.split_first() {
                 result.push(Line::from(vec![
                     Span::styled(head.clone(), header_style),
@@ -366,9 +326,7 @@ fn message_lines(message: &Message, width: u16, max_lines: Option<usize>) -> Vec
     for line in text_lines {
         let available = width.saturating_sub(2) as usize;
         let chunks = wrap_text(line, available);
-        if line.len() > chunks.first().map_or(0, |c| c.len()) {
-            any_truncated = true;
-        }
+        any_truncated |= chunks.iter().any(|c| c.ends_with('…'));
         for chunk in chunks {
             result.push(Line::from(Span::styled(chunk, body_style)));
         }
@@ -405,60 +363,6 @@ fn message_lines(message: &Message, width: u16, max_lines: Option<usize>) -> Vec
     // } else {
     //     result
     // }
-}
-
-/// Counts the number of visual lines a message occupies at a given width, accounting for
-/// word-wrap. Also indicates whether the message was truncated (for the hint line).
-fn message_line_count(message: &Message, width: u16, max_lines: Option<usize>) -> (usize, bool) {
-    let sender = if message.from_me {
-        "You".to_string()
-    } else {
-        message.sender.clone()
-    };
-    let head = format!("{sender} {}", format_timestamp(message.timestamp));
-    let header_width = head.len();
-    let wrap_width = width.saturating_sub(2) as usize;
-    let mut count = 0usize;
-    let mut any_truncated = false;
-
-    if message.reply_to_id.is_some() {
-        count += 1; // reply indicator line
-    }
-
-    let mut text_lines = message.text.lines();
-    match text_lines.next() {
-        Some(first) => {
-            let text_avail = wrap_width.saturating_sub(header_width + 2).max(1);
-            let chunks = wrap_text(first, text_avail);
-            if first.len() > chunks.first().map_or(0, |c| c.len()) {
-                any_truncated = true;
-            }
-            count += chunks.len().max(1);
-        }
-        None => {
-            count += 1;
-        }
-    }
-
-    for line in text_lines {
-        let chunks = wrap_text(line, wrap_width);
-        if line.len() > chunks.first().map_or(0, |c| c.len()) {
-            any_truncated = true;
-        }
-        count += chunks.len().max(1);
-    }
-
-    if any_truncated {
-        count += 1;
-    }
-
-    if let Some(max) = max_lines
-        && count > max
-    {
-        return (max + 1, true); // +1 for the hint line
-    }
-
-    (count, any_truncated)
 }
 
 /// Number of visual rows the Write box needs for the given text at `width` columns, counting
@@ -500,6 +404,7 @@ mod tests {
             message_id: "m".into(),
             chat: ChatId::Telegram(1),
             sender: "Alice".into(),
+            author_id: None,
             text: text.into(),
             timestamp: 0,
             from_me: false,
@@ -547,19 +452,33 @@ mod tests {
     }
 
     #[test]
-    fn message_line_count_single_line_message() {
+    fn message_height_matches_line_count_for_height_mapping() {
+        // The scrollbar height is the exact Line count from message_lines; the
+        // two must never disagree.
         let msg = message("hello");
-        // "Alice 01-01 00:00  hello" = ~25 chars, at width 80 → 1 line, no truncation
-        let (count, truncated) = message_line_count(&msg, 80, None);
-        assert_eq!(count, 1);
-        assert!(!truncated);
+        assert_eq!(message_lines(&msg, 80, None).len(), 1);
     }
 
     #[test]
-    fn message_line_count_multiline_message() {
-        let msg = message("line1\nline2\nline3");
-        let (count, _truncated) = message_line_count(&msg, 80, None);
-        assert!(count >= 3);
+    fn message_height_counts_reply_indicator_and_wrapped_lines() {
+        let mut msg = message("some words that get soft-wrapped at this narrow width");
+        msg.reply_to_id = Some("x".into());
+        let count = message_lines(&msg, 20, None).len();
+        let plain = message_lines(
+            &message("some words that get soft-wrapped at this narrow width"),
+            20,
+            None,
+        )
+        .len();
+        assert_eq!(count, plain + 1, "reply indicator adds exactly one line");
+    }
+
+    #[test]
+    fn message_height_caps_at_max_lines_with_hint() {
+        let msg = message("a\nb\nc\nd\ne\nf");
+        let lines = message_lines(&msg, 80, Some(5));
+        assert_eq!(lines.len(), 6, "5 content lines + the hint line");
+        assert!(lines.last().unwrap().to_string().contains("Press Enter"));
     }
 
     #[test]

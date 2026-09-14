@@ -44,6 +44,7 @@ enum UiEvent {
         chat: backend::Chat,
         generation: u64,
         result: Result<Vec<backend::Message>, backend::BackendError>,
+        status: Option<String>,
     },
     ChatList(
         Provider,
@@ -343,7 +344,8 @@ async fn run_app(
                             chat,
                             generation,
                             result,
-                        } => app.state.apply_chat_load(chat, generation, result),
+                            status,
+                        } => app.state.apply_chat_load(chat, generation, result, status),
                     UiEvent::ChatList(provider, result) => {
                         app.state.sidebar_sync_pending =
                             app.state.sidebar_sync_pending.saturating_sub(1);
@@ -438,6 +440,11 @@ impl App {
 
         let tx = self.tx.clone();
         self.chat_load_task = Some(tokio::spawn(async move {
+            // Subscribe to presence and read the current user status while the
+            // chat loads; WhatsApp only sends presence updates to chats it was
+            // asked to track, so asking here is what makes Online/Last Seen
+            // appear at all.
+            let status = messenger.status(&chat.id).await.unwrap_or(None);
             let result = match messenger.set_read(&chat.id).await {
                 Ok(()) => messenger.history(&chat.id).await,
                 Err(e) => Err(e),
@@ -446,6 +453,7 @@ impl App {
                 chat,
                 generation,
                 result,
+                status,
             });
         }));
     }

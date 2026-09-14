@@ -73,39 +73,6 @@ pub fn calc_height(msg: &str, width: u16, area: Rect, footer: bool) -> u16 {
         .min(area.height.saturating_sub(4))
 }
 
-/// Helper function for handling text rendering (Vec<Line> line wrappin)
-pub fn parse_text<'l>(lines: &mut Vec<Line<'l>>, text: String, width: usize) {
-    if !text.is_empty() {
-        for line in text.lines() {
-            if line.len() <= width {
-                lines.push(Line::from(line.to_string()));
-            } else {
-                let words: Vec<&str> = line.split_whitespace().collect();
-                let mut curr_line = String::new();
-
-                for word in words {
-                    if curr_line.len() + word.len() < width {
-                        if !curr_line.is_empty() {
-                            curr_line.push(' ');
-                        }
-                        curr_line.push_str(word);
-                    } else {
-                        if !curr_line.is_empty() {
-                            lines.push(Line::from(curr_line.clone()));
-                        }
-                        curr_line = word.to_string();
-                    }
-                }
-                if !curr_line.is_empty() {
-                    lines.push(Line::from(curr_line));
-                }
-            }
-        }
-    }
-
-    lines.push(Line::from(""));
-}
-
 /// Render a QR code payload as a monospace string suitable for a terminal.
 ///
 /// Uses the crate's [`qrcode::render::unicode::Dense1x2`] renderer, which packs
@@ -126,6 +93,54 @@ pub fn render_qr(payload: &str) -> String {
     }
 }
 
+/// Word-wraps a text line into chunks that fit within `max_width` characters.
+/// Words exceeding the limit are truncated and get `…` appended.
+pub fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
+    if max_width == 0 {
+        return vec![text.to_string()];
+    }
+
+    let words: Vec<&str> = text.split_whitespace().collect();
+
+    if words.is_empty() {
+        return vec![text.to_string()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+
+    for word in words {
+        let word_width = word.chars().count();
+        let fits = !current.is_empty() && current.chars().count() + 1 + word_width <= max_width;
+        if current.is_empty() {
+            if word_width > max_width {
+                let truncated: String = word.chars().take(max_width.saturating_sub(1)).collect();
+                chunks.push(format!("{truncated}…"));
+            } else {
+                current = word.to_string();
+            }
+        } else if fits {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            chunks.push(std::mem::take(&mut current));
+            if word_width > max_width {
+                let truncated: String = word.chars().take(max_width.saturating_sub(1)).collect();
+                chunks.push(format!("{truncated}…"));
+            } else {
+                current = word.to_string();
+            }
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    if chunks.is_empty() {
+        chunks.push(text.to_string());
+    }
+    chunks
+}
+
 #[cfg(test)]
 mod tests {
     use super::available_message_actions;
@@ -136,6 +151,7 @@ mod tests {
             message_id: MessageId::from("msg-1"),
             chat: ChatId::Myself,
             sender: if from_me { "You".into() } else { "Them".into() },
+            author_id: None,
             text: "hello".to_string(),
             timestamp: 0,
             from_me,

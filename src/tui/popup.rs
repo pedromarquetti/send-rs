@@ -2,8 +2,8 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Clear, Paragraph};
 
 use crate::backend::{Message, MessageAction};
-use crate::helpers::{calc_height, popup_area};
-use crate::tui::chat::chat_widget::{format_timestamp, wrap_text};
+use crate::helpers::{calc_height, popup_area, wrap_text};
+use crate::tui::chat::chat_widget::format_timestamp;
 use crate::tui::state::PopupState;
 
 #[derive(Debug, Clone)]

@@ -286,6 +286,12 @@ pub struct Message {
     pub message_id: MessageId,
     pub chat: ChatId,
     pub sender: String,
+    /// The author's raw provider-specific id (e.g. a WhatsApp participant LID).
+    /// Opaque to the UI; used to route per-author protocol actions such as
+    /// group read receipts. Providers that have no such id leave it unset.
+    #[serde(default)]
+    // TODO: check if this field can be merged with `sender`
+    pub author_id: Option<String>,
     pub text: String,
     pub timestamp: i64,
     pub from_me: bool,

@@ -62,6 +62,15 @@ struct WhatsAppState {
     /// (`state.chats` is non-empty even when no conversation sync ever lands).
     #[serde(default)]
     sync_seen_at: Option<i64>,
+    /// LID user-part -> phone-number user-part, learned from the client's local
+    /// LID↔PN cache (`Client::get_lid_pn_entry`). Lets live `@lid` messages and
+    /// conversations route to the phone-keyed chat row the user opens, and gives
+    /// LID senders a readable name.
+    #[serde(default)]
+    lid_pn: HashMap<String, String>,
+    /// Peer JID string -> (online, last_seen) learned from `Event::Presence`.
+    #[serde(default)]
+    presence: HashMap<String, (bool, Option<i64>)>,
 }
 
 fn message_actions(from_me: bool) -> Vec<MessageAction> {
@@ -95,6 +104,81 @@ fn own_chat_id(own_lid: Option<&Jid>, own_pn: Option<&Jid>, chat: ChatId, from_m
     }
 
     chat
+}
+
+/// Build the `@s.whatsapp.net` chat id for a phone-number user-part.
+fn pn_chat_id(pn_user: &str) -> ChatId {
+    ChatId::WhatsApp(Jid::pn(pn_user).to_non_ad_string())
+}
+
+/// Rewrite a `@lid` chat key to its phone-keyed twin when the local LID↔PN
+/// mapping knows the peer and the PN row already exists (the row the user
+/// opens). Peers never addressed by phone keep the LID key.
+fn fold_lid_key(key: &str, st: &WhatsAppState) -> ChatId {
+    let Ok(jid) = Jid::from_str(key) else {
+        return ChatId::WhatsApp(key.to_string());
+    };
+    if !jid.is_lid() {
+        return ChatId::WhatsApp(key.to_string());
+    }
+
+    let Some(pn_user) = st.lid_pn.get(jid.user_base()) else {
+        return ChatId::WhatsApp(key.to_string());
+    };
+
+    let pn_chat = pn_chat_id(pn_user);
+    if st.chats.iter().any(|c| c.id == pn_chat) {
+        pn_chat
+    } else {
+        ChatId::WhatsApp(key.to_string())
+    }
+}
+
+/// Canonicalize a chat key to the conversation row the TUI actually opens.
+///
+/// WhatsApp addresses 1:1 threads by LID on the wire, but the phone's history
+/// sync may key the same thread by the peer's phone number. A message or
+/// conversation that arrives under one form must land in the row the user is
+/// looking at, so a `@lid` chat is rewritten to its phone-keyed row when that
+/// row already exists. The mapping is learned from the client's local LID↔PN
+/// cache (and persisted) on first sight (offline callers pass `None` and only
+/// fold through what is already known); see [`fold_lid_key`] for the read-only
+/// side that never needs a client.
+async fn canonical_chat_id(
+    client: Option<&Arc<Client>>,
+    state: &SharedState,
+    chat: ChatId,
+) -> ChatId {
+    let ChatId::WhatsApp(raw) = &chat else {
+        return chat;
+    };
+    let Ok(jid) = Jid::from_str(raw) else {
+        return chat;
+    };
+    if !jid.is_lid() {
+        return chat;
+    }
+
+    let known = state
+        .read()
+        .await
+        .lid_pn
+        .contains_key(jid.user_base());
+    if !known {
+        let Some(client) = client else {
+            return chat;
+        };
+        let Ok(Some(entry)) = client.get_lid_pn_entry(&jid).await else {
+            return chat;
+        };
+        state.write().await.lid_pn.insert(
+            jid.user_base().to_string(),
+            entry.phone_number.to_string(),
+        );
+    }
+
+    let st = state.read().await;
+    fold_lid_key(raw, &st)
 }
 
 /// Convert [`WaMessage`] to [`MessageMedia`]
@@ -148,6 +232,7 @@ fn to_senders_msg(
             info.push_name.as_str(),
             &info.source.sender,
             &state.pushnames,
+            &state.lid_pn,
         )
     };
 
@@ -187,6 +272,7 @@ fn to_senders_msg(
         message_id: stanza_id.into(),
         chat,
         sender,
+        author_id: Some(info.source.sender.to_string()),
         text,
         timestamp: info.timestamp.timestamp(),
         from_me,
@@ -202,12 +288,15 @@ fn to_senders_msg(
 /// Resolve a human-readable sender name for an inbound message.
 ///
 /// Order: the message's own `push_name` (authoritative), then the push name
-/// cache for the author JID, then a bare JID fallback. `"Unknown"` is reserved
-/// for the truly unresolvable case so the TUI can keep a friendlier fallback.
+/// cache for the author JID. A LID author falls back to the phone-keyed push
+/// name / formatted number via the local LID↔PN mapping. `"Unknown"` is
+/// reserved for the truly unresolvable case so the TUI can keep a friendlier
+/// fallback.
 fn resolve_sender_name(
     push_name: &str,
     sender: &Jid,
     pushnames: &HashMap<String, String>,
+    lid_pn: &HashMap<String, String>,
 ) -> String {
     if !push_name.trim().is_empty() {
         return push_name.to_string();
@@ -221,6 +310,12 @@ fn resolve_sender_name(
         return name.clone();
     }
 
+    if sender.is_lid()
+        && let Some(pn_user) = lid_pn.get(sender.user_base())
+    {
+        return name_from_lid_pn(pn_user, pushnames);
+    }
+
     let bare = sender.user_base();
 
     if !bare.is_empty() {
@@ -231,7 +326,7 @@ fn resolve_sender_name(
 }
 
 /// Format a peer phone number the way WhatsApp does for contacts it has no
-/// name for: `5516992499381` -> `+55 16 99249-9381`. Non-numeric input (a bare
+/// name for: `15550000001` -> `+15 55 0000-0001`. Non-numeric input (a bare
 /// LID, a JID string) degrades to `+{digits}`.
 fn format_pn(pn: &str) -> String {
     let digits: String = pn.chars().filter(|c| c.is_ascii_digit()).collect();
@@ -487,6 +582,12 @@ impl WhatsAppMessenger {
 
         let client = bot.client();
 
+        // Heal chat rows split across LID/PN keys (older caches created one
+        // row per key) before the TUI can render them: one peer must never
+        // appear twice. Correct on a cold start too — at that point the LID↔PN
+        // mappings are still empty, so each cached LID row is resolved afresh.
+        merge_lid_duplicates(&client, &state, None, None).await;
+
         Ok(Self {
             client,
             bot: Arc::new(Mutex::new(Some(bot))),
@@ -604,8 +705,6 @@ impl WhatsAppMessenger {
                         continue;
                     }
 
-                    let mut state = state.write().await;
-
                     let chat = own_chat_id(
                         client.lid().as_ref(),
                         client.pn().as_ref(),
@@ -613,9 +712,21 @@ impl WhatsAppMessenger {
                         inbound.info.source.is_from_me,
                     );
 
+                    // Live messages are keyed by the peer's LID; fold to the
+                    // phone-keyed row the user opens before touching state.
+                    let chat = canonical_chat_id(Some(client), state, chat).await;
+
+                    // Resolve a LID author (group message) to a phone number
+                    // before the ingest names it; the lookup is async over the
+                    // client's sqlite and must stay outside the write lock.
+                    if !inbound.info.source.is_from_me {
+                        learn_lid_pn(client, &inbound.info.source.sender, state).await;
+                    }
+
+                    let mut state = state.write().await;
                     let msg = to_senders_msg(chat.clone(), &inbound.info, &inbound.message, &state);
 
-                    if (msg.text.is_empty() && msg.media.is_none()) || msg.sender == "Unknown" {
+                    if msg.text.is_empty() && msg.media.is_none() {
                         drop(state);
                         continue;
                     }
@@ -663,7 +774,7 @@ impl WhatsAppMessenger {
                             parsed.conversations.len(),
                             parsed.pushnames.len(),
                         );
-                        handle_history_sync(parsed, state, tx).await;
+                        handle_history_sync(parsed, Some(client), state, tx, cache_path).await;
                         state.read().await.save_to(cache_path);
 
                         // Backfill names the phone did not sync (pushnames) from
@@ -787,6 +898,69 @@ impl WhatsAppMessenger {
                     });
                 }
             }
+            Event::OfflineSyncPreview(p) => {
+                info!(
+                    "WA offline sync started: {} items ({} messages)",
+                    p.total, p.messages
+                );
+            }
+            Event::OfflineSyncInterrupted(i) => {
+                warn!(
+                    "WA offline sync interrupted: {}/{} items delivered",
+                    i.delivered, i.total
+                );
+            }
+            Event::OfflineSyncCompleted(c) => {
+                info!("WA offline sync completed: {} items", c.count);
+                // The drain replayed live messages straight into history; re-run
+                // name enrichment and republish the list so everything surfaced
+                // immediately even when the snapshot PDO fails to decompress.
+                let client = client.clone();
+                let state_for_enrich = state.clone();
+                let cache_path = cache_path.clone();
+                let tx_for_enrich = tx.clone();
+                tokio::spawn(async move {
+                    enrich_chat_names(&client, &state_for_enrich, &cache_path, &tx_for_enrich)
+                        .await;
+                });
+                let st = state.read().await;
+                let snapshot = sorted_chat_snapshot(&st);
+                drop(st);
+                let _ = tx.send(BackendEvent::ChatList(snapshot));
+            }
+            Event::Presence(u) => {
+                // Only track peers that have a chat row; unknown LIDs would
+                // otherwise grow the map without bounds.
+                let online = !u.unavailable;
+                let last_seen = u.last_seen.map(|ts| ts.timestamp());
+                let label = presence_label(online, last_seen);
+
+                let mut st = state.write().await;
+                let Some(chat) = find_peer_chat(&st, &u.from) else {
+                    return;
+                };
+                for key in presence_keys(&u.from, &st) {
+                    st.presence.insert(key, (online, last_seen));
+                }
+                // Surface the learned status in the open chat and sidebar; only
+                // broadcast when the row actually changes to avoid a flood of
+                // identical ChatUpdated events while a peer is active.
+                let Some(row) = st.chats.iter_mut().find(|c| c.id == chat) else {
+                    return;
+                };
+                let changed = match (&row.status, &label) {
+                    (Some(current), Some(next)) => current != next,
+                    (Some(_), None) => true,
+                    (None, None) => false,
+                    (None, Some(_)) => true,
+                };
+                if changed {
+                    row.status = label;
+                    let updated = row.clone();
+                    drop(st);
+                    let _ = tx.send(BackendEvent::ChatUpdated(updated));
+                }
+            }
             other => {
                 debug!(
                     "Unhandled WhatsApp event: {:?}, {:?}",
@@ -856,7 +1030,7 @@ impl WhatsAppState {
 
     /// Persist the account snapshot to the JSON cache. Best-effort:
     /// a failure only logs (the next successful save retries) and never aborts ingestion.
-    fn save_to(&self, cache_path: &PathBuf) {
+    fn save_to(&self, cache_path: &Path) {
         let raw = match serde_json::to_string_pretty(self) {
             Ok(raw) => raw,
             Err(e) => {
@@ -929,13 +1103,12 @@ impl WhatsAppState {
     /// metadata (name, unread, pinned). Preserves any newer `last_message` set
     /// by live data. Conversations that are not really chats on the phone (see
     /// [`should_skip_conversation`]) are not inserted.
-    fn upsert_conversation(&mut self, conv: &wa::Conversation) {
+    fn upsert_conversation(&mut self, conv: &wa::Conversation, chat: ChatId) {
         if let Some(reason) = should_skip_conversation(conv) {
             debug!("WA skipping conversation id={:?} reason={reason}", &conv.id);
             return;
         }
 
-        let chat = ChatId::jid_to_chat_id(&conv.id.to_string());
         let (contact_name, verified) = resolve_conversation_name(
             conv,
             &self.pushnames,
@@ -949,10 +1122,18 @@ impl WhatsAppState {
         let exists = self.chats.iter().any(|c| c.id == chat);
         let name_for_log = contact_name.clone();
 
+        // Periodic syncs occasionally carry a group record whose `name` is the
+        // raw JID (empty subject on the primary). Never downgrade a known
+        // group title to its raw JID — keep the existing name until a record
+        // with the real subject arrives.
+        let is_raw_jid_name = contact_name == conv.id;
+
         match self.chats.iter_mut().find(|c| c.id == chat) {
             Some(c) => {
-                c.contact_name = contact_name;
-                c.verified = verified;
+                if !is_raw_jid_name {
+                    c.contact_name = contact_name;
+                    c.verified = verified;
+                }
                 c.unread_count = unread_count
                     .max(c.unread_count)
                     .max(if c.unread { 1 } else { 0 });
@@ -1053,7 +1234,264 @@ async fn remove_chat(state: &SharedState, jid: &Jid) -> Option<Chat> {
     removed
 }
 
-async fn handle_history_sync(hs: &HistorySync, state: &SharedState, tx: &Sender<BackendEvent>) {
+/// Merge chat rows keyed by a LID into their phone-keyed twins so a peer never
+/// appears twice in the list and old offline `@lid` messages land in the row
+/// the user opens. Purely local: resolves each LID from the client's LID↔PN
+/// cache, folds history previews/unread, and drops the duplicate.
+/// Heal chat rows split across LID/PN keys: one peer must never appear twice.
+/// Folds any `@lid` row into its phone-keyed twin (moving unread, preview and
+/// history). When `tx`/`cache_path` are given the merge is live-friendly —
+/// `ChatRemoved` for the folded row, `ChatUpdated` for the survivor, a sorted
+/// `ChatList` republish, and a cache persist — so the running TUI drops the
+/// stale row even when a snapshot shrink would otherwise be ignored.
+/// Returns the number of rows folded.
+async fn merge_lid_duplicates(
+    client: &Arc<Client>,
+    state: &SharedState,
+    tx: Option<&Sender<BackendEvent>>,
+    cache_path: Option<&Path>,
+) -> usize {
+    let lids: Vec<String> = {
+        let st = state.read().await;
+        st.chats
+            .iter()
+            .filter_map(|c| match &c.id {
+                ChatId::WhatsApp(raw) => Jid::from_str(raw)
+                    .ok()
+                    .filter(|j| j.is_lid())
+                    .map(|j| j.user_base().to_string()),
+                _ => None,
+            })
+            .collect()
+    };
+
+    let mut merged = 0usize;
+    let mut folded: Vec<Chat> = Vec::new();
+    for lid_bare in lids {
+        let Ok(lid_jid) = Jid::from_str(&format!("{lid_bare}@lid")) else {
+            continue;
+        };
+        let Ok(Some(entry)) = client.get_lid_pn_entry(&lid_jid).await else {
+            continue;
+        };
+
+        let mut st = state.write().await;
+        st.lid_pn
+            .insert(lid_bare.clone(), entry.phone_number.to_string());
+        let lid_chat = ChatId::WhatsApp(lid_jid.to_non_ad_string());
+        let pn_chat = pn_chat_id(&entry.phone_number);
+        if !st.chats.iter().any(|c| c.id == pn_chat) {
+            continue;
+        }
+
+        let Some(orphan) = st
+            .chats
+            .iter()
+            .position(|c| c.id == lid_chat)
+            .map(|i| st.chats.remove(i))
+            .inspect(|c| folded.push(c.clone()))
+        else {
+            continue;
+        };
+
+        if let Some(pn_row) = st.chats.iter_mut().find(|c| c.id == pn_chat) {
+            pn_row.unread = pn_row.unread || orphan.unread;
+            pn_row.unread_count = pn_row.unread_count.max(orphan.unread_count);
+            if pn_row.last_message.is_none() {
+                pn_row.last_message = orphan.last_message;
+            }
+            pn_row.verified = pn_row.verified || orphan.verified;
+        }
+
+        if let Some(history) = st.history.remove(&lid_chat) {
+            let pn_history = st.history.entry(pn_chat.clone()).or_default();
+            for m in history {
+                if !pn_history.iter().any(|o| o.message_id == m.message_id) {
+                    pn_history.push(m);
+                }
+            }
+            pn_history.sort_by_key(|m| m.timestamp);
+        }
+        st.by_stanza_id
+            .retain(|_, (c, _)| *c != lid_chat);
+        merged += 1;
+        info!("WA merged duplicate LID chat {lid_bare} into {pn_chat:?}");
+    }
+
+    if merged > 0 {
+        if let Some(cache_path) = cache_path {
+            state.read().await.save_to(cache_path);
+        }
+        if let Some(tx) = tx {
+            for orphan in folded {
+                let _ = tx.send(BackendEvent::ChatRemoved { chat: orphan });
+            }
+            let snapshot = sorted_chat_snapshot(&*state.read().await);
+            let _ = tx.send(BackendEvent::ChatList(snapshot));
+            let _ = tx.send(BackendEvent::Status("merged duplicate chats".into()));
+        }
+    }
+    merged
+}
+
+/// Find the sidebar chat row for a peer JID, trying the wire key and its
+/// phone-keyed twin when the key is a LID.
+fn find_peer_chat(state: &WhatsAppState, jid: &Jid) -> Option<ChatId> {
+    let chat = fold_lid_key(&jid.to_non_ad_string(), state);
+    state
+        .chats
+        .iter()
+        .any(|c| c.id == chat)
+        .then_some(chat)
+}
+
+/// Store/lookup keys for a peer's presence state: the wire JID plus its
+/// phone-keyed twin when the peer was reached by LID and the mapping is known.
+/// [`Event::Presence`] writes every key and `status()` reads every key, so the
+/// two always agree.
+fn presence_keys(jid: &Jid, st: &WhatsAppState) -> Vec<String> {
+    let mut keys = vec![jid.to_non_ad_string()];
+    if jid.is_lid()
+        && let Some(pn_user) = st.lid_pn.get(jid.user_base())
+    {
+        keys.push(Jid::pn(pn_user).to_non_ad_string());
+    }
+    keys
+}
+
+/// Human label for a peer's known presence state, mirroring the Telegram
+/// backend's wording (`"online"` / `"last seen …"`).
+fn presence_label(online: bool, last_seen: Option<i64>) -> Option<String> {
+    if online {
+        Some("online".to_string())
+    } else {
+        last_seen.map(|ts| format!("last seen {}", relative_time(ts)))
+    }
+}
+
+/// Sidebar order for WhatsApp chats: pinned first, then most-recently-active.
+/// WhatsApp syncs conversation rows without a reliable per-row timestamp, so
+/// the newest stored message is the recency signal. `chats()` and every chat
+/// list republish go through this so the running TUI never falls back to
+/// insertion order.
+fn sorted_chat_snapshot(st: &WhatsAppState) -> Vec<Chat> {
+    let mut chats = st.chats.clone();
+    chats.sort_by_key(|c| {
+        let recency = st
+            .history
+            .get(&c.id)
+            .and_then(|h| h.iter().max_by_key(|m| m.timestamp))
+            .map(|m| m.timestamp)
+            .unwrap_or(0);
+        (!c.fixed, std::cmp::Reverse(recency))
+    });
+    chats
+}
+
+/// Learn the phone-number mapping for a LID author outside any state write
+/// lock (the client's local LID↔PN lookup awaits sqlite and can deadlock
+/// against a held lock). Returns the peer's phone-number user-part once known;
+/// non-LID JIDs and already-mapped LIDs return immediately.
+async fn learn_lid_pn(client: &Arc<Client>, sender: &Jid, state: &SharedState) -> Option<String> {
+    if !sender.is_lid() {
+        return None;
+    }
+    let bare = sender.user_base().to_string();
+    if let Some(pn_user) = state.read().await.lid_pn.get(&bare) {
+        return Some(pn_user.clone());
+    }
+    let Ok(Some(entry)) = client.get_lid_pn_entry(sender).await else {
+        return None;
+    };
+    let pn_user = entry.phone_number.to_string();
+    state
+        .write()
+        .await
+        .lid_pn
+        .insert(bare, pn_user.clone());
+    Some(pn_user)
+}
+
+/// Relative "x ago" label for an epoch-seconds timestamp (same shape as the
+/// Telegram backend's `telegram_relative_time`).
+fn relative_time(unix_seconds: i64) -> String {
+    let delta = now().saturating_sub(unix_seconds).max(0);
+    match delta {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{}m ago", delta / 60),
+        3600..=86399 => format!("{}h ago", delta / 3600),
+        _ => format!("{}d ago", delta / 86400),
+    }
+}
+
+async fn handle_history_sync(
+    hs: &HistorySync,
+    client: Option<&Arc<Client>>,
+    state: &SharedState,
+    tx: &Sender<BackendEvent>,
+    cache_path: &Path,
+) {
+    // Canonicalize every conversation key before taking the write lock: the
+    // helper awaits the client's local LID↔PN cache and would otherwise
+    // deadlock against a held write lock.
+    let mut canonical: Vec<ChatId> = Vec::with_capacity(hs.conversations.len());
+    for conversation in &hs.conversations {
+        canonical.push(
+            canonical_chat_id(client, state, ChatId::jid_to_chat_id(&conversation.id.to_string()))
+                .await,
+        );
+    }
+
+    // Resolve unmapped LID authors (group participants with no push name) to
+    // their phone numbers before the ingest pass names them: the lookup is
+    // async over the client's sqlite and must stay outside the write lock.
+    if let Some(client) = client {
+        let mut need: Vec<Jid> = Vec::new();
+        {
+            let st = state.read().await;
+            let mut seen: HashSet<String> = HashSet::new();
+            for conversation in &hs.conversations {
+                for history in conversation.messages.iter() {
+                    let Some(web) = history.message.as_option() else {
+                        continue;
+                    };
+                    let Some(key) = web.key.as_option() else {
+                        continue;
+                    };
+                    if key.from_me.unwrap_or(false) {
+                        continue;
+                    }
+                    if web
+                        .push_name
+                        .as_deref()
+                        .is_some_and(|n| !n.trim().is_empty())
+                    {
+                        continue;
+                    }
+                    let sender = key
+                        .participant
+                        .as_deref()
+                        .and_then(|p| Jid::from_str(p).ok())
+                        .unwrap_or_else(|| {
+                            Jid::from_str(&conversation.id)
+                                .unwrap_or_else(|_| Jid::new(&conversation.id, Server::Pn))
+                        });
+                    if sender.is_lid()
+                        && sender.user_base().is_ascii()
+                        && !st.lid_pn.contains_key(sender.user_base())
+                        && seen.insert(sender.user_base().to_string())
+                    {
+                        need.push(sender);
+                    }
+                }
+            }
+        }
+        for sender in &need {
+            learn_lid_pn(client, sender, state).await;
+        }
+    }
+
+    let shared = state;
     let mut state = state.write().await;
 
     if state.sync_seen_at.is_none() {
@@ -1076,10 +1514,10 @@ async fn handle_history_sync(hs: &HistorySync, state: &SharedState, tx: &Sender<
         }
     }
 
-    for conversation in hs.conversations.iter() {
-        let chat = ChatId::jid_to_chat_id(&conversation.id.to_string());
+    for (conversation, chat) in hs.conversations.iter().zip(canonical.iter()) {
+        let chat = chat.clone();
 
-        state.upsert_conversation(conversation);
+        state.upsert_conversation(conversation, chat.clone());
 
         let mut new_messages: Vec<(String, Message)> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
@@ -1149,22 +1587,16 @@ async fn handle_history_sync(hs: &HistorySync, state: &SharedState, tx: &Sender<
                 &sender_jid,
                 web,
                 &state.pushnames,
+                &state.lid_pn,
             );
 
-            let mut normalized = to_senders_msg(
-                ChatId::jid_to_chat_id(&info.source.chat.to_string()),
-                &info,
-                msg,
-                &state,
-            );
+            let mut normalized = to_senders_msg(chat.clone(), &info, msg, &state);
             normalized.timestamp = web
                 .message_timestamp
                 .map(|ts| ts as i64)
                 .unwrap_or_else(now);
 
-            if (normalized.text.is_empty() && normalized.media.is_none())
-                || (!from_me && normalized.sender == "Unknown")
-            {
+            if normalized.text.is_empty() && normalized.media.is_none() {
                 continue;
             }
 
@@ -1203,7 +1635,7 @@ async fn handle_history_sync(hs: &HistorySync, state: &SharedState, tx: &Sender<
         state.refresh_preview(&chat);
     }
     let chats_total = state.chats.len();
-    let chats_snapshot = state.chats.clone();
+    let chats_snapshot = sorted_chat_snapshot(&state);
     drop(state);
 
     info!("WA handle_history_sync done: chats={}", chats_total);
@@ -1213,6 +1645,14 @@ async fn handle_history_sync(hs: &HistorySync, state: &SharedState, tx: &Sender<
     // bounded broadcast channel.
     let _ = tx.send(BackendEvent::ChatList(chats_snapshot));
     let _ = tx.send(BackendEvent::Status("history synced".into()));
+
+    // Second pass: a LID conversation ingested here may have canonicalized
+    // before its phone-keyed twin existed, leaving two rows for one peer.
+    // Fold them now that every row from this sync is present, persisting the
+    // learned LID↔PN mappings and broadcasting the removal.
+    if let Some(client) = client {
+        merge_lid_duplicates(client, shared, Some(tx), Some(cache_path)).await;
+    }
 }
 
 /// One round of usync enrichment for 1:1 chats that still show a bare number or
@@ -1364,8 +1804,10 @@ async fn enrich_chat_names(
         // so the running TUI refreshes without waiting for the next history
         // sync (a cold start would otherwise keep showing cached bare JIDs
         // until a sync happens to re-announce the chats).
-        let chats_snapshot = state.read().await.chats.clone();
-        state.read().await.save_to(cache_path);
+        let st = state.read().await;
+        let chats_snapshot = sorted_chat_snapshot(&st);
+        st.save_to(cache_path);
+        drop(st);
         let _ = tx.send(BackendEvent::ChatList(chats_snapshot));
         let _ = tx.send(BackendEvent::Status("names updated".into()));
         info!("WA usync name enrichment finished");
@@ -1382,6 +1824,7 @@ fn history_info(
     sender_jid: &Jid,
     web: &wa::WebMessageInfo,
     pushnames: &HashMap<String, String>,
+    lid_pn: &HashMap<String, String>,
 ) -> MessageInfo {
     let mut info = MessageInfo {
         id: stanza_id.into(),
@@ -1395,6 +1838,7 @@ fn history_info(
         web.push_name.as_deref().unwrap_or_default(),
         sender_jid,
         pushnames,
+        lid_pn,
     )
     .into();
     info
@@ -1413,7 +1857,7 @@ impl Messenger for WhatsAppMessenger {
     async fn chats(&self) -> Result<Vec<Chat>, BackendError> {
         let state = self.state.read().await;
         debug!("WA chats() returning {} chats", state.chats.len());
-        Ok(state.chats.clone())
+        Ok(sorted_chat_snapshot(&state))
     }
 
     async fn set_read(&mut self, chat: &ChatId) -> Result<(), BackendError> {
@@ -1426,12 +1870,43 @@ impl Messenger for WhatsAppMessenger {
         let jid = Jid::from_str(jid_str)
             .map_err(|e| BackendError::Other(format!("WhatsApp: invalid chat jid: {e}")))?;
 
-        let client = self.current_client();
-        let _ = client.mark_as_read(&jid, None, &[]).await;
+        // WhatsApp marks a whole chat read against its newest incoming message
+        // (the read watermark); `mark_as_read` no-ops on an empty id list, so a
+        // chat with nothing unread — or none at all — simply sends no receipt.
+        let (target_jid, latest_read, canonical) = {
+            let state = self.state.read().await;
+            let canonical = fold_lid_key(jid_str, &state);
+            let target_jid = match &canonical {
+                ChatId::WhatsApp(raw) => Jid::from_str(raw).ok().unwrap_or_else(|| jid.clone()),
+                _ => jid.clone(),
+            };
+            let latest_read = state
+                .history
+                .get(&canonical)
+                .and_then(|h| h.iter().filter(|m| !m.from_me).max_by_key(|m| m.timestamp))
+                .map(|m| {
+                    // Group receipts carry the author's participant slot so the
+                    // sender can tell who read it.
+                    let author = if jid.is_group() {
+                        m.author_id.as_deref().and_then(|s| Jid::from_str(s).ok())
+                    } else {
+                        None
+                    };
+                    (m.message_id.to_string(), author)
+                });
+            (target_jid, latest_read, canonical)
+        };
+
+        if let Some((latest_id, author)) = latest_read {
+            let client = self.current_client();
+            let _ = client
+                .mark_as_read(&target_jid, author.as_ref(), &[latest_id.as_str()])
+                .await;
+        }
 
         let mut state = self.state.write().await;
         for c in state.chats.iter_mut() {
-            if c.id == *chat {
+            if c.id == *chat || c.id == canonical {
                 c.unread = false;
                 c.unread_count = 0;
             }
@@ -1447,12 +1922,55 @@ impl Messenger for WhatsAppMessenger {
     }
 
     async fn history(&self, chat: &ChatId) -> Result<Vec<Message>, BackendError> {
+        // `history_page` intentionally uses the `Messenger` trait default (full
+        // history load): the pinned whatsapp-rust has no before-message
+        // pagination cursor, and mapping WhatsApp's opaque message id onto the
+        // trait's numeric `Option<i32>` offset would silently drop or duplicate
+        // messages. Pagination lands when a reliable opaque cursor exists.
         let state = self.state.read().await;
+        let chat = match chat {
+            ChatId::WhatsApp(raw) => fold_lid_key(raw, &state),
+            other => other.clone(),
+        };
         // The cache is kept oldest-to-newest; re-sort defensively by timestamp so
         // the TUI always renders chronological order regardless of ingest path.
-        let mut messages = state.history.get(chat).cloned().unwrap_or_default();
+        let mut messages = state.history.get(&chat).cloned().unwrap_or_default();
         messages.sort_by_key(|m| m.timestamp);
         Ok(messages)
+    }
+
+    async fn status(&self, chat: &ChatId) -> Result<Option<String>, BackendError> {
+        if !self.client.clone().is_logged_in() {
+            return Ok(None);
+        }
+        let ChatId::WhatsApp(raw) = chat else {
+            return Ok(None);
+        };
+        let Ok(jid) = Jid::from_str(raw) else {
+            return Ok(None);
+        };
+        if !jid.is_pn() && !jid.is_lid() {
+            return Ok(None);
+        }
+
+        // Streaming subscription: answers with the current state immediately,
+        // then keeps `Event::Presence` flowing from the linked device. Ignore
+        // subscription errors (peers that never published presence): the read
+        // below still returns whatever is already cached.
+        let client = self.current_client();
+        if let Err(e) = client.presence().subscribe(jid.clone()).await {
+            warn!("WA presence subscribe failed for {raw}: {e}");
+        }
+
+        let st = self.state.read().await;
+        if find_peer_chat(&st, &jid).is_none() {
+            return Ok(None);
+        }
+        Ok(presence_keys(&jid, &st)
+            .iter()
+            .find_map(|k| st.presence.get(k))
+            .copied()
+            .and_then(|(online, last_seen)| presence_label(online, last_seen)))
     }
 
     async fn reply_context(
@@ -1521,6 +2039,7 @@ impl Messenger for WhatsAppMessenger {
             message_id: result.message_id.clone().into(),
             chat: chat.clone(),
             sender: "You".into(),
+            author_id: None,
             text: text.to_string(),
             timestamp: now(),
             from_me: true,
@@ -1838,28 +2357,28 @@ mod tests {
         // back to the formatted phone number when usync supplied it.
         let mut usync = HashMap::new();
         usync.insert(
-            "169509608489037@lid".to_string(),
-            "+55 11 9509-6084".to_string(),
+            "15550000004@lid".to_string(),
+            "+15 55 0000-0004".to_string(),
         );
         let lid_learned = wa::Conversation {
-            id: "169509608489037@lid".to_string(),
+            id: "15550000004@lid".to_string(),
             ..Default::default()
         };
         assert_eq!(
             resolve_conversation_name(&lid_learned, &pushnames, &usync, &no_verified),
-            ("+55 11 9509-6084".to_string(), false)
+            ("+15 55 0000-0004".to_string(), false)
         );
 
         // A verified business peer: name resolves from usync with verified=true.
         usync.insert(
-            "5516992499381@s.whatsapp.net".to_string(),
+            "15550000003@s.whatsapp.net".to_string(),
             "ACME Bots".to_string(),
         );
         let mut verified = HashSet::new();
-        verified.insert("5516992499381@s.whatsapp.net".to_string());
+        verified.insert("15550000003@s.whatsapp.net".to_string());
         let biz = wa::Conversation {
-            id: "109818203390040@lid".to_string(),
-            pn_jid: Some("5516992499381@s.whatsapp.net".to_string()),
+            id: "15550000005@lid".to_string(),
+            pn_jid: Some("15550000003@s.whatsapp.net".to_string()),
             ..Default::default()
         };
         assert_eq!(
@@ -1882,23 +2401,23 @@ mod tests {
 
     #[test]
     fn format_pn_matches_whatsapp_layout() {
-        assert_eq!(format_pn("5516992499381"), "+55 16 99249-9381");
+        assert_eq!(format_pn("15550000003"), "+15 55 000-0003");
         assert_eq!(format_pn("15551234567"), "+15 55 123-4567");
         assert_eq!(format_pn("123"), "+123");
-        assert_eq!(format_pn("169509608489037@lid"), "+16 95 0960848-9037");
+        assert_eq!(format_pn("15550000004@lid"), "+15 55 000-0004");
     }
 
     #[test]
     fn name_from_lid_pn_formats_numbers_for_lid_keyed_chats() {
-        // Real LID↔PN mappings learned locally from message traffic, with no
+        // Fake LID↔PN mappings learned locally from message traffic, with no
         // push name cached: the formatted number must be the fallback so a
         // LID-keyed chat never shows as a bare LID.
         let empty = HashMap::new();
         let cases = [
-            ("5511974186171", "+55 11 97418-6171"),
-            ("5519996739798", "+55 19 99673-9798"),
-            ("5511953041920", "+55 11 95304-1920"),
-            ("553285061750", "+55 32 8506-1750"),
+            ("15550000001", "+15 55 000-0001"),
+            ("15550000002", "+15 55 000-0002"),
+            ("15550000003", "+15 55 000-0003"),
+            ("15550000004", "+15 55 000-0004"),
         ];
         for (pn, expected) in cases {
             assert_eq!(name_from_lid_pn(pn, &empty), expected, "for {pn}");
@@ -1909,13 +2428,51 @@ mod tests {
     fn name_from_lid_pn_prefers_synced_pushname() {
         let mut pushnames = HashMap::new();
         pushnames.insert(
-            "5511953041920@s.whatsapp.net".to_string(),
-            "Leonardo Lima".to_string(),
+            "15550000002@s.whatsapp.net".to_string(),
+            "Test Pushname".to_string(),
         );
+        assert_eq!(name_from_lid_pn("15550000002", &pushnames), "Test Pushname");
+    }
+
+    #[test]
+    fn upsert_keeps_known_group_title_when_sync_carries_raw_jid() {
+        let mut st = WhatsAppState::default();
+        let group = "15550000001-111222333@g.us";
+        let chat_id = ChatId::jid_to_chat_id(group);
+
+        // Full sync record with the real subject.
+        let titled = wa::Conversation {
+            id: group.to_string(),
+            name: Some("Teste".to_string()),
+            ..Default::default()
+        };
+
+        st.upsert_conversation(&titled, chat_id.clone());
+        assert_eq!(st.chats[0].contact_name, "Teste");
+
+        // Periodic sync record whose subject is the raw JID (empty on the
+        // phone): must not clobber the known title.
+        let raw = wa::Conversation {
+            id: group.to_string(),
+            name: Some(group.to_string()),
+            ..Default::default()
+        };
+        st.upsert_conversation(&raw, chat_id.clone());
         assert_eq!(
-            name_from_lid_pn("5511953041920", &pushnames),
-            "Leonardo Lima"
+            st.chats[0].contact_name, "Teste",
+            "a raw-JID subject must not downgrade the group title"
         );
+
+        // A genuinely new group without a subject renders its JID until a
+        // real title arrives.
+        let new_group = "111222333444@g.us";
+        let fresh = wa::Conversation {
+            id: new_group.to_string(),
+            name: Some(new_group.to_string()),
+            ..Default::default()
+        };
+        st.upsert_conversation(&fresh, ChatId::jid_to_chat_id(new_group));
+        assert_eq!(st.chats[1].contact_name, new_group);
     }
 
     #[test]
@@ -1954,14 +2511,117 @@ mod tests {
             "15550000001@s.whatsapp.net".to_string(),
             "Cached Name".to_string(),
         );
+        let no_lid_pn = HashMap::new();
 
         // 1. Message push name wins.
-        assert_eq!(resolve_sender_name("Alice", &sender, &pushnames), "Alice");
+        assert_eq!(
+            resolve_sender_name("Alice", &sender, &pushnames, &no_lid_pn),
+            "Alice"
+        );
         // 2. Falls back to the push-name cache.
-        assert_eq!(resolve_sender_name("", &sender, &pushnames), "Cached Name");
+        assert_eq!(
+            resolve_sender_name("", &sender, &pushnames, &no_lid_pn),
+            "Cached Name"
+        );
         // 3. Falls back to the bare JID user part.
         let empty = HashMap::new();
-        assert_eq!(resolve_sender_name("", &sender, &empty), "15550000001");
+        assert_eq!(
+            resolve_sender_name("", &sender, &empty, &no_lid_pn),
+            "15550000001"
+        );
+    }
+
+    #[test]
+    fn sender_resolves_lid_author_via_lid_pn_mapping() {
+        let sender = Jid::lid("255202829570287");
+        let mut pushnames = HashMap::new();
+        pushnames.insert(
+            "15550000007@s.whatsapp.net".to_string(),
+            "Test Sender".to_string(),
+        );
+        let mut lid_pn = HashMap::new();
+        lid_pn.insert("255202829570287".to_string(), "15550000007".to_string());
+
+        // Cached push name for the peer's phone number wins over the bare LID.
+        assert_eq!(
+            resolve_sender_name("", &sender, &pushnames, &lid_pn),
+            "Test Sender"
+        );
+
+        // No cached name: formatted number, never a bare LID.
+        let empty = HashMap::new();
+        assert_eq!(
+            resolve_sender_name("", &sender, &empty, &lid_pn),
+            "+15 55 000-0007"
+        );
+
+        // Unknown mapping: falls back to the bare LID user part.
+        let no_lid_pn = HashMap::new();
+        assert_eq!(
+            resolve_sender_name("", &sender, &empty, &no_lid_pn),
+            "255202829570287"
+        );
+    }
+
+    #[test]
+    fn sorted_chat_snapshot_orders_pinned_then_recency() {
+        let old = Chat {
+            id: ChatId::WhatsApp("15550000001@s.whatsapp.net".to_string()),
+            contact_name: "Old chat".into(),
+            fixed: false,
+            ..Default::default()
+        };
+        let fresh = Chat {
+            id: ChatId::WhatsApp("15550000002@s.whatsapp.net".to_string()),
+            contact_name: "Fresh chat".into(),
+            fixed: false,
+            ..Default::default()
+        };
+        let pinned = Chat {
+            id: ChatId::WhatsApp("15550000003@s.whatsapp.net".to_string()),
+            contact_name: "Pinned chat".into(),
+            fixed: true,
+            ..Default::default()
+        };
+        let mut st = WhatsAppState {
+            chats: vec![old.clone(), fresh.clone(), pinned.clone()],
+            ..Default::default()
+        };
+        let msg = |m: &str, ts: i64, chat: &ChatId| Message {
+            message_id: format!("m-{m}").into(),
+            chat: chat.clone(),
+            sender: "x".into(),
+            text: m.into(),
+            timestamp: ts,
+            from_me: false,
+            author_id: None,
+            media: None,
+            msg_actions: Vec::new(),
+            reply_to_id: None,
+            reply_ctx: None,
+            pending: false,
+            failed: false,
+        };
+        st.history.insert(
+            old.id.clone(),
+            vec![msg("old", 1000, &old.id)],
+        );
+        st.history.insert(
+            fresh.id.clone(),
+            vec![msg("fresh", 3000, &fresh.id)],
+        );
+        let order: Vec<_> = sorted_chat_snapshot(&st)
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ChatId::WhatsApp("15550000003@s.whatsapp.net".to_string()),
+                ChatId::WhatsApp("15550000002@s.whatsapp.net".to_string()),
+                ChatId::WhatsApp("15550000001@s.whatsapp.net".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -2000,17 +2660,17 @@ mod tests {
     #[test]
     fn own_chat_id_rewrites_self_lid_messages_to_own_pn() {
         let own_pn = Jid::pn("15551234567");
-        let own_lid = Jid::lid("96018372800539");
+        let own_lid = Jid::lid("123456789012345");
 
         // Self message keyed by our own LID -> own PN chat.
-        let lid_chat = ChatId::WhatsApp("96018372800539@lid".to_string());
+        let lid_chat = ChatId::WhatsApp("123456789012345@lid".to_string());
         assert_eq!(
             own_chat_id(Some(&own_lid), Some(&own_pn), lid_chat.clone(), true),
             ChatId::WhatsApp("15551234567@s.whatsapp.net".to_string())
         );
 
         // A same-JID chat addressed to someone else (not from_me) is untouched.
-        let other_lid_chat = ChatId::WhatsApp("214082762317966@lid".to_string());
+        let other_lid_chat = ChatId::WhatsApp("777777777777777@lid".to_string());
         assert_eq!(
             own_chat_id(Some(&own_lid), Some(&own_pn), other_lid_chat.clone(), false),
             other_lid_chat
@@ -2082,8 +2742,8 @@ mod tests {
         // mismatched file.
         let path = std::env::temp_dir().join("senders_wa_tui_schema_test.json");
         let foreign = serde_json::to_string(&[Chat {
-            id: ChatId::WhatsApp("5516993643032@s.whatsapp.net".to_string()),
-            contact_name: "Beatriz".to_string(),
+            id: ChatId::WhatsApp("15550000006@s.whatsapp.net".to_string()),
+            contact_name: "Test User".to_string(),
             ..Default::default()
         }])
         .unwrap();
@@ -2163,7 +2823,8 @@ mod tests {
             ..Default::default()
         };
 
-        super::handle_history_sync(&hs, &state, &tx).await;
+        super::handle_history_sync(&hs, None, &state, &tx, Path::new("/tmp/wa_test_cache.json"))
+            .await;
         let s = state.read().await;
 
         assert_eq!(s.chats.len(), 2);
@@ -2224,7 +2885,8 @@ mod tests {
             ..Default::default()
         };
 
-        super::handle_history_sync(&hs, &state, &tx).await;
+        super::handle_history_sync(&hs, None, &state, &tx, Path::new("/tmp/wa_test_cache.json"))
+            .await;
         let s = state.read().await;
         let history = s
             .history
@@ -2234,6 +2896,70 @@ mod tests {
             history.len(),
             1,
             "duplicate + empty must collapse to one message"
+        );
+    }
+
+    #[test]
+    fn fold_lid_key_rewrites_known_lid_when_pn_row_exists() {
+        let pn_chat = ChatId::WhatsApp("15550000007@s.whatsapp.net".to_string());
+
+        let mut folded = WhatsAppState::default();
+        folded.chats.push(Chat {
+            id: pn_chat.clone(),
+            ..Default::default()
+        });
+        folded
+            .lid_pn
+            .insert("255202829570287".to_string(), "15550000007".to_string());
+
+        // Mapped + row exists: folded to the phone-keyed row.
+        assert_eq!(fold_lid_key("255202829570287@lid", &folded), pn_chat);
+        // A plain phone-keyed chat is untouched.
+        assert_eq!(fold_lid_key("15550000007@s.whatsapp.net", &folded), pn_chat);
+
+        // LID with no mapping stays put.
+        assert_eq!(
+            fold_lid_key("777777777777777@lid", &folded),
+            ChatId::WhatsApp("777777777777777@lid".to_string())
+        );
+
+        // Mapped but no phone-keyed row on the list stays put (the peer was
+        // never addressed by phone, so the LID row is what the user opens).
+        let mut no_row = WhatsAppState::default();
+        no_row
+            .lid_pn
+            .insert("255202829570287".to_string(), "15550000007".to_string());
+        assert_eq!(
+            fold_lid_key("255202829570287@lid", &no_row),
+            ChatId::WhatsApp("255202829570287@lid".to_string())
+        );
+
+        // Unparseable keys are never rewritten.
+        assert_eq!(
+            fold_lid_key("not-a-jid", &folded),
+            ChatId::WhatsApp("not-a-jid".to_string())
+        );
+    }
+
+    #[test]
+    fn presence_label_formats_online_and_last_seen() {
+        assert_eq!(presence_label(true, None), Some("online".to_string()));
+        assert_eq!(
+            presence_label(true, Some(1_800_000_000)),
+            Some("online".to_string())
+        );
+        assert_eq!(presence_label(false, None), None);
+        assert_eq!(
+            presence_label(false, Some(now() - 300)),
+            Some("last seen 5m ago".to_string())
+        );
+        assert_eq!(
+            presence_label(false, Some(now() - 7200)),
+            Some("last seen 2h ago".to_string())
+        );
+        assert_eq!(
+            presence_label(false, Some(now() - 172800)),
+            Some("last seen 2d ago".to_string())
         );
     }
 }

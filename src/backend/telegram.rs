@@ -128,6 +128,7 @@ fn normalize_telegram_message(
         message_id: telegram_message_id(msg),
         chat: chat.clone(),
         sender,
+        author_id: None,
         text,
         timestamp: msg.date().timestamp(),
         from_me,

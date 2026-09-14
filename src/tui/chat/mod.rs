@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use ratatui::widgets::ListState;
 
-use crate::backend::{Chat, ChatId, Message, MessageAction, MessageId, Provider};
+use crate::backend::{Chat, ChatId, Message, MessageAction, MessageId};
 
 pub mod chat_list;
 pub mod chat_widget;
@@ -225,7 +225,7 @@ impl ChatState {
         self.chats.sort_by_key(|chat| !chat.fixed);
     }
 
-    /// Insert or update a sidebar chat entry from a push update while keeping
+    /// Insert or update a chat_list entry from a push update while keeping
     /// the existing order intact and preserving user-visible scroll state.
     pub fn upsert_chat(&mut self, chat: Chat) -> bool {
         let mut chat = chat;
@@ -306,23 +306,12 @@ impl ChatState {
         provider: crate::backend::Provider,
         chats: Vec<Chat>,
     ) {
-        // Grow-only: a snapshot may refresh the list, but a smaller snapshot
-        // (e.g. WhatsApp after a cold restart where the connection re-syncs
-        // only a partial subset) must never shrink the fuller cached list.
-        // An empty snapshot is the extreme case and is likewise ignored.
-        let current = self
-            .chats
-            .iter()
-            .filter(|chat| {
-                matches!(
-                    (&chat.id, provider),
-                    (ChatId::Telegram(_), Provider::Telegram)
-                        | (ChatId::WhatsApp(_), Provider::WhatsApp)
-                )
-            })
-            .count();
-
-        if chats.len() < current {
+        // A non-empty snapshot is authoritative: the backend always sends its
+        // complete chat list here, so rows this provider no longer reports
+        // (e.g. an LID twin folded into its PN row) are pruned. An EMPTY
+        // snapshot is the cold-start case where the provider has not re-synced
+        // yet, and must not wipe the fuller cached list.
+        if chats.is_empty() {
             return;
         }
 
@@ -513,6 +502,7 @@ mod tests {
             message_id: id.into(),
             chat,
             sender: "Sender".into(),
+            author_id: None,
             text: "hello".into(),
             timestamp,
             from_me: false,
@@ -806,24 +796,24 @@ mod tests {
     }
 
     #[test]
-    fn provider_reconciliation_is_grow_only() {
+    fn provider_reconciliation_prunes_stale_rows_on_non_empty_snapshot() {
         let mut state = ChatState {
             chats: vec![
                 chat(ChatId::Telegram(1), "Old Telegram"),
-                chat(ChatId::Telegram(2), "Second"),
+                chat(ChatId::Telegram(2), "To Be Pruned"),
                 chat(ChatId::WhatsApp("wa-1".into()), "WhatsApp"),
             ],
             ..Default::default()
         };
 
-        // A smaller snapshot (1 < 2 loaded Telegram chats) must never shrink
-        // the fuller cached list: it is ignored wholesale.
+        // A non-empty Telegram snapshot is authoritative: the missing
+        // Telegram(2) is pruned, while the other provider's chat survives.
         state.reconcile_provider_chats(
             Provider::Telegram,
-            vec![chat(ChatId::Telegram(1), "Partial Telegram")],
+            vec![chat(ChatId::Telegram(1), "Updated Telegram")],
         );
 
-        assert_eq!(state.chats.len(), 3);
+        assert_eq!(state.chats.len(), 2);
         assert!(
             state
                 .chats
@@ -831,11 +821,11 @@ mod tests {
                 .any(|chat| chat.id == ChatId::WhatsApp("wa-1".into()))
         );
         assert!(
-            state
+            !state
                 .chats
                 .iter()
                 .any(|chat| chat.id == ChatId::Telegram(2)),
-            "a smaller snapshot must not drop already-loaded chats"
+            "a non-empty snapshot must prune rows the provider no longer reports"
         );
         assert_eq!(
             state
@@ -844,8 +834,41 @@ mod tests {
                 .find(|chat| chat.id == ChatId::Telegram(1))
                 .unwrap()
                 .contact_name,
-            "Old Telegram",
-            "an ignored partial snapshot must not rename existing chats"
+            "Updated Telegram",
+            "an authoritative snapshot must update existing chats"
+        );
+    }
+
+    #[test]
+    fn provider_reconciliation_prunes_lid_twin_on_non_empty_snapshot() {
+        let mut state = ChatState {
+            chats: vec![
+                chat(ChatId::WhatsApp("pn-x".into()), "Test Contact"),
+                chat(ChatId::WhatsApp("lid-y".into()), "Test Contact"),
+            ],
+            ..Default::default()
+        };
+
+        // The backend merged the LID twin into the PN row, so the live
+        // WhatsApp snapshot no longer carries lid-y.
+        state.reconcile_provider_chats(
+            Provider::WhatsApp,
+            vec![chat(ChatId::WhatsApp("pn-x".into()), "Test Contact")],
+        );
+
+        assert_eq!(state.chats.len(), 1);
+        assert!(
+            state
+                .chats
+                .iter()
+                .any(|chat| chat.id == ChatId::WhatsApp("pn-x".into()))
+        );
+        assert!(
+            !state
+                .chats
+                .iter()
+                .any(|chat| chat.id == ChatId::WhatsApp("lid-y".into())),
+            "a WhatsApp LID twin absent from a live WhatsApp snapshot must be pruned"
         );
     }
 

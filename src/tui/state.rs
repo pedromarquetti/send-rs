@@ -154,10 +154,12 @@ impl AppState {
     }
 
     /// Apply a previously fetched chat list to the TUI chat state, preserving
-    /// each chat's saved scroll position. Chats already loaded for an enabled
-    /// provider that returned no live entries (e.g. WhatsApp after a cold
-    /// restart, where the realtime client does not re-sync its full history)
-    /// are kept rather than wiped out.
+    /// each chat's saved scroll position. Providers that appear in a fresh,
+    /// non-empty snapshot are treated as authoritative: rows they no longer
+    /// report (e.g. a WhatsApp LID twin folded into its PN row by the backend
+    /// merge) are pruned. Chat state for an enabled provider that returned no
+    /// live entries at all (e.g. WhatsApp during a cold start, where the
+    /// realtime client has not re-synced yet) is kept rather than wiped out.
     pub fn apply_chats(&mut self, chats: Vec<Chat>) {
         let saved_scrolls: HashMap<ChatId, usize> = self
             .chat_state
@@ -180,33 +182,10 @@ impl AppState {
         let live_providers: HashSet<Provider> =
             chat_list.iter().map(|chat| chat.id.to_provider()).collect();
 
-        // Grow-only: a live provider that returned a *smaller* snapshot than
-        // the chats already loaded (e.g. WhatsApp after a cold restart re-syncs
-        // only a partial subset) must not shrink the fuller cached list. Track
-        // such shrunken providers so their missing chats are preserved below.
-        let shrunken_enabled: HashSet<Provider> = live_providers
-            .iter()
-            .copied()
-            .filter(|provider| {
-                let old = self
-                    .chat_state
-                    .chats
-                    .iter()
-                    .filter(|old_chat| {
-                        matches!(&old_chat.id, ChatId::Telegram(_) | ChatId::WhatsApp(_))
-                    })
-                    .filter(|old_chat| old_chat.id.to_provider() == *provider)
-                    .count();
-
-                let new = chat_list
-                    .iter()
-                    .filter(|new_chat| new_chat.id.to_provider() == *provider)
-                    .count();
-
-                new < old && provider.is_enabled(&self.config.providers)
-            })
-            .collect();
-
+        // Preserve only rows whose provider is missing entirely from the fresh
+        // snapshot (cold start / still reconnecting) or is disabled. A provider
+        // that returned ANY chats is authoritative, so a stale row it no longer
+        // reports (e.g. a merged-away LID twin) must be pruned, never kept.
         let preserved: Vec<Chat> = self
             .chat_state
             .chats
@@ -216,8 +195,7 @@ impl AppState {
                 id => {
                     let provider = id.to_provider();
                     !chat_list.iter().any(|c| c.id == *id)
-                        && (!live_providers.contains(&provider)
-                            || shrunken_enabled.contains(&provider))
+                        && !live_providers.contains(&provider)
                         && provider.is_enabled(&self.config.providers)
                 }
             })
@@ -485,12 +463,22 @@ impl AppState {
         chat: Chat,
         generation: u64,
         result: std::result::Result<Vec<Message>, BackendError>,
+        status: Option<String>,
     ) {
         // Return early if user closed the chat and opened a new one
         if generation != self.chat_load_generation
             || self.chat_state.selected_chat().map(|c| &c.id) != Some(&chat.id)
         {
             return;
+        }
+
+        // The presence subscription was sent before history loaded; surface
+        // the peer's status on the sidebar row and, when the load succeeds,
+        // on the freshly opened chat.
+        if let Some(status) = status.as_deref()
+            && let Some(chat) = self.chat_state.chats.iter_mut().find(|c| c.id == chat.id)
+        {
+            chat.status = Some(status.to_string());
         }
 
         match result {
@@ -502,6 +490,12 @@ impl AppState {
                     history: messages,
                     has_more_history: true,
                 });
+
+                if let (Some(status), Some(open)) =
+                    (status.as_deref(), self.chat_state.open_chat.as_mut())
+                {
+                    open.chat.status = Some(status.to_string());
+                }
 
                 self.chat_state.restore_message_selection(history_len);
             }
@@ -972,7 +966,6 @@ impl AppState {
                 if let Err(e) = self.config.save_config() {
                     self.create_popup(PopupKind::Error(format!("could not save config: {e}")));
                 }
-
             }
         }
         self.screen = Screen::Main;
@@ -1070,11 +1063,25 @@ impl AppState {
                     .map(|chat| chat.unread_count)
                     .unwrap_or(0);
 
-                let contact_name = if message.sender == "Unknown" {
-                    String::new()
-                } else {
-                    message.sender.clone()
-                };
+                let chatlist_row = self.chat_state.chats.iter().find(|c| c.id == message.chat);
+                let chatlist_found = chatlist_row.is_some();
+                let existing_name = chatlist_row
+                    .map(|c| c.contact_name.clone())
+                    .filter(|n| !n.is_empty() && n != "Unknown" && n != "You");
+
+                // Messages never rename an existing chat list row: for a group
+                // chat the sender is a member, so the member's name would
+                // clobber the group title on every inbound message. The
+                // backend owns titles (ChatList/ChatUpdated); only genuinely
+                // new chats get a sender-derived fallback so something
+                // renders until the first authoritative list arrives.
+                let contact_name = existing_name.unwrap_or_else(|| {
+                    if message.sender == "Unknown" {
+                        String::new()
+                    } else {
+                        message.sender.clone()
+                    }
+                });
 
                 let mut chat_update = Chat {
                     id: message.chat.clone(),
@@ -1088,19 +1095,13 @@ impl AppState {
                     chat_update.unread_count = previous_unread_count.saturating_add(1);
                 }
 
-                let sidebar_found = self
-                    .chat_state
-                    .chats
-                    .iter()
-                    .any(|chat| chat.id == message.chat);
-
                 // Guard against polluting the sidebar with a brand-new chat whose
                 // sender name we cannot resolve (sender came through as
                 // "Unknown" -> empty). Such a chat would only render as an
                 // "Unnamed chat" and, when the provider is mid-lifecycle, can
                 // appear spuriously. Existing chats still get their preview
                 // bumped; only genuinely-new nameless entries are suppressed.
-                if sidebar_found || !contact_name.is_empty() {
+                if chatlist_found || !contact_name.is_empty() {
                     self.chat_state.upsert_chat(chat_update);
                 }
 
@@ -1108,13 +1109,14 @@ impl AppState {
                     self.chat_state.mark_read(&message.chat);
                 }
 
+                let text_preview: String = message.text.chars().take(60).collect();
                 debug!(
                     chat = ?message.chat,
                     from_me = message.from_me,
                     is_open,
-                    sidebar_found,
+                    chatlist_found,
                     open_chat_id = ?open_chat_id,
-                    text_preview = &message.text[..message.text.len().min(60)],
+                    text_preview = %text_preview,
                     "TUI MessageReceived",
                 );
 
@@ -1122,7 +1124,7 @@ impl AppState {
                     debug!(chat = ?message.chat, "TUI set unread");
                 }
 
-                if !sidebar_found {
+                if !chatlist_found {
                     debug!(chat = ?message.chat, "TUI MessageReceived: inserted sidebar chat from push event");
                 }
             }
@@ -1445,8 +1447,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_chats_is_grow_only_for_live_providers() {
+    async fn apply_chats_prunes_stale_rows_missing_from_live_snapshot() {
         let mut state = app_state().await;
+        state.config.providers.whatsapp = true;
         let original_ids: Vec<_> = state
             .chat_state
             .chats
@@ -1458,19 +1461,58 @@ mod tests {
             "test precondition: a populated sidebar"
         );
 
-        // A one-chat subset of what is already loaded must not shrink the list.
-        let partial = vec![state.chat_state.chats[0].clone()];
-        state.apply_chats(partial);
+        // Two WhatsApp rows: one the backend still reports, one it merged away
+        // (simulates a stale LID twin the live snapshot no longer carries).
+        state.chat_state.chats.push(crate::backend::Chat {
+            id: ChatId::WhatsApp("wa-keep".into()),
+            contact_name: "WA Keep".into(),
+            ..Default::default()
+        });
+        state.chat_state.chats.push(crate::backend::Chat {
+            id: ChatId::WhatsApp("wa-orphan".into()),
+            contact_name: "WA Orphan".into(),
+            ..Default::default()
+        });
 
-        let ids: Vec<_> = state
-            .chat_state
-            .chats
+        // The snapshot is non-empty and includes WhatsApp: the stale row the
+        // provider no longer reports is pruned, while original rows are kept.
+        let fresh: Vec<_> = original_ids
             .iter()
-            .map(|chat| chat.id.clone())
+            .map(|id| crate::backend::Chat {
+                id: id.clone(),
+                contact_name: "refresh".into(),
+                ..Default::default()
+            })
+            .chain(std::iter::once(crate::backend::Chat {
+                id: ChatId::WhatsApp("wa-keep".into()),
+                contact_name: "WA Keep".into(),
+                ..Default::default()
+            }))
             .collect();
-        assert_eq!(
-            ids, original_ids,
-            "a smaller live snapshot must never shrink the fuller cached list"
+        state.apply_chats(fresh);
+
+        // Original Telegram rows must survive a live WhatsApp snapshot.
+        for id in &original_ids {
+            assert!(
+                state.chat_state.chats.iter().any(|c| &c.id == id),
+                "original chat {id:?} must survive"
+            );
+        }
+        assert!(
+            state
+                .chat_state
+                .chats
+                .iter()
+                .any(|c| c.id == ChatId::WhatsApp("wa-keep".into())),
+            "a row present in the live snapshot must survive"
+        );
+        assert!(
+            !state
+                .chat_state
+                .chats
+                .iter()
+                .any(|c| c.id == ChatId::WhatsApp("wa-orphan".into())),
+            "a WhatsApp row absent from a live WhatsApp snapshot must be pruned"
         );
     }
 
@@ -1627,6 +1669,7 @@ mod tests {
                 message_id: "incoming".into(),
                 chat: ChatId::Telegram(101),
                 sender: "Telegram News".into(),
+                author_id: None,
                 text: "breaking".into(),
                 timestamp: 0,
                 from_me: false,
@@ -1662,6 +1705,7 @@ mod tests {
                 message_id: "incoming".into(),
                 chat: ChatId::Telegram(103),
                 sender: "Alice".into(),
+                author_id: None,
                 text: "hi".into(),
                 timestamp: 0,
                 from_me: false,
@@ -1770,6 +1814,7 @@ mod tests {
                 message_id: "new-chat".into(),
                 chat: ChatId::Telegram(999),
                 sender: "New contact".into(),
+                author_id: None,
                 text: "hello there".into(),
                 timestamp: 0,
                 from_me: false,
@@ -1793,6 +1838,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn message_never_renames_existing_sidebar_chat_to_sender() {
+        let mut state = app_state().await;
+
+        state.chat_state.upsert_chat(Chat {
+            id: ChatId::Telegram(777),
+            contact_name: "Car Budget".into(),
+            ..Default::default()
+        });
+
+        // Group-style message: the sender is a member, not the chat itself.
+        state.handle_backend_event(
+            Provider::Telegram,
+            BackendEvent::MessageReceived(Message {
+                message_id: "g-1".into(),
+                chat: ChatId::Telegram(777),
+                sender: "A Member".into(),
+                author_id: None,
+                text: "updated".into(),
+                timestamp: 0,
+                from_me: false,
+                msg_actions: Vec::new(),
+                media: None,
+                reply_to_id: None,
+                reply_ctx: None,
+                pending: false,
+                failed: false,
+            }),
+        );
+
+        let chat = state
+            .chat_state
+            .chats
+            .iter()
+            .find(|c| c.id == ChatId::Telegram(777))
+            .expect("existing chat stays in sidebar");
+        assert_eq!(
+            chat.contact_name, "Car Budget",
+            "a message sender must never rename the row title"
+        );
+        assert_eq!(chat.last_message.as_deref(), Some("A Member: updated"));
+        assert_eq!(chat.unread_count, 1);
+    }
+
+    #[tokio::test]
+    async fn message_preview_truncation_handles_multibyte_emoji() {
+        let mut state = app_state().await;
+
+        // 30 x 4-byte emoji = 120 bytes; byte 60 lands inside an emoji and
+        // used to panic the byte-index preview slice.
+        let text = "👇".repeat(30);
+        state.handle_backend_event(
+            Provider::Telegram,
+            BackendEvent::MessageReceived(Message {
+                message_id: "emoji-1".into(),
+                chat: ChatId::Telegram(101),
+                sender: "Alice".into(),
+                author_id: None,
+                text,
+                timestamp: 0,
+                from_me: false,
+                msg_actions: Vec::new(),
+                media: None,
+                reply_to_id: None,
+                reply_ctx: None,
+                pending: false,
+                failed: false,
+            }),
+        );
+
+        assert!(state.chat_state.chats[0].last_message.is_some());
+    }
+
+    #[tokio::test]
     async fn unknown_sender_message_does_not_insert_nameless_sidebar_chat() {
         let mut state = app_state().await;
         let before = state.chat_state.chats.len();
@@ -1805,6 +1923,7 @@ mod tests {
                 message_id: "transient".into(),
                 chat: ChatId::Telegram(4242),
                 sender: "Unknown".into(),
+                author_id: None,
                 text: "system ping".into(),
                 timestamp: 0,
                 from_me: false,
@@ -2090,6 +2209,7 @@ mod tests {
                     message_id: "stub-sent".into(),
                     chat: chat.clone(),
                     sender: "You".into(),
+                    author_id: None,
                     text: text.to_string(),
                     timestamp: 0,
                     from_me: true,

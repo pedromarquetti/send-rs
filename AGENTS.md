@@ -18,6 +18,14 @@ types.
   `~/.local/share/sender/sender.log` (`tracing`, level controlled by
   `RUST_LOG`).
 
+## Concepts
+
+- Messenger/Provider - The messaging service this apps integrates with
+  (Telegram/WhatsApp)
+- chat - The page/widget that displays the conversation itself
+- chat list - The list of chats returned by the Messenger
+- message - Messages from the providers: a group of messages are rendered in a chat
+
 ## Project layout
 
 - `src/backend/mod.rs` — `Messenger` trait,
@@ -33,7 +41,8 @@ types.
   events.
 - `src/tui/chat/mod.rs` — `ChatState`, `OpenChat { chat, history }`, per-chat
   scroll/drafts.
-- `src/tui/chat/chat_list.rs`, `chat_widget.rs` — sidebar and history rendering.
+- `src/tui/chat/chat_list.rs` — Chat list (displayed at the side)
+- `chat_widget.rs` — Chat view.
 
 ## Backend provider model (core invariants)
 
@@ -130,8 +139,8 @@ the pinned source above.
 - `Cargo.toml` pins `whatsapp-rust` with `default-features = false` +
   `sqlite-storage` (no bundled SQLite) to avoid duplicate `sqlite3` symbols
   against grammers-session's `libsql-ffi` — never enable
-  `sqlite-storage-bundled`, and read the Cargo.toml comment before changing
-  the dependency features.
+  `sqlite-storage-bundled`, and read the Cargo.toml comment before changing the
+  dependency features.
 
 ## Security
 
@@ -143,4 +152,5 @@ the pinned source above.
   `@s.whatsapp.net`, `@g.us` user parts), group ids, push names, or any value
   copied from the logs — those are the user's private data. Use clearly fake
   placeholders; the existing tests use the `1555000000X@s.whatsapp.net`,
-  `NNN...@lid` and `NNN@g.us` conventions. - The data gathered from the logs is probably private, so, for testing, create mock
+  `NNN...@lid` and `NNN@g.us` conventions. - The data gathered from the logs is
+  probably private, so, for testing, create mock
