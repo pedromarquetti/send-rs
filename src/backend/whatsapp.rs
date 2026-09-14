@@ -71,6 +71,14 @@ struct WhatsAppState {
     /// Peer JID string -> (online, last_seen) learned from `Event::Presence`.
     #[serde(default)]
     presence: HashMap<String, (bool, Option<i64>)>,
+    /// The account's own LID and phone-number JIDs (`to_non_ad_string`), used
+    /// to label the self-chat ("Myself") instead of the formatted phone number.
+    /// Learned from `client.lid()`/`client.pn()` on connect and history sync
+    /// (an Option so the cache survives before the first learn).
+    #[serde(default)]
+    own_lid: Option<String>,
+    #[serde(default)]
+    own_pn: Option<String>,
 }
 
 fn message_actions(from_me: bool) -> Vec<MessageAction> {
@@ -104,6 +112,16 @@ fn own_chat_id(own_lid: Option<&Jid>, own_pn: Option<&Jid>, chat: ChatId, from_m
     }
 
     chat
+}
+
+/// Whether a chat key is the account's own self-chat (own LID or own phone
+/// number). Used to label the "message yourself" thread "Myself" instead of a
+/// formatted number.
+fn is_self_chat(chat: &ChatId, own_lid: Option<&str>, own_pn: Option<&str>) -> bool {
+    let ChatId::WhatsApp(raw) = chat else {
+        return false;
+    };
+    own_lid == Some(raw.as_str()) || own_pn == Some(raw.as_str())
 }
 
 /// Build the `@s.whatsapp.net` chat id for a phone-number user-part.
@@ -695,6 +713,10 @@ impl WhatsAppMessenger {
                 let _ = tx.send(BackendEvent::QrCode(q.code.clone()));
             }
             Event::Messages(batch) => {
+                // Learn the account's own JIDs for self-chat labelling; cheap
+                // and idempotent, and live messages may precede the first
+                // history sync.
+                state.write().await.learn_own_identity(client);
                 for inbound in batch.messages.iter() {
                     // Skip status/24h broadcasts and any
                     // message with no payload: they do not
@@ -1054,6 +1076,29 @@ impl WhatsAppState {
         }
     }
 
+    /// Remember the account's own LID and phone-number JIDs for self-chat
+    /// labelling. Idempotent; both are `None` until the client knows them.
+    /// Also heals cached self-chat rows (labelled with the formatted own number
+    /// by earlier versions) the moment the identity is learned.
+    fn learn_own_identity(&mut self, client: &Client) {
+        self.own_lid = client.lid().map(|j| j.to_non_ad_string());
+        self.own_pn = client.pn().map(|j| j.to_non_ad_string());
+        self.name_self_chats();
+    }
+
+    /// Rename any cached row that addresses the account's own LID or phone
+    /// number to "Myself". WhatsApp keeps the self-thread local on the phone
+    /// (it may never arrive via HistorySync), so rows seeded from the cache
+    /// need this sweep to converge.
+    fn name_self_chats(&mut self) {
+        for chat in self.chats.iter_mut() {
+            if is_self_chat(&chat.id, self.own_lid.as_deref(), self.own_pn.as_deref()) {
+                chat.contact_name = "Myself".to_string();
+                chat.verified = false;
+            }
+        }
+    }
+
     /// Insert or update the sidebar entry for `chat` from a freshly normalized
     /// message, bumping preview and unread state. Used by the live
     /// `Event::Messages` path.
@@ -1064,6 +1109,11 @@ impl WhatsAppState {
             Some(c) => {
                 c.last_message = Some(preview);
 
+                if is_self_chat(&chat, self.own_lid.as_deref(), self.own_pn.as_deref()) {
+                    c.contact_name = "Myself".to_string();
+                    c.verified = false;
+                }
+
                 if !msg.from_me {
                     c.unread = true;
                     c.unread_count += 1;
@@ -1071,7 +1121,11 @@ impl WhatsAppState {
             }
             None => {
                 let sender = if msg.from_me {
-                    "You".to_string()
+                    if is_self_chat(&chat, self.own_lid.as_deref(), self.own_pn.as_deref()) {
+                        "Myself".to_string()
+                    } else {
+                        "You".to_string()
+                    }
                 } else {
                     msg.sender.clone()
                 };
@@ -1109,12 +1163,17 @@ impl WhatsAppState {
             return;
         }
 
-        let (contact_name, verified) = resolve_conversation_name(
-            conv,
-            &self.pushnames,
-            &self.usync_names,
-            &self.usync_verified,
-        );
+        let (contact_name, verified) =
+            if is_self_chat(&chat, self.own_lid.as_deref(), self.own_pn.as_deref()) {
+                ("Myself".to_string(), false)
+            } else {
+                resolve_conversation_name(
+                    conv,
+                    &self.pushnames,
+                    &self.usync_names,
+                    &self.usync_verified,
+                )
+            };
 
         let unread_count = conv.unread_count.unwrap_or(0) as i32;
         let fixed = conv.pinned.unwrap_or(0) > 0;
@@ -1493,6 +1552,10 @@ async fn handle_history_sync(
 
     let shared = state;
     let mut state = state.write().await;
+
+    if let Some(client) = client {
+        state.learn_own_identity(client);
+    }
 
     if state.sync_seen_at.is_none() {
         state.sync_seen_at = Some(now());
@@ -2473,6 +2536,128 @@ mod tests {
         };
         st.upsert_conversation(&fresh, ChatId::jid_to_chat_id(new_group));
         assert_eq!(st.chats[1].contact_name, new_group);
+    }
+
+    #[test]
+    fn upsert_self_chat_is_named_myself() {
+        let mut st = WhatsAppState {
+            own_lid: Some("123456789012345@lid".to_string()),
+            own_pn: Some("15551234567@s.whatsapp.net".to_string()),
+            ..Default::default()
+        };
+
+        // Self-chat keyed by the own phone number, even with a pushname that
+        // would otherwise resolve.
+        let conv = wa::Conversation {
+            id: "15551234567@s.whatsapp.net".to_string(),
+            name: Some("Test".to_string()),
+            ..Default::default()
+        };
+        st.upsert_conversation(&conv, ChatId::jid_to_chat_id("15551234567@s.whatsapp.net"));
+        assert_eq!(st.chats[0].contact_name, "Myself");
+        assert!(!st.chats[0].verified);
+
+        // Self-chat keyed by the own LID (no phone twin yet) is Myself too.
+        let lid_conv = wa::Conversation {
+            id: "123456789012345@lid".to_string(),
+            conversation_timestamp: Some(1),
+            ..Default::default()
+        };
+        st.upsert_conversation(&lid_conv, ChatId::jid_to_chat_id("123456789012345@lid"));
+        assert_eq!(st.chats[1].contact_name, "Myself");
+
+        // A peer chat is untouched by the self-chat rule.
+        let peer = wa::Conversation {
+            id: "15559998877@s.whatsapp.net".to_string(),
+            name: Some("Alice".to_string()),
+            ..Default::default()
+        };
+        st.upsert_conversation(&peer, ChatId::jid_to_chat_id("15559998877@s.whatsapp.net"));
+        assert_eq!(st.chats[2].contact_name, "Alice");
+    }
+
+    #[test]
+    fn upsert_from_message_names_self_chat_myself() {
+        let msg = Message {
+            message_id: "s-1".into(),
+            chat: ChatId::jid_to_chat_id("15551234567@s.whatsapp.net"),
+            sender: "You".into(),
+            text: "hello myself".into(),
+            timestamp: 1,
+            from_me: true,
+            author_id: None,
+            media: None,
+            msg_actions: Vec::new(),
+            reply_to_id: None,
+            reply_ctx: None,
+            pending: false,
+            failed: false,
+        };
+
+        let mut st = WhatsAppState {
+            own_pn: Some("15551234567@s.whatsapp.net".to_string()),
+            ..Default::default()
+        };
+        st.upsert_chat_from_message(ChatId::jid_to_chat_id("15551234567@s.whatsapp.net"), &msg);
+        assert_eq!(st.chats[0].contact_name, "Myself");
+        assert_eq!(st.chats[0].unread_count, 0);
+
+        // A from-me message to a peer row still uses "You".
+        let mut st2 = WhatsAppState {
+            own_pn: Some("15551234567@s.whatsapp.net".to_string()),
+            ..Default::default()
+        };
+        st2.upsert_chat_from_message(ChatId::jid_to_chat_id("15559998877@s.whatsapp.net"), &msg);
+        assert_eq!(st2.chats[0].contact_name, "You");
+
+        // A self row that already exists (seeded from a previous cache with the
+        // formatted own number) is renamed by an arriving self-message.
+        let mut st3 = WhatsAppState {
+            own_pn: Some("15551234567@s.whatsapp.net".to_string()),
+            chats: vec![Chat {
+                id: ChatId::WhatsApp("15551234567@s.whatsapp.net".to_string()),
+                contact_name: "+15 55 123-4567".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        st3.upsert_chat_from_message(ChatId::jid_to_chat_id("15551234567@s.whatsapp.net"), &msg);
+        assert_eq!(st3.chats[0].contact_name, "Myself");
+        assert!(!st3.chats[0].verified);
+    }
+
+    #[test]
+    fn name_self_chats_renames_cached_self_rows() {
+        let mut st = WhatsAppState {
+            own_lid: Some("123456789012345@lid".to_string()),
+            own_pn: Some("15551234567@s.whatsapp.net".to_string()),
+            chats: vec![
+                Chat {
+                    id: ChatId::WhatsApp("15551234567@s.whatsapp.net".to_string()),
+                    contact_name: "+15 55 123-4567".to_string(),
+                    verified: true,
+                    ..Default::default()
+                },
+                Chat {
+                    id: ChatId::WhatsApp("123456789012345@lid".to_string()),
+                    contact_name: "123456789012345".to_string(),
+                    ..Default::default()
+                },
+                Chat {
+                    id: ChatId::WhatsApp("15559998877@s.whatsapp.net".to_string()),
+                    contact_name: "Alice".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        st.name_self_chats();
+
+        assert_eq!(st.chats[0].contact_name, "Myself");
+        assert!(!st.chats[0].verified);
+        assert_eq!(st.chats[1].contact_name, "Myself");
+        assert_eq!(st.chats[2].contact_name, "Alice");
     }
 
     #[test]
