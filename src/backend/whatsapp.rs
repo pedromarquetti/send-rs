@@ -19,6 +19,7 @@ use whatsapp_rust::Client;
 use whatsapp_rust::prelude::{
     Bot, Event, Jid, MessageBuilderExt, MessageExt, MessageInfo, Server, SqliteStore, wa,
 };
+use whatsapp_rust::wacore::types::message::EditAttribute;
 use whatsapp_rust::wacore_binary::JidExt;
 use whatsapp_rust::waproto::whatsapp::HistorySync;
 use whatsapp_rust::waproto::whatsapp::Message as WaMessage;
@@ -177,11 +178,7 @@ async fn canonical_chat_id(
         return chat;
     }
 
-    let known = state
-        .read()
-        .await
-        .lid_pn
-        .contains_key(jid.user_base());
+    let known = state.read().await.lid_pn.contains_key(jid.user_base());
     if !known {
         let Some(client) = client else {
             return chat;
@@ -189,10 +186,11 @@ async fn canonical_chat_id(
         let Ok(Some(entry)) = client.get_lid_pn_entry(&jid).await else {
             return chat;
         };
-        state.write().await.lid_pn.insert(
-            jid.user_base().to_string(),
-            entry.phone_number.to_string(),
-        );
+        state
+            .write()
+            .await
+            .lid_pn
+            .insert(jid.user_base().to_string(), entry.phone_number.to_string());
     }
 
     let st = state.read().await;
@@ -746,6 +744,22 @@ impl WhatsAppMessenger {
                     }
 
                     let mut state = state.write().await;
+
+                    // A WhatsApp edit re-sends the ORIGINAL stanza id with an
+                    // edit payload: update the stored message instead of
+                    // treating it as a new or duplicate message. The batch-level
+                    // save below persists the change.
+                    if inbound.info.edit == EditAttribute::MessageEdit {
+                        let updated = state
+                            .apply_message_edit(&chat, &inbound.info, &inbound.message)
+                            .map(BackendEvent::MessageUpdated);
+                        drop(state);
+                        if let Some(ev) = updated {
+                            let _ = tx.send(ev);
+                        }
+                        continue;
+                    }
+
                     let msg = to_senders_msg(chat.clone(), &inbound.info, &inbound.message, &state);
 
                     if msg.text.is_empty() && msg.media.is_none() {
@@ -1099,6 +1113,64 @@ impl WhatsAppState {
         }
     }
 
+    /// Rewrite the text of a stored message (by its original id) and refresh
+    /// the sidebar preview. Used both for edits arriving back from the server
+    /// and for local edits confirmed by the send ack (which the server never
+    /// re-delivers in the self-chat). Returns the updated copy, or `None` when
+    /// the target is not in the cache.
+    fn edit_message_text(&mut self, chat: &ChatId, id: &MessageId, text: &str) -> Option<Message> {
+        let existing = self
+            .history
+            .get_mut(chat)?
+            .iter_mut()
+            .find(|m| m.message_id == *id)?;
+        existing.text = text.to_string();
+        let updated = existing.clone();
+        self.refresh_preview(chat);
+        Some(updated)
+    }
+
+    /// Apply a WhatsApp message edit to the stored history.
+    ///
+    /// Edits arrive as a new `Event::Messages` entry whose stanza id is the
+    /// ORIGINAL message's, carrying either the re-written body top-level
+    /// (`Message.edited_message`, peeled by `get_base_message`) or the
+    /// decrypted secret-encrypted variant inside
+    /// `protocol_message.edited_message`. The stored copy is located by the
+    /// original message id, its text swapped, the preview refreshed, and the
+    /// updated message returned for a `BackendEvent::MessageUpdated` broadcast.
+    /// Returns `None` when the edited body carries no text or the target is
+    /// not in the cache.
+    fn apply_message_edit(
+        &mut self,
+        chat: &ChatId,
+        info: &MessageInfo,
+        wa_msg: &WaMessage,
+    ) -> Option<Message> {
+        let target_id = wa_msg
+            .protocol_message
+            .as_option()
+            .and_then(|pm| pm.key.as_option())
+            .and_then(|key| key.id.as_deref())
+            .map(|id| MessageId(id.to_string()))
+            .unwrap_or_else(|| MessageId(info.id.to_string()));
+
+        let new_text = wa_msg
+            .protocol_message
+            .as_option()
+            .and_then(|pm| pm.edited_message.as_option())
+            .and_then(|m| m.get_base_message().text_content())
+            .or_else(|| wa_msg.get_base_message().text_content())
+            .unwrap_or("")
+            .to_string();
+
+        if new_text.is_empty() {
+            return None;
+        }
+
+        self.edit_message_text(chat, &target_id, &new_text)
+    }
+
     /// Insert or update the sidebar entry for `chat` from a freshly normalized
     /// message, bumping preview and unread state. Used by the live
     /// `Event::Messages` path.
@@ -1371,8 +1443,8 @@ async fn merge_lid_duplicates(
             }
             pn_history.sort_by_key(|m| m.timestamp);
         }
-        st.by_stanza_id
-            .retain(|_, (c, _)| *c != lid_chat);
+
+        st.by_stanza_id.retain(|_, (c, _)| *c != lid_chat);
         merged += 1;
         info!("WA merged duplicate LID chat {lid_bare} into {pn_chat:?}");
     }
@@ -1397,11 +1469,7 @@ async fn merge_lid_duplicates(
 /// phone-keyed twin when the key is a LID.
 fn find_peer_chat(state: &WhatsAppState, jid: &Jid) -> Option<ChatId> {
     let chat = fold_lid_key(&jid.to_non_ad_string(), state);
-    state
-        .chats
-        .iter()
-        .any(|c| c.id == chat)
-        .then_some(chat)
+    state.chats.iter().any(|c| c.id == chat).then_some(chat)
 }
 
 /// Store/lookup keys for a peer's presence state: the wire JID plus its
@@ -1459,15 +1527,14 @@ async fn learn_lid_pn(client: &Arc<Client>, sender: &Jid, state: &SharedState) -
     if let Some(pn_user) = state.read().await.lid_pn.get(&bare) {
         return Some(pn_user.clone());
     }
+
     let Ok(Some(entry)) = client.get_lid_pn_entry(sender).await else {
         return None;
     };
+
     let pn_user = entry.phone_number.to_string();
-    state
-        .write()
-        .await
-        .lid_pn
-        .insert(bare, pn_user.clone());
+    state.write().await.lid_pn.insert(bare, pn_user.clone());
+
     Some(pn_user)
 }
 
@@ -1496,8 +1563,12 @@ async fn handle_history_sync(
     let mut canonical: Vec<ChatId> = Vec::with_capacity(hs.conversations.len());
     for conversation in &hs.conversations {
         canonical.push(
-            canonical_chat_id(client, state, ChatId::jid_to_chat_id(&conversation.id.to_string()))
-                .await,
+            canonical_chat_id(
+                client,
+                state,
+                ChatId::jid_to_chat_id(&conversation.id.to_string()),
+            )
+            .await,
         );
     }
 
@@ -2026,9 +2097,11 @@ impl Messenger for WhatsAppMessenger {
         }
 
         let st = self.state.read().await;
+
         if find_peer_chat(&st, &jid).is_none() {
             return Ok(None);
         }
+
         Ok(presence_keys(&jid, &st)
             .iter()
             .find_map(|k| st.presence.get(k))
@@ -2166,6 +2239,39 @@ impl Messenger for WhatsAppMessenger {
             .await
             .map_err(BackendError::from)?;
 
+        // The server may never re-deliver the revocation (notably in the
+        // self-chat), so apply the deletion to the cached history locally and
+        // broadcast it; the poll refresh would otherwise restore the message.
+        let removed = {
+            let mut state = self.state.write().await;
+            let removed = state
+                .history
+                .get_mut(chat)
+                .map(|msg_vec| {
+                    let before = msg_vec.len();
+                    msg_vec.retain(|m| m.message_id != *id);
+                    before != msg_vec.len()
+                })
+                .unwrap_or(false);
+
+            if removed {
+                state
+                    .by_stanza_id
+                    .retain(|_, (c, mid)| !(*c == *chat && *mid == *id));
+                state.refresh_preview(chat);
+            }
+
+            removed
+        };
+
+        if removed {
+            let _ = self.tx.send(BackendEvent::MessageDeleted {
+                chat: Some(chat.clone()),
+                message_ids: vec![id.clone()],
+            });
+            self.state.read().await.save_to(&self.cache_path);
+        }
+
         Ok(())
     }
 
@@ -2185,6 +2291,20 @@ impl Messenger for WhatsAppMessenger {
             .edit_message(jid, id.to_string(), wa::Message::text(text.to_string()))
             .await
             .map_err(BackendError::from)?;
+
+        // The server may never re-deliver the edit (notably in the self-chat),
+        // so rewrite the cached history locally and broadcast the update; the
+        // poll refresh would otherwise restore the previous text.
+        let updated = {
+            let mut state = self.state.write().await;
+            state.edit_message_text(chat, id, text)
+        };
+
+        if let Some(updated) = updated {
+            let _ = self.tx.send(BackendEvent::MessageUpdated(updated));
+            self.state.read().await.save_to(&self.cache_path);
+        }
+
         Ok(())
     }
 
@@ -2284,6 +2404,24 @@ mod tests {
         info.push_name = push_name.into();
         info.timestamp = chrono::Utc.timestamp_opt(1000, 0).unwrap();
         info
+    }
+
+    fn build_msg(id: &str, text: &str, chat: &ChatId, from_me: bool) -> Message {
+        Message {
+            message_id: MessageId(id.to_string()),
+            chat: chat.clone(),
+            sender: "Alice".into(),
+            author_id: None,
+            text: text.to_string(),
+            timestamp: 1000,
+            from_me,
+            msg_actions: message_actions(from_me),
+            media: None,
+            reply_to_id: None,
+            reply_ctx: None,
+            pending: false,
+            failed: false,
+        }
     }
 
     /// Build a HistorySync message record mirroring the shape the bot decodes.
@@ -2661,6 +2799,218 @@ mod tests {
     }
 
     #[test]
+    fn edit_rewrites_stored_message_via_protocol_message() {
+        let chat = ChatId::jid_to_chat_id("15550000001@s.whatsapp.net");
+        let mut st = WhatsAppState::default();
+        st.history.insert(
+            chat.clone(),
+            vec![build_msg("orig-1", "before", &chat, false)],
+        );
+        st.chats.push(Chat {
+            id: chat.clone(),
+            last_message: Some("Alice: before".into()),
+            ..Default::default()
+        });
+
+        let wa_msg = wa::Message {
+            protocol_message: MessageField::some(wa::message::ProtocolMessage {
+                key: MessageField::some(wa::MessageKey {
+                    id: Some("orig-1".to_string()),
+                    ..Default::default()
+                }),
+                edited_message: MessageField::some(wa::Message::text("after".to_string())),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut info = msg_info(
+            &pn("15550000001"),
+            &pn("15550000001"),
+            "Alice",
+            "orig-1",
+            false,
+        );
+        info.edit = EditAttribute::MessageEdit;
+
+        let updated = st
+            .apply_message_edit(&chat, &info, &wa_msg)
+            .expect("existing target must be edited");
+        assert_eq!(updated.text, "after");
+        assert_eq!(updated.message_id, MessageId("orig-1".into()));
+        assert_eq!(st.history[&chat][0].text, "after");
+        assert_eq!(st.chats[0].last_message.as_deref(), Some("Alice: after"));
+    }
+
+    #[test]
+    fn edit_rewrites_stored_message_via_top_level_edited_message() {
+        let chat = ChatId::jid_to_chat_id("15550000001@s.whatsapp.net");
+        let mut st = WhatsAppState::default();
+        st.history.insert(
+            chat.clone(),
+            vec![build_msg("orig-1", "before", &chat, false)],
+        );
+
+        let wa_msg = wa::Message {
+            edited_message: MessageField::some(wa::message::FutureProofMessage {
+                message: MessageField::some(wa::Message::text("after".to_string())),
+            }),
+            ..Default::default()
+        };
+        // No protocol_message key: the target falls back to the stanza id.
+        let mut info = msg_info(
+            &pn("15550000001"),
+            &pn("15550000001"),
+            "Alice",
+            "orig-1",
+            false,
+        );
+        info.edit = EditAttribute::MessageEdit;
+
+        let updated = st
+            .apply_message_edit(&chat, &info, &wa_msg)
+            .expect("existing target must be edited");
+        assert_eq!(updated.text, "after");
+    }
+
+    #[test]
+    fn edit_of_unknown_message_is_ignored() {
+        let chat = ChatId::jid_to_chat_id("15550000001@s.whatsapp.net");
+        let mut st = WhatsAppState::default();
+        st.history.insert(
+            chat.clone(),
+            vec![build_msg("orig-1", "before", &chat, false)],
+        );
+
+        let wa_msg = wa::Message {
+            protocol_message: MessageField::some(wa::message::ProtocolMessage {
+                key: MessageField::some(wa::MessageKey {
+                    id: Some("other-9".to_string()),
+                    ..Default::default()
+                }),
+                edited_message: MessageField::some(wa::Message::text("after".to_string())),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut info = msg_info(
+            &pn("15550000001"),
+            &pn("15550000001"),
+            "Alice",
+            "other-9",
+            false,
+        );
+        info.edit = EditAttribute::MessageEdit;
+
+        assert!(st.apply_message_edit(&chat, &info, &wa_msg).is_none());
+        assert_eq!(st.history[&chat][0].text, "before");
+    }
+
+    #[test]
+    fn edit_with_empty_body_is_ignored() {
+        let chat = ChatId::jid_to_chat_id("15550000001@s.whatsapp.net");
+        let mut st = WhatsAppState::default();
+        st.history.insert(
+            chat.clone(),
+            vec![build_msg("orig-1", "before", &chat, false)],
+        );
+
+        let wa_msg = wa::Message {
+            protocol_message: MessageField::some(wa::message::ProtocolMessage {
+                key: MessageField::some(wa::MessageKey {
+                    id: Some("orig-1".to_string()),
+                    ..Default::default()
+                }),
+                edited_message: MessageField::some(wa::Message::text("".to_string())),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut info = msg_info(
+            &pn("15550000001"),
+            &pn("15550000001"),
+            "Alice",
+            "orig-1",
+            false,
+        );
+        info.edit = EditAttribute::MessageEdit;
+
+        assert!(st.apply_message_edit(&chat, &info, &wa_msg).is_none());
+        assert_eq!(st.history[&chat][0].text, "before");
+    }
+
+    #[test]
+    fn second_edit_overwrites_the_first() {
+        let chat = ChatId::jid_to_chat_id("15550000001@s.whatsapp.net");
+        let mut st = WhatsAppState::default();
+        st.history
+            .insert(chat.clone(), vec![build_msg("orig-1", "v1", &chat, false)]);
+        let edit_msg = |text: &str| wa::Message {
+            protocol_message: MessageField::some(wa::message::ProtocolMessage {
+                key: MessageField::some(wa::MessageKey {
+                    id: Some("orig-1".to_string()),
+                    ..Default::default()
+                }),
+                edited_message: MessageField::some(wa::Message::text(text.to_string())),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut info = msg_info(
+            &pn("15550000001"),
+            &pn("15550000001"),
+            "Alice",
+            "orig-1",
+            false,
+        );
+        info.edit = EditAttribute::MessageEdit;
+
+        st.apply_message_edit(&chat, &info, &edit_msg("v2"))
+            .expect("first edit");
+        assert_eq!(st.history[&chat][0].text, "v2");
+        st.apply_message_edit(&chat, &info, &edit_msg("v3"))
+            .expect("second edit");
+        assert_eq!(st.history[&chat][0].text, "v3");
+    }
+
+    #[test]
+    fn edit_message_text_rewrites_stored_message_and_refreshes_preview() {
+        let chat = ChatId::jid_to_chat_id("15550000001@s.whatsapp.net");
+        let mut st = WhatsAppState::default();
+        st.history.insert(
+            chat.clone(),
+            vec![build_msg("orig-1", "before", &chat, false)],
+        );
+        st.chats.push(Chat {
+            id: chat.clone(),
+            last_message: Some("Alice: before".into()),
+            ..Default::default()
+        });
+
+        let updated = st
+            .edit_message_text(&chat, &MessageId("orig-1".into()), "after")
+            .expect("found");
+        assert_eq!(updated.text, "after");
+        assert_eq!(updated.message_id, MessageId("orig-1".into()));
+        assert_eq!(st.history[&chat][0].text, "after");
+        assert_eq!(st.chats[0].last_message.as_deref(), Some("Alice: after"));
+    }
+
+    #[test]
+    fn edit_message_text_ignores_unknown_message() {
+        let chat = ChatId::jid_to_chat_id("15550000001@s.whatsapp.net");
+        let mut st = WhatsAppState::default();
+        st.history.insert(
+            chat.clone(),
+            vec![build_msg("orig-1", "before", &chat, false)],
+        );
+        assert!(
+            st.edit_message_text(&chat, &MessageId("nope".into()), "after")
+                .is_none()
+        );
+        assert_eq!(st.history[&chat][0].text, "before");
+    }
+
+    #[test]
     fn chat_id_drops_device_qualifier() {
         let jids = [
             Jid::from_str("15551234567@s.whatsapp.net").unwrap(),
@@ -2787,14 +3137,10 @@ mod tests {
             pending: false,
             failed: false,
         };
-        st.history.insert(
-            old.id.clone(),
-            vec![msg("old", 1000, &old.id)],
-        );
-        st.history.insert(
-            fresh.id.clone(),
-            vec![msg("fresh", 3000, &fresh.id)],
-        );
+        st.history
+            .insert(old.id.clone(), vec![msg("old", 1000, &old.id)]);
+        st.history
+            .insert(fresh.id.clone(), vec![msg("fresh", 3000, &fresh.id)]);
         let order: Vec<_> = sorted_chat_snapshot(&st)
             .into_iter()
             .map(|c| c.id)
