@@ -919,8 +919,8 @@ impl WhatsAppMessenger {
                 }
             }
             Event::MarkChatAsReadUpdate(u) => {
-                let mut state = state.write().await;
-                if let Some(chat) = state
+                let mut guard = state.write().await;
+                if let Some(chat) = guard
                     .chats
                     .iter_mut()
                     .find(|c| c.id == ChatId::jid_to_chat_id(&u.jid.to_string()))
@@ -933,6 +933,8 @@ impl WhatsAppMessenger {
                         unread_count: 0,
                     });
                 }
+                drop(guard);
+                state.read().await.save_to(cache_path);
             }
             Event::OfflineSyncPreview(p) => {
                 info!(
@@ -1265,10 +1267,12 @@ impl WhatsAppState {
                     c.contact_name = contact_name;
                     c.verified = verified;
                 }
-                c.unread_count = unread_count
-                    .max(c.unread_count)
-                    .max(if c.unread { 1 } else { 0 });
-                c.unread = unread_count > 0 || c.unread;
+
+                // The HistorySync snapshot is the server's authoritative unread
+                // state (reading on the phone lowers it there); do not keep a
+                // stale grow-only high-water mark that resurrects read chats.
+                c.unread_count = unread_count;
+                c.unread = unread_count > 0;
                 c.fixed = fixed;
             }
             None => self.chats.push(Chat {
@@ -2047,6 +2051,8 @@ impl Messenger for WhatsAppMessenger {
         }
         drop(state);
 
+        self.state.read().await.save_to(&self.cache_path);
+
         let _ = self.tx.send(BackendEvent::UnreadUpdated {
             chat: chat.clone(),
             unread: false,
@@ -2374,6 +2380,11 @@ impl Messenger for WhatsAppMessenger {
         }
     }
 
+    /// Graceful shutdown only: Senders never logs out of WhatsApp. This closes
+    /// the connection and flushes pending state via `Client::disconnect`, but it
+    /// does NOT unlink the device (`wa.db` is kept), so the next launch stays
+    /// paired and skips the QR flow. A real device logout/unlink is deliberate
+    /// and out of scope — never call `Client::logout()` here.
     async fn logout(&mut self) -> Result<(), BackendError> {
         self.check_logged_in().await?;
         self.current_client().disconnect().await;
@@ -2386,6 +2397,7 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use whatsapp_rust::prelude::MessageField;
+    use whatsapp_rust::wacore::types::message::MessageSource;
 
     fn pn(num: &str) -> Jid {
         Jid::pn(num)
@@ -2396,14 +2408,18 @@ mod tests {
     }
 
     fn msg_info(chat: &Jid, sender: &Jid, push_name: &str, id: &str, from_me: bool) -> MessageInfo {
-        let mut info = MessageInfo::default();
-        info.id = id.into();
-        info.source.chat = chat.clone();
-        info.source.sender = sender.clone();
-        info.source.is_from_me = from_me;
-        info.push_name = push_name.into();
-        info.timestamp = chrono::Utc.timestamp_opt(1000, 0).unwrap();
-        info
+        MessageInfo {
+            source: MessageSource {
+                chat: chat.clone(),
+                sender: sender.clone(),
+                is_from_me: from_me,
+                ..Default::default()
+            },
+            id: id.into(),
+            push_name: push_name.into(),
+            timestamp: chrono::Utc.timestamp_opt(1000, 0).unwrap(),
+            ..Default::default()
+        }
     }
 
     fn build_msg(id: &str, text: &str, chat: &ChatId, from_me: bool) -> Message {
@@ -2674,6 +2690,42 @@ mod tests {
         };
         st.upsert_conversation(&fresh, ChatId::jid_to_chat_id(new_group));
         assert_eq!(st.chats[1].contact_name, new_group);
+    }
+
+    #[test]
+    fn upsert_snapshot_clears_cached_unread() {
+        let chat = ChatId::jid_to_chat_id("15550000001@s.whatsapp.net");
+        // A chat that was unread when the app last shut down...
+        let mut st = WhatsAppState {
+            chats: vec![Chat {
+                id: chat.clone(),
+                contact_name: "Alice".to_string(),
+                unread: true,
+                unread_count: 3,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        // ...is cleared once the phone has read it and the sync snapshot says 0.
+        let read_conv = wa::Conversation {
+            id: "15550000001@s.whatsapp.net".to_string(),
+            unread_count: Some(0),
+            ..Default::default()
+        };
+        st.upsert_conversation(&read_conv, chat.clone());
+        assert!(!st.chats[0].unread);
+        assert_eq!(st.chats[0].unread_count, 0);
+
+        // A snapshot with unread still bumps a previously-read chat.
+        let unread_conv = wa::Conversation {
+            id: "15550000001@s.whatsapp.net".to_string(),
+            unread_count: Some(2),
+            ..Default::default()
+        };
+        st.upsert_conversation(&unread_conv, chat.clone());
+        assert!(st.chats[0].unread);
+        assert_eq!(st.chats[0].unread_count, 2);
     }
 
     #[test]

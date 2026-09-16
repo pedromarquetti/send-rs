@@ -1175,6 +1175,7 @@ impl AppState {
                         entry.unread = unread;
                         entry.unread_count = unread_count;
                     }
+                    self.persist_chats();
                 }
             }
 

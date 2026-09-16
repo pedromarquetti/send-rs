@@ -1,5 +1,21 @@
 # Welcome to Sender!
 
+<!--toc:start-->
+
+- [Welcome to Sender!](#welcome-to-sender)
+  - [Features](#features)
+  - [Configuration](#configuration)
+    - [Example `config.toml`:](#example-configtoml)
+      - [Top-level options](#top-level-options)
+      - [Providers](#providers)
+    - [Telegram Setup](#telegram-setup)
+    - [WhatsApp Setup](#whatsapp-setup)
+  - [Controls / Key Bindings](#controls-key-bindings)
+  - [Built with](#built-with)
+  - [Inspirations](#inspirations)
+
+<!--toc:end-->
+
 Sender is an TUI app for interacting with Whatsapp AND telegram (maybe more in
 the future?) in one TUI app!
 
@@ -20,7 +36,8 @@ the future?) in one TUI app!
 - [ ] Telegram integration
 - [ ] Message actions (reply, edit, delete) for telegram
 - [ ] Support for notifications
-- [ ] Support for endless chat scroll (currently limited history fetch)
+- [x] **Telegram** - Support for endless chat scroll.
+- [ ] **WhatsApp** - Support for endless chat scroll.
 - [ ] Image rendering
 - [ ] Audio playback
 - [ ] Ordered chat list - All chats, ordered by pinned/most recent.
@@ -75,12 +92,12 @@ whatsapp = false
 
 #### Top-level options
 
-| Key                       | Default | Description                                                                                                                                                                                                                                                                                                   |
-| ------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `max_write_lines`         | `5`     | How many text lines the Write box can grow to. The input wraps long lines and scrolls once it exceeds that.                                                                                                                                                                                                   |
-| `chat_poll_interval_secs` | `10`    | Fallback interval (in seconds) for reconciling messages in the **currently open** chat when push updates are unavailable. Lower values feel more responsive but use more resources.                                                                                                            |
-| `sync_update_state_secs`  | `120`   | How often (in seconds) the Telegram client persists its internal update-state (pts/qts/seq) to the session file. This does **not** call any Telegram API — it only saves local state so that `catch_up` on restart is faster. I recommend setting a high value, because it does consume Disk IO               |
-| `sidebar_sync_secs`       | `10`    | How often (in seconds) the TUI fetches the full dialog list from Telegram to detect **unread-count changes across all chats**. This is the mechanism that updates unread indicators on chats you are not currently viewing. Increase this if you notice high CPU usage; decrease it for snappier unread dots. |
+| Key                       | Default | Description                                                                                                                                                                                                                                                                                                                                      |
+| ------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `max_write_lines`         | `5`     | How many text lines the Write box can grow to. The input wraps long lines and scrolls once it exceeds that.                                                                                                                                                                                                                                      |
+| `chat_poll_interval_secs` | `10`    | Fallback interval (in seconds) for reconciling messages in the **currently open** chat (any provider) when push updates are unavailable. Lower values feel more responsive but use more resources.                                                                                                                                               |
+| `sync_update_state_secs`  | `120`   | Telegram-only. How often (in seconds) the Telegram client persists its internal update-state (pts/qts/seq) to the session file. This does **not** call any Telegram API — it only saves local state so that `catch_up` on restart is faster. I recommend setting a high value, because it does consume Disk IO                                   |
+| `sidebar_sync_secs`       | `10`    | How often (in seconds) the TUI fetches the full chat list from the enabled providers (Telegram and WhatsApp) to detect **unread-count changes across all chats**. This is the mechanism that updates unread indicators on chats you are not currently viewing. Increase this if you notice high CPU usage; decrease it for snappier unread dots. |
 
 #### Providers
 
@@ -102,7 +119,7 @@ Add them to your `config.toml`:
 
 ```toml
 [providers.telegram]
-enabled = true
+enabled = true # This can also be enabled in-app
 api_id = 12345678
 api_hash = "your_api_hash_here"
 ```
@@ -111,7 +128,30 @@ On first launch the app will prompt you for your Telegram phone number and a
 verification code. After a successful login the session is stored locally so you
 won't need to log in again.
 
-## Controls
+### WhatsApp Setup
+
+WhatsApp has no credentials — pairing happens through a QR code:
+
+1. Turn WhatsApp on in the settings screen (inside the app: **Settings > enable
+   WhatsApp**), or set `whatsapp = true` in the config file:
+
+   ```toml
+   [providers]
+   whatsapp = true
+   ```
+
+2. A QR code appears in the login screen. On your phone open **WhatsApp >
+   Settings > Linked devices > Link a device** and scan it.
+
+3. Once linked, the session is stored under `wa.db` in the same directory as the
+   config file, so the next launch is already paired (no QR needed).
+
+> [!NOTE]
+> Closing Senders gracefully disconnects but **never logs your device out of
+> WhatsApp** — your linked device stays active. To remove it, unlink it from the
+> phone (WhatsApp > Linked devices) instead.
+
+## Controls / Key Bindings
 
 | Keys        | Pane / Mode   | Action                                                                                                                                                                  |
 | ----------- | ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
