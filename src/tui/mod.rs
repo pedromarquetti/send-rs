@@ -633,6 +633,8 @@ impl App {
             Focus::ChatList => {
                 if key == km.scroll_up {
                     self.state.chat_state.chat_list_state.select_previous();
+                } else if key == km.scroll_to_bottom {
+                    self.state.chat_state.chat_list_state.select_last();
                 } else if key == km.scroll_down {
                     self.state.chat_state.chat_list_state.select_next();
                 } else if key == km.select

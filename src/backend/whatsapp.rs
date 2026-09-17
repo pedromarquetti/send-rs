@@ -173,14 +173,17 @@ async fn canonical_chat_id(
     let ChatId::WhatsApp(raw) = &chat else {
         return chat;
     };
+
     let Ok(jid) = Jid::from_str(raw) else {
         return chat;
     };
+
     if !jid.is_lid() {
         return chat;
     }
 
     let known = state.read().await.lid_pn.contains_key(jid.user_base());
+
     if !known {
         let Some(client) = client else {
             return chat;
@@ -908,15 +911,32 @@ impl WhatsAppMessenger {
                 }
             }
             Event::PinUpdate(u) => {
-                let mut state = state.write().await;
-                if let Some(chat) = state
-                    .chats
-                    .iter_mut()
-                    .find(|c| c.id == ChatId::jid_to_chat_id(&u.jid.to_string()))
-                {
-                    chat.fixed = u.action.pinned.unwrap_or(false);
-                    let _ = tx.send(BackendEvent::ChatUpdated(chat.clone()));
+                debug!("Pinning event! {:?}", u);
+                // WhatsApp pins 1:1 threads by LID on the wire, but the chat
+                // list rows are canonicalized to their phone-keyed twins; fold
+                // the pin JID the same way live messages are folded (async
+                // LID↔PN lookup must stay outside the write lock).
+                let chat = canonical_chat_id(
+                    Some(client),
+                    state,
+                    ChatId::jid_to_chat_id(&u.jid.to_string()),
+                )
+                .await;
+
+                let mut guard = state.write().await;
+
+                if let Some(chat_row) = guard.chats.iter_mut().find(|c| c.id == chat) {
+                    chat_row.fixed = u.action.pinned.unwrap_or(false);
                 }
+
+                // Republish the whole list (pinned rows sort first) so the TUI
+                // reflects both pin and unpin; `ChatUpdated` via `upsert_chat`
+                // can only ever set `fixed = true` and could not clear one.
+                let snapshot = sorted_chat_snapshot(&guard);
+                drop(guard);
+                state.read().await.save_to(cache_path);
+
+                let _ = tx.send(BackendEvent::ChatList(snapshot));
             }
             Event::ArchiveUpdate(u) => {
                 let mut state = state.write().await;
@@ -972,10 +992,12 @@ impl WhatsAppMessenger {
                 let state_for_enrich = state.clone();
                 let cache_path = cache_path.clone();
                 let tx_for_enrich = tx.clone();
+
                 tokio::spawn(async move {
                     enrich_chat_names(&client, &state_for_enrich, &cache_path, &tx_for_enrich)
                         .await;
                 });
+
                 let st = state.read().await;
                 let snapshot = sorted_chat_snapshot(&st);
                 drop(st);
@@ -1221,7 +1243,7 @@ impl WhatsAppState {
 
                 let contact_name = if sender.is_empty() || sender == "Unknown" {
                     match &chat {
-                        ChatId::WhatsApp(jid) => Jid::from_str(&jid)
+                        ChatId::WhatsApp(jid) => Jid::from_str(jid)
                             .map(|j| j.user_base().to_string())
                             .unwrap_or_else(|_| jid.clone()),
                         _ => "Unknown".to_string(),
@@ -1265,7 +1287,11 @@ impl WhatsAppState {
             };
 
         let unread_count = conv.unread_count.unwrap_or(0) as i32;
-        let fixed = conv.pinned.unwrap_or(0) > 0;
+        
+        // WhatsApp syncs `pinned` as None in practice (pins arrive only via
+        // PinUpdate), so a sync must never clobber an applied pin back to
+        // false. Write `fixed` only when the conversation carries a pin value.
+        let fixed = conv.pinned.map(|pinned| pinned > 0);
 
         let exists = self.chats.iter().any(|c| c.id == chat);
         let name_for_log = contact_name.clone();
@@ -1288,14 +1314,16 @@ impl WhatsAppState {
                 // stale grow-only high-water mark that resurrects read chats.
                 c.unread_count = unread_count;
                 c.unread = unread_count > 0;
-                c.fixed = fixed;
+                if let Some(fixed) = fixed {
+                    c.fixed = fixed;
+                }
             }
             None => self.chats.push(Chat {
                 id: chat,
                 contact_name,
                 unread: unread_count > 0,
                 unread_count,
-                fixed,
+                fixed: fixed.unwrap_or(false),
                 verified,
                 ..Default::default()
             }),
@@ -1451,6 +1479,7 @@ async fn merge_lid_duplicates(
                 pn_row.last_message = orphan.last_message;
             }
             pn_row.verified = pn_row.verified || orphan.verified;
+            pn_row.fixed = pn_row.fixed || orphan.fixed;
         }
 
         if let Some(history) = st.history.remove(&lid_chat) {
@@ -1815,6 +1844,7 @@ async fn handle_history_sync(
 /// phone number) under both the peer LID and PN keys, refreshes the cached chat
 /// rows, and persists the cache. Already-queried peers are skipped so a contact
 /// without a username/business name is not re-queried on every history sync.
+// BUG: WhatsApp: This is not working properly: Contact names in Chat view are being rendered incorrectly (not by their name, but by phone number or id).
 async fn enrich_chat_names(
     client: &Arc<Client>,
     state: &SharedState,
@@ -1852,12 +1882,14 @@ async fn enrich_chat_names(
         }
         out
     };
+
     if candidates.is_empty() {
         return;
     }
 
     debug!("WA usync enrichment: {}-chat batch", candidates.len());
     let mut updated = false;
+
     for chunk in candidates.chunks(100) {
         match client.contacts().is_on_whatsapp(chunk).await {
             Ok(results) => {
@@ -2846,6 +2878,69 @@ mod tests {
         st.upsert_conversation(&unread_conv, chat.clone());
         assert!(st.chats[0].unread);
         assert_eq!(st.chats[0].unread_count, 2);
+    }
+
+    #[test]
+    fn upsert_snapshot_without_pin_preserves_applied_fixed() {
+        // WhatsApp syncs `pinned` as None in practice; pins arrive only via
+        // PinUpdate. A snapshot must never reset a pinned chat back to false.
+        let chat = ChatId::jid_to_chat_id("15550000001@s.whatsapp.net");
+        let mut st = WhatsAppState {
+            chats: vec![Chat {
+                id: chat.clone(),
+                contact_name: "Alice".to_string(),
+                fixed: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let conv = wa::Conversation {
+            id: "15550000001@s.whatsapp.net".to_string(),
+            ..Default::default()
+        };
+        st.upsert_conversation(&conv, chat.clone());
+        assert!(
+            st.chats[0].fixed,
+            "a None-pinned history sync must not unpin an applied pin"
+        );
+
+        // A sync that does carry a pin value is authoritative: Some(1) keeps it,
+        // Some(0) clears it.
+        let pinned = wa::Conversation {
+            id: "15550000001@s.whatsapp.net".to_string(),
+            pinned: Some(1),
+            ..Default::default()
+        };
+        st.upsert_conversation(&pinned, chat.clone());
+        assert!(st.chats[0].fixed);
+
+        let unpinned = wa::Conversation {
+            id: "15550000001@s.whatsapp.net".to_string(),
+            pinned: Some(0),
+            ..Default::default()
+        };
+        st.upsert_conversation(&unpinned, chat.clone());
+        assert!(!st.chats[0].fixed, "Some(0) is an explicit unpin");
+    }
+
+    #[tokio::test]
+    async fn canonical_chat_id_folds_known_lid_pin_to_phone_row() {
+        // The PinUpdate handler canonicalizes the wire LID the same way live
+        // messages are folded, so an offline client (mapping already cached)
+        // resolves the pin to the phone-keyed row the list stores.
+        let pn_chat = ChatId::WhatsApp("15550000001@s.whatsapp.net".to_string());
+        let state: SharedState = Arc::new(RwLock::new(WhatsAppState {
+            chats: vec![Chat {
+                id: pn_chat.clone(),
+                ..Default::default()
+            }],
+            lid_pn: HashMap::from([("255202829570287".to_string(), "15550000001".to_string())]),
+            ..Default::default()
+        }));
+
+        let lid = ChatId::jid_to_chat_id("255202829570287@lid");
+        assert_eq!(canonical_chat_id(None, &state, lid).await, pn_chat);
     }
 
     #[test]
