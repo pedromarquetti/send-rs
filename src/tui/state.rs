@@ -510,6 +510,51 @@ impl AppState {
         }
     }
 
+    /// Apply a lazy-history page produced by `App::load_more_history` to the
+    /// open chat, stitching the older messages in front of the current history.
+    /// The chat-id guard is the only check needed: fetching runs in a single
+    /// in-flight slot (`App::chat_load_task`), so a page can never be overtaken
+    /// by another page for the same or a different chat.
+    pub fn apply_history_page(
+        &mut self,
+        chat_id: &ChatId,
+        result: std::result::Result<Vec<Message>, BackendError>,
+    ) {
+        let Some(open) = self.chat_state.open_chat.as_mut() else {
+            return;
+        };
+        if open.chat.id != *chat_id {
+            return;
+        }
+
+        match result {
+            Ok(older) if !older.is_empty() => {
+                let existing = open.history.clone();
+                let filtered = older
+                    .into_iter()
+                    .filter(|msg| {
+                        !existing
+                            .iter()
+                            .any(|item| item.message_id == msg.message_id)
+                    })
+                    .collect::<Vec<_>>();
+
+                if !filtered.is_empty() {
+                    let count = filtered.len();
+                    self.chat_state.prepend_history(chat_id, filtered);
+                    self.chat_state.message_list_state.select(Some(count));
+                }
+            }
+            Ok(_) => {
+                open.has_more_history = false;
+            }
+            Err(err) => {
+                open.has_more_history = false;
+                error!(chat = ?chat_id, error = %err, "Lazy history load failed");
+            }
+        }
+    }
+
     /// Inserts pasted text into the write box if it has focus.
     pub fn handle_paste(&mut self, text: String) {
         if self.focus == Focus::Write {
@@ -1004,6 +1049,7 @@ impl AppState {
                 }
             }
             BackendEvent::Status(status) => {
+                // TODO: make this auto dissapear
                 self.backend_status = (!status.is_empty()).then_some(status);
             }
             BackendEvent::Disconnected(message) => {
@@ -1423,6 +1469,164 @@ mod tests {
                 .iter()
                 .all(|c| c.id.to_provider() == Provider::Telegram),
             "WhatsApp chats must be removed after disabling"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_history_page_prepends_older_and_filters_duplicates() {
+        let mut state = app_state().await;
+        state.config.providers.whatsapp = false;
+        state.chat_state.chat_list_state.select(Some(0));
+        state.select_chat(0).await;
+
+        let chat_id = state.chat_state.open_chat.as_ref().unwrap().chat.id.clone();
+        let before = state.chat_state.open_chat.as_ref().unwrap().history.len();
+        let first_existing = state
+            .chat_state
+            .open_chat
+            .as_ref()
+            .unwrap()
+            .history
+            .first()
+            .map(|m| m.message_id.clone())
+            .expect("opened chat must have history");
+
+        let older = vec![
+            Message {
+                message_id: "older-1".into(),
+                chat: chat_id.clone(),
+                sender: "Alice".into(),
+                author_id: None,
+                text: "older still".into(),
+                timestamp: -1000,
+                from_me: false,
+                msg_actions: Vec::new(),
+                media: None,
+                reply_to_id: None,
+                reply_ctx: None,
+                pending: false,
+                failed: false,
+            },
+            // A duplicate of an already-cached message must be filtered away.
+            Message {
+                message_id: first_existing,
+                chat: chat_id.clone(),
+                sender: "Alice".into(),
+                author_id: None,
+                text: "duplicate".into(),
+                timestamp: -1000,
+                from_me: false,
+                msg_actions: Vec::new(),
+                media: None,
+                reply_to_id: None,
+                reply_ctx: None,
+                pending: false,
+                failed: false,
+            },
+        ];
+
+        state.apply_history_page(&chat_id, Ok(older));
+
+        let open = state.chat_state.open_chat.as_ref().unwrap();
+        assert!(
+            open.has_more_history,
+            "a non-empty page keeps lazy loading enabled"
+        );
+        assert_eq!(open.history.len(), before + 1, "duplicate must be filtered");
+        assert_eq!(
+            open.history.first().map(|m| &m.message_id),
+            Some(&MessageId("older-1".into())),
+            "the older page is stitched in front"
+        );
+        assert_eq!(
+            state.chat_state.message_list_state.selected(),
+            Some(1),
+            "selection lands on the first message of the freshly prepended page"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_history_page_empty_or_error_disables_lazy_load() {
+        let mut state = app_state().await;
+        state.config.providers.whatsapp = false;
+        state.chat_state.chat_list_state.select(Some(0));
+        state.select_chat(0).await;
+
+        let chat_id = state.chat_state.open_chat.as_ref().unwrap().chat.id.clone();
+        let len = state.chat_state.open_chat.as_ref().unwrap().history.len();
+
+        state.apply_history_page(&chat_id, Ok(Vec::new()));
+        assert!(
+            !state
+                .chat_state
+                .open_chat
+                .as_ref()
+                .unwrap()
+                .has_more_history,
+            "an empty page means the server has no older messages"
+        );
+        assert_eq!(
+            state.chat_state.open_chat.as_ref().unwrap().history.len(),
+            len,
+            "an empty page must not alter the history"
+        );
+
+        state
+            .chat_state
+            .open_chat
+            .as_mut()
+            .unwrap()
+            .has_more_history = true;
+        state.apply_history_page(&chat_id, Err(BackendError::Other("expired".into())));
+        assert!(
+            !state
+                .chat_state
+                .open_chat
+                .as_ref()
+                .unwrap()
+                .has_more_history,
+            "a failed fetch also stops lazy loading for this chat"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_history_page_ignores_results_for_another_chat() {
+        let mut state = app_state().await;
+        state.config.providers.whatsapp = false;
+        state.chat_state.chat_list_state.select(Some(0));
+        state.select_chat(0).await;
+
+        let len = state.chat_state.open_chat.as_ref().unwrap().history.len();
+        let other_id = ChatId::Telegram(999_999);
+
+        state.apply_history_page(
+            &other_id,
+            Ok(vec![Message {
+                message_id: "stale".into(),
+                chat: other_id.clone(),
+                sender: "Alice".into(),
+                author_id: None,
+                text: "for another chat".into(),
+                timestamp: -1000,
+                from_me: false,
+                msg_actions: Vec::new(),
+                media: None,
+                reply_to_id: None,
+                reply_ctx: None,
+                pending: false,
+                failed: false,
+            }]),
+        );
+
+        let open = state.chat_state.open_chat.as_ref().unwrap();
+        assert_eq!(
+            open.history.len(),
+            len,
+            "stale result must not touch the open chat"
+        );
+        assert!(
+            open.has_more_history,
+            "a result for another chat cannot turn off lazy loading"
         );
     }
 

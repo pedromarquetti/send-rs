@@ -39,6 +39,9 @@ enum UiEvent {
     Resize(u16, u16),
     HistoryRefresh(ChatId, Vec<backend::Message>),
     HistoryRefreshResult(ChatId, Result<Vec<backend::Message>, backend::BackendError>),
+    /// Result of a backgrounded lazy-history load (scroll-up with the chat at its
+    /// topmost message); applied by `AppState::apply_history_page`.
+    HistoryPageResult(ChatId, Result<Vec<backend::Message>, backend::BackendError>),
     ChatLoaded {
         chat: backend::Chat,
         generation: u64,
@@ -337,6 +340,14 @@ async fn run_app(
                             error!(chat = ?chat_id, error = %e, "Poll refresh failed");
                         }
                     }
+                    UiEvent::HistoryPageResult(chat_id, result) => {
+                        if app.state.chat_state.open_chat.as_ref().map(|open| &open.chat.id)
+                            != Some(&chat_id)
+                        {
+                            continue;
+                        }
+                        app.state.apply_history_page(&chat_id, result);
+                    }
                         UiEvent::ChatLoaded {
                             chat,
                             generation,
@@ -462,7 +473,7 @@ impl App {
         self.state.cancel_chat_load();
     }
 
-    async fn load_more_history(&mut self) {
+    fn load_more_history(&mut self) {
         let Some(chat_id) = self
             .state
             .chat_state
@@ -481,7 +492,7 @@ impl App {
             return;
         };
 
-        let Some(open) = self.state.chat_state.open_chat.as_mut() else {
+        let Some(open) = self.state.chat_state.open_chat.as_ref() else {
             return;
         };
 
@@ -489,37 +500,19 @@ impl App {
             return;
         }
 
+        // Telegram paginates by numeric message id; WhatsApp's ids are opaque
+        // (`to_i32()` → `None`), so the backend anchors on its own oldest cached
+        // message instead. Fetch in a background task: WhatsApp's on-demand sync
+        // can take seconds, and waiting on it inline would freeze the UI.
         let offset_id = open.history.first().and_then(|msg| msg.message_id.to_i32());
 
-        let result: Result<Vec<_>, backend::BackendError> =
-            messenger.history_page(&chat_id, offset_id, 25).await;
-
-        match result {
-            Ok(older) if !older.is_empty() => {
-                let existing = open.history.clone();
-                let filtered = older
-                    .into_iter()
-                    .filter(|msg| {
-                        !existing
-                            .iter()
-                            .any(|item| item.message_id == msg.message_id)
-                    })
-                    .collect::<Vec<_>>();
-
-                if !filtered.is_empty() {
-                    let count = filtered.len();
-                    self.state.chat_state.prepend_history(&chat_id, filtered);
-                    self.state.chat_state.message_list_state.select(Some(count));
-                }
-            }
-            Ok(_) => {
-                open.has_more_history = false;
-            }
-            Err(err) => {
-                open.has_more_history = false;
-                error!(chat = ?chat_id, error = %err, "Lazy history load failed");
-            }
-        }
+        self.cancel_chat_load();
+        let tx = self.tx.clone();
+        let task_chat = chat_id.clone();
+        self.chat_load_task = Some(tokio::spawn(async move {
+            let result = messenger.history_page(&task_chat, offset_id, 25).await;
+            let _ = tx.send(UiEvent::HistoryPageResult(task_chat, result));
+        }));
     }
 
     async fn shutdown(&mut self) {
@@ -666,7 +659,7 @@ impl App {
                         .selected()
                         .is_some_and(|current| current == 0)
                     {
-                        self.load_more_history().await;
+                        self.load_more_history();
                     } else {
                         self.state.chat_state.message_list_state.select_previous();
                     }
@@ -688,7 +681,7 @@ impl App {
                         let new = current.saturating_sub(page);
                         self.state.chat_state.message_list_state.select(Some(new));
                     } else {
-                        self.load_more_history().await;
+                        self.load_more_history();
                     }
                 } else if key.code == KeyCode::PageDown {
                     // TODO: use scroll_up_by/ scroll_down_by here

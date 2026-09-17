@@ -1,7 +1,6 @@
 # Welcome to Sender!
 
 <!--toc:start-->
-
 - [Welcome to Sender!](#welcome-to-sender)
   - [Features](#features)
   - [Configuration](#configuration)
@@ -13,7 +12,6 @@
   - [Controls / Key Bindings](#controls-key-bindings)
   - [Built with](#built-with)
   - [Inspirations](#inspirations)
-
 <!--toc:end-->
 
 Sender is an TUI app for interacting with Whatsapp AND telegram (maybe more in
@@ -150,6 +148,13 @@ WhatsApp has no credentials — pairing happens through a QR code:
 > Closing Senders gracefully disconnects but **never logs your device out of
 > WhatsApp** — your linked device stays active. To remove it, unlink it from the
 > phone (WhatsApp > Linked devices) instead.
+
+> [!NOTE]
+> WhatsApp scroll-to-top (PageUp / `k` at the first message) requests older
+> messages from your primary phone via an on-demand history sync. The phone must
+> be online and reachable; if it ignores the request, Senders times out after
+> 10 seconds and keeps whatever is currently cached (scroll up again later to
+> retry).
 
 ## Controls / Key Bindings
 

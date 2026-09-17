@@ -120,6 +120,8 @@ pub struct Keymap {
     pub quit: KeyEvent,
     pub open_settings: KeyEvent,
     pub focus_write: KeyEvent,
+    // TODO: add scroll_top
+    // gg?
     pub scroll_to_bottom: KeyEvent,
     pub send: KeyEvent,
     /// Enter (with a modifier) also inserts a newline; this key is honored if the terminal

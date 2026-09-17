@@ -19,10 +19,12 @@ use whatsapp_rust::Client;
 use whatsapp_rust::prelude::{
     Bot, Event, Jid, MessageBuilderExt, MessageExt, MessageInfo, Server, SqliteStore, wa,
 };
+use whatsapp_rust::wacore::store::DevicePropsOverride;
 use whatsapp_rust::wacore::types::message::EditAttribute;
 use whatsapp_rust::wacore_binary::JidExt;
 use whatsapp_rust::waproto::whatsapp::HistorySync;
 use whatsapp_rust::waproto::whatsapp::Message as WaMessage;
+use whatsapp_rust::waproto::whatsapp::device_props::HistorySyncConfig;
 
 type SharedState = Arc<RwLock<WhatsAppState>>;
 
@@ -540,6 +542,16 @@ impl WhatsAppMessenger {
 
         let builder = Bot::builder()
             .with_backend(store)
+            .with_device_props(
+                DevicePropsOverride::new()
+                    .with_os("Sende-rs")
+                    .with_history_sync_config(HistorySyncConfig {
+                        // enabling on-demand history fetch
+                        on_demand_ready: Some(true),
+                        complete_on_demand_ready: Some(true),
+                        ..whatsapp_rust::wacore::store::device::default_history_sync_config()
+                    }),
+            )
             .on_connected({
                 let tx = tx.clone();
                 let state = state.clone();
@@ -2065,11 +2077,6 @@ impl Messenger for WhatsAppMessenger {
     }
 
     async fn history(&self, chat: &ChatId) -> Result<Vec<Message>, BackendError> {
-        // `history_page` intentionally uses the `Messenger` trait default (full
-        // history load): the pinned whatsapp-rust has no before-message
-        // pagination cursor, and mapping WhatsApp's opaque message id onto the
-        // trait's numeric `Option<i32>` offset would silently drop or duplicate
-        // messages. Pagination lands when a reliable opaque cursor exists.
         let state = self.state.read().await;
         let chat = match chat {
             ChatId::WhatsApp(raw) => fold_lid_key(raw, &state),
@@ -2078,6 +2085,116 @@ impl Messenger for WhatsAppMessenger {
         // The cache is kept oldest-to-newest; re-sort defensively by timestamp so
         // the TUI always renders chronological order regardless of ingest path.
         let mut messages = state.history.get(&chat).cloned().unwrap_or_default();
+        messages.sort_by_key(|m| m.timestamp);
+        Ok(messages)
+    }
+
+    async fn history_page(
+        &self,
+        chat: &ChatId,
+        _offset_id: Option<i32>,
+        limit: usize,
+    ) -> Result<Vec<Message>, BackendError> {
+        self.check_logged_in().await?;
+
+        // WhatsApp has no numeric before-message cursor, so the trait's
+        // `Option<i32>` offset is unused here (the TUI always passes `None`,
+        // since opaque message ids have no i32 form). The anchor is instead the
+        // oldest message already cached — the topmost one the user can see —
+        // derived from our own state, keeping `telegram.rs` and the shared
+        // trait untouched. Resolve it (plus the cache row's key) before any
+        // await so the state lock is not held across the network request.
+        let (chat, anchor) = {
+            let state = self.state.read().await;
+            let chat = match chat {
+                ChatId::WhatsApp(raw) => fold_lid_key(raw, &state),
+                other => other.clone(),
+            };
+
+            // The cache is not kept globally sorted: each history-sync chunk
+            // appends in arrival order (chunks often stream newest-first or an
+            // older full sync after a recent one), so the first *inserted*
+            // message is not necessarily the oldest. The on-demand cursor must
+            // page before the chronologically oldest cached message, otherwise
+            // the phone is asked for a window the cache already holds and
+            // every returned message is deduplicated away.
+            let anchor = state
+                .history
+                .get(&chat)
+                .and_then(|h| h.iter().min_by_key(|m| m.timestamp))
+                .cloned();
+            (chat, anchor)
+        };
+
+        // No cached anchor (empty chat): there is no window left to page before.
+        let Some(anchor) = anchor else {
+            return Err(BackendError::Other(
+                "WhatsApp: no older history available".into(),
+            ));
+        };
+
+        let ChatId::WhatsApp(jid_str) = &chat else {
+            return Err(BackendError::Other("WhatsApp: not a WhatsApp chat".into()));
+        };
+        let jid = Jid::from_str(jid_str)
+            .map_err(|e| BackendError::Other(format!("WhatsApp: invalid chat jid: {e}")))?;
+
+        // On-demand history sync: ask our own phone (via PDO) for the page of
+        // messages before the oldest cached one. The phone answers asynchronously
+        // with an ordinary HistorySync, which `handle_history_sync` merges into
+        // the cache.
+        self.current_client()
+            .fetch_message_history(
+                &jid,
+                &anchor.message_id.to_string(),
+                anchor.from_me,
+                anchor.timestamp.saturating_mul(1000),
+                limit.max(1) as i32,
+            )
+            .await
+            .map_err(|e| BackendError::Other(format!("WhatsApp: history fetch failed: {e}")))?;
+
+        // Wait (bounded) for the backfilled page to land in the cache, then hand
+        // the grown page back so the TUI can prepend it. The wait runs in a
+        // background task (see `App::load_more_history`), so the UI never
+        // freezes; on a phone that ignores the request we fall back to the
+        // current cache and the next scroll-up simply retries.
+        let known: HashSet<String> = {
+            let state = self.state.read().await;
+            state
+                .history
+                .get(&chat)
+                .map(|h| h.iter().map(|m| m.message_id.to_string()).collect())
+                .unwrap_or_default()
+        };
+
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+            let changed = {
+                let state = self.state.read().await;
+                let now: HashSet<String> = state
+                    .history
+                    .get(&chat)
+                    .map(|h| h.iter().map(|m| m.message_id.to_string()).collect())
+                    .unwrap_or_default();
+                now != known
+            };
+
+            if changed {
+                break;
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                debug!(chat = ?chat, "Timed out waiting for on-demand history sync");
+                break;
+            }
+        }
+
+        let state = self.state.read().await;
+        let mut messages = state.history.get(&chat).cloned().unwrap_or_default();
+        drop(state);
         messages.sort_by_key(|m| m.timestamp);
         Ok(messages)
     }
