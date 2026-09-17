@@ -10,7 +10,9 @@ use tokio::sync::mpsc;
 use tokio::time::{Duration, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 
-use crate::backend::{self, AuthSteps, BackendEvent, ChatId, MessageAction, MessengerKind, Provider};
+use crate::backend::{
+    self, AuthSteps, BackendEvent, ChatId, MessageAction, MessengerKind, Provider,
+};
 use crate::config::{Config, Keymap};
 use crate::helpers::available_message_actions;
 use crate::tui::chat::chat_list::ChatList;
@@ -36,20 +38,14 @@ enum UiEvent {
     Backend(Provider, BackendEvent),
     Resize(u16, u16),
     HistoryRefresh(ChatId, Vec<backend::Message>),
-    HistoryRefreshResult(
-        ChatId,
-        Result<Vec<backend::Message>, backend::BackendError>,
-    ),
+    HistoryRefreshResult(ChatId, Result<Vec<backend::Message>, backend::BackendError>),
     ChatLoaded {
         chat: backend::Chat,
         generation: u64,
         result: Result<Vec<backend::Message>, backend::BackendError>,
         status: Option<String>,
     },
-    ChatList(
-        Provider,
-        Result<Vec<backend::Chat>, backend::BackendError>,
-    ),
+    ChatList(Provider, Result<Vec<backend::Chat>, backend::BackendError>),
     ChatsLoaded {
         chats: Vec<backend::Chat>,
         errors: Vec<backend::BackendError>,
@@ -137,9 +133,10 @@ async fn run_app(
 
     // handling new events for each messenger type
     for messenger in messengers.iter() {
-        if !messenger.is_enabled(&config.providers) {
-            continue;
-        }
+        // removing this because wp login was broken
+        // if !messenger.is_enabled(&config.providers) {
+        //     continue;
+        // }
 
         let mut backend_rx = messenger.subscribe();
         let forward_tx = tx.clone();

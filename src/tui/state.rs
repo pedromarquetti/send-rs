@@ -1010,10 +1010,27 @@ impl AppState {
                 warn!(message, "Backend disconnected");
                 self.create_popup(PopupKind::Error(message));
             }
-            BackendEvent::QrCode(_code) => {
+            BackendEvent::QrCode(code) => {
                 info!("WhatsApp QR code received");
-                self.backend_status =
-                    Some("Scan this WhatsApp QR code with your phone".to_string());
+
+                // if wp qr pair ok, remove login screen
+                // TODO: check if there's a better way to do this
+                match code.as_str() {
+                    "ok" => {
+                        self.login_state = None;
+                        self.screen = Screen::Main;
+                        self.config.providers.whatsapp = true;
+                        let _ = self.config.save_config().map_err(|err| {
+                            self.create_popup(PopupKind::Error(format!(
+                                "Error saving config after Qr code pair {err}"
+                            )));
+                        });
+                    }
+                    _ => {
+                        self.backend_status =
+                            Some("Scan this WhatsApp QR code with your phone".to_string());
+                    }
+                }
 
                 // Pairing is shown through the login screen (which reads the QR
                 // payload live each frame). Only surface it when the provider is

@@ -710,6 +710,9 @@ impl WhatsAppMessenger {
                 *current_qr.write().await = Some(q.code.clone());
                 let _ = tx.send(BackendEvent::QrCode(q.code.clone()));
             }
+            Event::PairSuccess(_) => {
+                let _ = tx.send(BackendEvent::QrCode(String::from("ok")));
+            }
             Event::Messages(batch) => {
                 // Learn the account's own JIDs for self-chat labelling; cheap
                 // and idempotent, and live messages may precede the first
