@@ -264,7 +264,7 @@ impl AppState {
         if let Some(chat) = self.chat_state.chats.iter_mut().find(|c| c.id == *chat_id)
             && let Some(newest) = history.last()
         {
-            chat.last_message = Some(format!("{}: {}", newest.sender, newest.text));
+            chat.last_message_ts = Some(format!("{}: {}", newest.sender, newest.text));
         }
     }
 
@@ -1150,7 +1150,7 @@ impl AppState {
                 let mut chat_update = Chat {
                     id: message.chat.clone(),
                     contact_name: contact_name.clone(),
-                    last_message: Some(preview),
+                    last_message_ts: Some(preview),
                     ..Default::default()
                 };
 
@@ -1287,7 +1287,7 @@ impl AppState {
             .map(|message| message_preview(&message.sender, &message.text));
 
         if let Some((_, chat)) = self.chat_state.find_mut(chat_id) {
-            chat.last_message = latest;
+            chat.last_message_ts = latest;
         }
     }
 }
@@ -1910,7 +1910,7 @@ mod tests {
             3
         );
         assert_eq!(
-            state.chat_state.chats[0].last_message.as_deref(),
+            state.chat_state.chats[0].last_message_ts.as_deref(),
             Some("Telegram News: breaking")
         );
         assert!(!state.chat_state.chats[0].unread);
@@ -2009,7 +2009,7 @@ mod tests {
     async fn closed_chat_status_update_preserves_existing_chat_list_metadata() {
         let mut state = app_state().await;
         let original_name = state.chat_state.chats[1].contact_name.clone();
-        let original_preview = state.chat_state.chats[1].last_message.clone();
+        let original_preview = state.chat_state.chats[1].last_message_ts.clone();
 
         state.handle_backend_event(
             Provider::Telegram,
@@ -2022,7 +2022,7 @@ mod tests {
 
         let chat = &state.chat_state.chats[1];
         assert_eq!(chat.contact_name, original_name);
-        assert_eq!(chat.last_message, original_preview);
+        assert_eq!(chat.last_message_ts, original_preview);
         assert_eq!(chat.status.as_deref(), Some("online"));
     }
 
@@ -2053,7 +2053,7 @@ mod tests {
         assert_eq!(state.chat_state.chats.len(), before + 1);
         assert_eq!(state.chat_state.chats[0].id, ChatId::Telegram(999));
         assert_eq!(
-            state.chat_state.chats[0].last_message.as_deref(),
+            state.chat_state.chats[0].last_message_ts.as_deref(),
             Some("New contact: hello there")
         );
         assert!(state.chat_state.chats[0].unread);
@@ -2100,7 +2100,7 @@ mod tests {
             chat.contact_name, "Car Budget",
             "a message sender must never rename the row title"
         );
-        assert_eq!(chat.last_message.as_deref(), Some("A Member: updated"));
+        assert_eq!(chat.last_message_ts.as_deref(), Some("A Member: updated"));
         assert_eq!(chat.unread_count, 1);
     }
 
@@ -2130,7 +2130,7 @@ mod tests {
             }),
         );
 
-        assert!(state.chat_state.chats[0].last_message.is_some());
+        assert!(state.chat_state.chats[0].last_message_ts.is_some());
     }
 
     #[tokio::test]

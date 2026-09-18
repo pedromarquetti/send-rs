@@ -276,6 +276,7 @@ async fn run_app(
                     });
                 }
             }
+
             event = rx.recv() => {
                 let Some(event) = event else {
                     break;

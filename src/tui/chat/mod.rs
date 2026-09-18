@@ -255,11 +255,11 @@ impl ChatState {
                 entry.fixed = true;
             }
 
-            let should_bump = chat.last_message.is_some();
-            let has_last_message = chat.last_message.is_some();
+            let should_bump = chat.last_message_ts.is_some();
+            let has_last_message = chat.last_message_ts.is_some();
 
-            if let Some(last_message) = chat.last_message {
-                entry.last_message = Some(last_message);
+            if let Some(last_message) = chat.last_message_ts {
+                entry.last_message_ts = Some(last_message);
             }
 
             if chat.unread || chat.unread_count > 0 {
@@ -596,7 +596,7 @@ mod tests {
         state.upsert_chat(Chat {
             id: id.clone(),
             contact_name: "Unknown".into(),
-            last_message: Some("hi".into()),
+            last_message_ts: Some("hi".into()),
             ..Default::default()
         });
 
@@ -618,7 +618,7 @@ mod tests {
 
         state.upsert_chat(Chat {
             id: selected_id,
-            last_message: Some("B: newest".into()),
+            last_message_ts: Some("B: newest".into()),
             ..Default::default()
         });
 

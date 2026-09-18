@@ -412,7 +412,7 @@ impl TelegramMessenger {
                                         let _ = tx.send(BackendEvent::ChatUpdated(Chat {
                                             id: chat_id,
                                             contact_name: pretty_peer_name(&msg, &sender),
-                                            last_message: Some(preview),
+                                            last_message_ts: Some(preview),
                                             status: None,
                                             fixed: false,
                                             verified: false,
@@ -491,7 +491,7 @@ impl TelegramMessenger {
                                             let _ = tx.send(BackendEvent::ChatUpdated(Chat {
                                                 id: chat_id,
                                                 contact_name: String::new(),
-                                                last_message: None,
+                                                last_message_ts: None,
                                                 status,
                                                 fixed: false,
                                                 verified: false,
@@ -716,7 +716,7 @@ impl TelegramMessenger {
             chats.push(Chat {
                 id,
                 contact_name,
-                last_message,
+                last_message_ts: last_message,
                 status,
                 fixed,
                 verified: false,

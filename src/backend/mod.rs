@@ -162,7 +162,8 @@ impl<'de> serde::Deserialize<'de> for ChatId {
 pub struct Chat {
     pub id: ChatId,
     pub contact_name: String,
-    pub last_message: Option<String>,
+    // TODO: CHange this so Messengers proapgate last msg ts for sorting
+    pub last_message_ts: Option<String>,
     pub status: Option<String>,
     /// True when the user has pinned/fixed this chat at the top of the list.
     pub fixed: bool,
@@ -602,13 +603,13 @@ mod tests {
         let chat = Chat {
             id: ChatId::WhatsApp("5511999999999@s.whatsapp.net".into()),
             contact_name: "Alice".into(),
-            last_message: Some("hey".into()),
+            last_message_ts: Some("hey".into()),
             unread: true,
             unread_count: 1,
             ..Default::default()
         };
         assert_eq!(chat.contact_name, "Alice");
-        assert_eq!(chat.last_message.as_deref(), Some("hey"));
+        assert_eq!(chat.last_message_ts.as_deref(), Some("hey"));
         assert!(chat.unread);
     }
 
