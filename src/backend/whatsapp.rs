@@ -950,10 +950,10 @@ impl WhatsAppMessenger {
                     chat_row.fixed = u.action.pinned.unwrap_or(false);
                 }
 
-                // Republish the whole list (pinned rows sort first) so the TUI
-                // reflects both pin and unpin; `ChatUpdated` via `upsert_chat`
-                // can only ever set `fixed = true` and could not clear one.
-                let snapshot = sorted_chat_snapshot(&guard);
+                // Republish the whole list so the TUI reflects both pin and
+                // unpin; `ChatUpdated` via `upsert_chat` can only ever set
+                // `fixed = true` and could not clear one.
+                let snapshot = guard.chats.clone();
                 drop(guard);
                 state.read().await.save_to(cache_path);
 
@@ -1020,8 +1020,10 @@ impl WhatsAppMessenger {
                 });
 
                 let st = state.read().await;
-                let snapshot = sorted_chat_snapshot(&st);
+                let snapshot = st.chats.clone();
+
                 drop(st);
+
                 let _ = tx.send(BackendEvent::ChatList(snapshot));
             }
             Event::Presence(u) => {
@@ -1325,7 +1327,7 @@ impl WhatsAppState {
 
         match self.chats.iter_mut().find(|c| c.id == chat) {
             Some(c) => {
-                c.last_message = Some(preview);
+                c.last_message_ts = Some(preview);
 
                 if is_self_chat(&chat, self.own_lid.as_deref(), self.own_pn.as_deref()) {
                     c.contact_name = "Myself".to_string();
@@ -1362,7 +1364,7 @@ impl WhatsAppState {
                 self.chats.push(Chat {
                     id: chat.clone(),
                     contact_name,
-                    last_message: Some(preview),
+                    last_message_ts: Some(preview),
                     unread: !msg.from_me,
                     unread_count: if msg.from_me { 0 } else { 1 },
                     ..Default::default()
@@ -1451,7 +1453,7 @@ impl WhatsAppState {
             .map(|lm| preview_line(&lm.sender, &lm.text, lm.from_me));
 
         if let Some(c) = self.chats.iter_mut().find(|c| c.id == *chat) {
-            c.last_message = preview;
+            c.last_message_ts = preview;
         }
     }
 }
@@ -1524,7 +1526,7 @@ async fn remove_chat(state: &SharedState, jid: &Jid) -> Option<Chat> {
 /// Heal chat rows split across LID/PN keys: one peer must never appear twice.
 /// Folds any `@lid` row into its phone-keyed twin (moving unread, preview and
 /// history). When `tx`/`cache_path` are given the merge is live-friendly —
-/// `ChatRemoved` for the folded row, `ChatUpdated` for the survivor, a sorted
+/// `ChatRemoved` for the folded row, `ChatUpdated` for the survivor, a
 /// `ChatList` republish, and a cache persist — so the running TUI drops the
 /// stale row even when a snapshot shrink would otherwise be ignored.
 /// Returns the number of rows folded.
@@ -1580,9 +1582,11 @@ async fn merge_lid_duplicates(
         if let Some(pn_row) = st.chats.iter_mut().find(|c| c.id == pn_chat) {
             pn_row.unread = pn_row.unread || orphan.unread;
             pn_row.unread_count = pn_row.unread_count.max(orphan.unread_count);
-            if pn_row.last_message.is_none() {
-                pn_row.last_message = orphan.last_message;
+
+            if pn_row.last_message_ts.is_none() {
+                pn_row.last_message_ts = orphan.last_message_ts;
             }
+
             pn_row.verified = pn_row.verified || orphan.verified;
             pn_row.fixed = pn_row.fixed || orphan.fixed;
         }
@@ -1610,7 +1614,8 @@ async fn merge_lid_duplicates(
             for orphan in folded {
                 let _ = tx.send(BackendEvent::ChatRemoved { chat: orphan });
             }
-            let snapshot = sorted_chat_snapshot(&*state.read().await);
+
+            let snapshot = state.read().await.chats.clone();
             let _ = tx.send(BackendEvent::ChatList(snapshot));
             let _ = tx.send(BackendEvent::Status("merged duplicate chats".into()));
         }
@@ -1647,26 +1652,6 @@ fn presence_label(online: bool, last_seen: Option<i64>) -> Option<String> {
     } else {
         last_seen.map(|ts| format!("last seen {}", relative_time(ts)))
     }
-}
-
-/// Chat list order for WhatsApp chats: pinned first, then most-recently-active.
-/// WhatsApp syncs conversation rows without a reliable per-row timestamp, so
-/// the newest stored message is the recency signal. `chats()` and every chat
-/// list republish go through this so the running TUI never falls back to
-/// insertion order.
-fn sorted_chat_snapshot(st: &WhatsAppState) -> Vec<Chat> {
-    let mut chats = st.chats.clone();
-    // TODO: let the TUI handle sorting - sorting here is breaking multi provider chat_list
-    chats.sort_by_key(|c| {
-        let recency = st
-            .history
-            .get(&c.id)
-            .and_then(|h| h.iter().max_by_key(|m| m.timestamp))
-            .map(|m| m.timestamp)
-            .unwrap_or(0);
-        (!c.fixed, std::cmp::Reverse(recency))
-    });
-    chats
 }
 
 /// Learn the phone-number mapping for a LID author outside any state write
@@ -1954,11 +1939,13 @@ async fn handle_history_sync(
         // Always finish with an up-to-date preview.
         state.refresh_preview(&chat);
     }
+
     // Re-resolve senders the ingest froze bare before the pushnames bundle
     // landed, and persist any repairs with the newly learned names.
     let repaired = state.resolve_stale_senders();
     let chats_total = state.chats.len();
-    let chats_snapshot = sorted_chat_snapshot(&state);
+    let chats_snapshot = state.chats.clone();
+
     drop(state);
 
     if repaired > 0 {
@@ -2135,14 +2122,19 @@ async fn enrich_chat_names(
         // persist one snapshot covering chats and messages.
         let mut st = state.write().await;
         let repaired = st.resolve_stale_senders();
-        let chats_snapshot = sorted_chat_snapshot(&st);
+        let chats_snapshot = st.chats.clone();
+
         st.save_to(cache_path);
+
         drop(st);
+
         if repaired > 0 {
             info!("WA usync resolved {repaired} stale sender name(s)");
         }
+
         let _ = tx.send(BackendEvent::ChatList(chats_snapshot));
         let _ = tx.send(BackendEvent::Status("names updated".into()));
+
         info!("WA usync name enrichment finished");
     }
 }
@@ -2190,7 +2182,7 @@ impl Messenger for WhatsAppMessenger {
     async fn chats(&self) -> Result<Vec<Chat>, BackendError> {
         let state = self.state.read().await;
         debug!("WA chats() returning {} chats", state.chats.len());
-        Ok(sorted_chat_snapshot(&state))
+        Ok(state.chats.clone())
     }
 
     async fn set_read(&mut self, chat: &ChatId) -> Result<(), BackendError> {
@@ -2517,7 +2509,7 @@ impl Messenger for WhatsAppMessenger {
 
             for c in state.chats.iter_mut() {
                 if c.id == *chat {
-                    c.last_message = Some(format!("You: {text}"));
+                    c.last_message_ts = Some(format!("You: {text}"));
                     c.unread = false;
                     c.unread_count = 0;
                 }
@@ -3359,7 +3351,7 @@ mod tests {
         );
         st.chats.push(Chat {
             id: chat.clone(),
-            last_message: Some("Alice: before".into()),
+            last_message_ts: Some("Alice: before".into()),
             ..Default::default()
         });
 
@@ -3389,7 +3381,7 @@ mod tests {
         assert_eq!(updated.text, "after");
         assert_eq!(updated.message_id, MessageId("orig-1".into()));
         assert_eq!(st.history[&chat][0].text, "after");
-        assert_eq!(st.chats[0].last_message.as_deref(), Some("Alice: after"));
+        assert_eq!(st.chats[0].last_message_ts.as_deref(), Some("Alice: after"));
     }
 
     #[test]
@@ -3533,7 +3525,7 @@ mod tests {
         );
         st.chats.push(Chat {
             id: chat.clone(),
-            last_message: Some("Alice: before".into()),
+            last_message_ts: Some("Alice: before".into()),
             ..Default::default()
         });
 
@@ -3543,7 +3535,7 @@ mod tests {
         assert_eq!(updated.text, "after");
         assert_eq!(updated.message_id, MessageId("orig-1".into()));
         assert_eq!(st.history[&chat][0].text, "after");
-        assert_eq!(st.chats[0].last_message.as_deref(), Some("Alice: after"));
+        assert_eq!(st.chats[0].last_message_ts.as_deref(), Some("Alice: after"));
     }
 
     #[test]
@@ -3646,63 +3638,6 @@ mod tests {
         assert_eq!(
             resolve_sender_name("", &sender, &empty, &no_lid_pn),
             "255202829570287"
-        );
-    }
-
-    #[test]
-    fn sorted_chat_snapshot_orders_pinned_then_recency() {
-        let old = Chat {
-            id: ChatId::WhatsApp("15550000001@s.whatsapp.net".to_string()),
-            contact_name: "Old chat".into(),
-            fixed: false,
-            ..Default::default()
-        };
-        let fresh = Chat {
-            id: ChatId::WhatsApp("15550000002@s.whatsapp.net".to_string()),
-            contact_name: "Fresh chat".into(),
-            fixed: false,
-            ..Default::default()
-        };
-        let pinned = Chat {
-            id: ChatId::WhatsApp("15550000003@s.whatsapp.net".to_string()),
-            contact_name: "Pinned chat".into(),
-            fixed: true,
-            ..Default::default()
-        };
-        let mut st = WhatsAppState {
-            chats: vec![old.clone(), fresh.clone(), pinned.clone()],
-            ..Default::default()
-        };
-        let msg = |m: &str, ts: i64, chat: &ChatId| Message {
-            message_id: format!("m-{m}").into(),
-            chat: chat.clone(),
-            sender: "x".into(),
-            text: m.into(),
-            timestamp: ts,
-            from_me: false,
-            author_id: None,
-            media: None,
-            msg_actions: Vec::new(),
-            reply_to_id: None,
-            reply_ctx: None,
-            pending: false,
-            failed: false,
-        };
-        st.history
-            .insert(old.id.clone(), vec![msg("old", 1000, &old.id)]);
-        st.history
-            .insert(fresh.id.clone(), vec![msg("fresh", 3000, &fresh.id)]);
-        let order: Vec<_> = sorted_chat_snapshot(&st)
-            .into_iter()
-            .map(|c| c.id)
-            .collect();
-        assert_eq!(
-            order,
-            vec![
-                ChatId::WhatsApp("15550000003@s.whatsapp.net".to_string()),
-                ChatId::WhatsApp("15550000002@s.whatsapp.net".to_string()),
-                ChatId::WhatsApp("15550000001@s.whatsapp.net".to_string()),
-            ]
         );
     }
 
@@ -3922,7 +3857,7 @@ mod tests {
         assert_eq!(dm_chat.unread_count, 3);
         assert!(dm_chat.unread);
         // Preview from the newest message.
-        assert_eq!(dm_chat.last_message.as_deref(), Some("You: reply"));
+        assert_eq!(dm_chat.last_message_ts.as_deref(), Some("You: reply"));
 
         let group_chat = s
             .chats
