@@ -5,6 +5,19 @@ use ratatui::{layout::Flex, prelude::*};
 
 use crate::backend::MessageAction;
 
+/// Relative "x ago" label for an epoch-seconds timestamp. Accepts any integer
+/// unix-time type (`i32`, `i64`, …) so both backends share one implementation.
+pub fn relative(ts: impl Into<i64>) -> String {
+    let ts = ts.into();
+    let delta = now().saturating_sub(ts).max(0);
+    match delta {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{}m ago", delta / 60),
+        3600..=86399 => format!("{}h ago", delta / 3600),
+        _ => format!("{}d ago", delta / 86400),
+    }
+}
+
 pub fn now() -> i64 {
     SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -182,6 +195,24 @@ mod tests {
         let failed = sample_message(false, false, true);
         assert!(available_message_actions(&pending).is_empty());
         assert!(available_message_actions(&failed).is_empty());
+    }
+
+    #[test]
+    fn relative_buckets_are_deterministic_across_the_clock() {
+        // Offsets are large enough that the bucket never straddles a boundary,
+        // so these hold regardless of when the test runs.
+        let anchor = super::now();
+        assert_eq!(super::relative(anchor + 60), "just now");
+        assert_eq!(super::relative(anchor - 35), "just now");
+        assert_eq!(super::relative(anchor - 300), "5m ago");
+        assert_eq!(super::relative(anchor - 7200), "2h ago");
+        assert_eq!(super::relative(anchor - 90000), "1d ago");
+    }
+
+    #[test]
+    fn relative_accepts_narrower_integer_time_types() {
+        let anchor = super::now();
+        assert_eq!(super::relative(anchor), super::relative(anchor as i32));
     }
 
     #[test]

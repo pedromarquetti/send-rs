@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::helpers::now;
+use crate::helpers::{now, relative};
 
 use super::{
     AuthSteps, BackendError, BackendEvent, Chat, ChatId, LoginStepState, MediaKind, Message,
@@ -731,10 +731,19 @@ impl WhatsAppMessenger {
             Event::Connected(_) => {
                 let _ = tx.send(BackendEvent::Connected);
             }
-            Event::Disconnected(_) | Event::StreamError(_) | Event::ConnectFailure(_) => {
-                let _ = tx.send(BackendEvent::Disconnected(
-                    "WhatsApp: Connection Failure!".into(),
-                ));
+            Event::Disconnected(e) => {
+                let _ = tx.send(BackendEvent::Disconnected(format!(
+                    "WhatsApp: Disconnected! {:?}",
+                    e
+                )));
+            }
+            Event::StreamError(e) => {
+                let err = format!("WhatsApp: ! {:?}", e);
+                let _ = tx.send(BackendEvent::Error(err.clone(), BackendError::Other(err)));
+            }
+            Event::ConnectFailure(e) => {
+                let err = format!("WhatsApp: ! {:?}", e);
+                let _ = tx.send(BackendEvent::Error(err.clone(), BackendError::Other(err)));
             }
             Event::PairingQrCode(q) => {
                 *current_qr.write().await = Some(q.code.clone());
@@ -1697,7 +1706,7 @@ fn presence_label(online: bool, last_seen: Option<i64>) -> Option<String> {
     if online {
         Some("online".to_string())
     } else {
-        last_seen.map(|ts| format!("last seen {}", relative_time(ts)))
+        last_seen.map(|ts| format!("last seen {}", relative(ts)))
     }
 }
 

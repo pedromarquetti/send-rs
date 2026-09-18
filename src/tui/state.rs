@@ -205,7 +205,7 @@ impl AppState {
         chat_list.extend(preserved);
 
         self.chat_state.chats = chat_list;
-        self.chat_state.chats.sort_by_key(|chat| !chat.fixed);
+        self.chat_state.sort_pinned_then_recent();
 
         let len = self.chat_state.chats.len();
         let index = if len == 0 {
@@ -258,12 +258,35 @@ impl AppState {
     }
 
     /// Update the chat list entry for `chat_id` after a poll refresh detected new messages.
-    /// Sets the recency timestamp from the newest message in `history`.
+    /// Sets the recency timestamp from the newest message in `history` and re-sorts,
+    /// keeping the currently selected chat selected.
     pub fn update_chat_list_from_poll(&mut self, chat_id: &ChatId, history: &[Message]) {
-        if let Some(chat) = self.chat_state.chats.iter_mut().find(|c| c.id == *chat_id)
-            && let Some(newest) = history.last()
-        {
-            chat.last_message_ts = Some(newest.timestamp);
+        let Some((_, chat)) = self.chat_state.find_mut(chat_id) else {
+            return;
+        };
+
+        let Some(newest) = history.last() else {
+            return;
+        };
+
+        // Never regress: a partial poll history must not lower the recency ts.
+        if chat.last_message_ts.is_some_and(|t| newest.timestamp <= t) {
+            return;
+        }
+
+        chat.last_message_ts = Some(newest.timestamp);
+
+        let selected_id = self.chat_state.selected_chat().map(|chat| chat.id.clone());
+
+        self.chat_state.sort_pinned_then_recent();
+
+        if let Some(selected_id) = selected_id {
+            let selected = self
+                .chat_state
+                .chats
+                .iter()
+                .position(|chat| chat.id == selected_id);
+            self.chat_state.chat_list_state.select(selected);
         }
     }
 
@@ -1226,7 +1249,7 @@ impl AppState {
                 }
 
                 self.refresh_chat_list_timestamp(&chat);
-                
+
                 if let Some(open) = self.chat_state.open_chat.as_ref()
                     && open.chat.id == chat
                 {
@@ -1290,8 +1313,10 @@ impl AppState {
             }
             BackendEvent::ChatList(chats) => {
                 debug!(provider = ?provider, total = chats.len(), "TUI ChatList applied");
-                self.chat_state.reconcile_provider_chats(provider, chats);
-                self.persist_chats();
+
+                if self.chat_state.reconcile_provider_chats(provider, chats) {
+                    self.persist_chats();
+                }
             }
         }
     }
@@ -1319,6 +1344,17 @@ impl AppState {
         // must not wipe or lower the row's recency timestamp.
         if chat.last_message_ts.is_none_or(|since| ts > since) {
             chat.last_message_ts = Some(ts);
+            let selected_id = self.chat_state.selected_chat().map(|chat| chat.id.clone());
+            self.chat_state.sort_pinned_then_recent();
+
+            if let Some(selected_id) = selected_id {
+                let selected = self
+                    .chat_state
+                    .chats
+                    .iter()
+                    .position(|chat| chat.id == selected_id);
+                self.chat_state.chat_list_state.select(selected);
+            }
         }
     }
 }
@@ -1921,8 +1957,8 @@ mod tests {
             Provider::Telegram,
             BackendEvent::MessageReceived(Message {
                 message_id: "incoming".into(),
-                chat: ChatId::Telegram(101),
-                sender: "Telegram News".into(),
+                chat: ChatId::Telegram(103),
+                sender: "Alice".into(),
                 author_id: None,
                 text: "breaking".into(),
                 timestamp: 1000,
@@ -1954,7 +1990,7 @@ mod tests {
             Provider::Telegram,
             BackendEvent::MessageReceived(Message {
                 message_id: "incoming".into(),
-                chat: ChatId::Telegram(103),
+                chat: ChatId::Telegram(101),
                 sender: "Alice".into(),
                 author_id: None,
                 text: "hi".into(),
@@ -1973,7 +2009,7 @@ mod tests {
             .chat_state
             .chats
             .iter()
-            .find(|chat| chat.id == ChatId::Telegram(103))
+            .find(|chat| chat.id == ChatId::Telegram(101))
             .expect("incoming chat remains in chat list");
         assert!(chat.unread);
         assert_eq!(chat.unread_count, 1);
@@ -1988,7 +2024,7 @@ mod tests {
         state.handle_backend_event(
             Provider::Telegram,
             BackendEvent::UnreadUpdated {
-                chat: ChatId::Telegram(101),
+                chat: ChatId::Telegram(103),
                 unread: true,
                 unread_count: 4,
             },
@@ -1998,7 +2034,7 @@ mod tests {
             .chat_state
             .chats
             .iter()
-            .find(|chat| chat.id == ChatId::Telegram(101))
+            .find(|chat| chat.id == ChatId::Telegram(103))
             .expect("open chat remains in chat list");
         assert!(!chat.unread);
         assert_eq!(chat.unread_count, 0);
@@ -2013,7 +2049,7 @@ mod tests {
         state.handle_backend_event(
             Provider::Telegram,
             BackendEvent::ChatUpdated(Chat {
-                id: ChatId::Telegram(101),
+                id: ChatId::Telegram(103),
                 status: Some("last seen 5m ago".into()),
                 ..Default::default()
             }),
@@ -2067,7 +2103,7 @@ mod tests {
                 sender: "New contact".into(),
                 author_id: None,
                 text: "hello there".into(),
-                timestamp: 0,
+                timestamp: 1000,
                 from_me: false,
                 msg_actions: Vec::new(),
                 media: None,
@@ -2080,7 +2116,7 @@ mod tests {
 
         assert_eq!(state.chat_state.chats.len(), before + 1);
         assert_eq!(state.chat_state.chats[0].id, ChatId::Telegram(999));
-        assert_eq!(state.chat_state.chats[0].last_message_ts, Some(0));
+        assert_eq!(state.chat_state.chats[0].last_message_ts, Some(1000));
         assert!(state.chat_state.chats[0].unread);
         assert_eq!(state.chat_state.chats[0].unread_count, 1);
     }
@@ -2216,7 +2252,7 @@ mod tests {
         state.select_chat(1).await;
 
         assert_eq!(
-            state.chat_state.load_draft(&ChatId::Telegram(101)),
+            state.chat_state.load_draft(&ChatId::Telegram(103)),
             Some("hello from chat 0")
         );
     }
@@ -2251,7 +2287,7 @@ mod tests {
 
         assert!(state.write.lines().join("\n").is_empty());
         assert_eq!(
-            state.chat_state.load_draft(&ChatId::Telegram(101)),
+            state.chat_state.load_draft(&ChatId::Telegram(103)),
             Some("unsent text")
         );
     }
@@ -2318,7 +2354,7 @@ mod tests {
         state.select_chat(0).await;
 
         assert_eq!(
-            state.chat_state.load_draft(&ChatId::Telegram(101)),
+            state.chat_state.load_draft(&ChatId::Telegram(103)),
             Some("msg for chat 0")
         );
         assert_eq!(

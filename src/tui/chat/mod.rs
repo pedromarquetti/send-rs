@@ -221,8 +221,16 @@ impl ChatState {
         }
     }
 
-    fn sort_fixed_first(&mut self) {
-        self.chats.sort_by_key(|chat| !chat.fixed);
+    /// Sort the chat list: pinned chats first, then by most recent
+    /// `last_message_ts`. The single authoritative order for the whole list,
+    /// independent of whichever provider's snapshot arrived last.
+    pub fn sort_pinned_then_recent(&mut self) {
+        self.chats.sort_by_key(|chat| {
+            (
+                !chat.fixed,
+                std::cmp::Reverse(chat.last_message_ts.unwrap_or(i64::MIN)),
+            )
+        });
     }
 
     /// Insert or update a chat_list entry from a push update while keeping
@@ -236,13 +244,21 @@ impl ChatState {
         }
 
         let selected_id = self.selected_chat().map(|selected| selected.id.clone());
-        if let Some((pos, entry)) = self.find_mut(&chat.id) {
+        if let Some((_, entry)) = self.find_mut(&chat.id) {
             if !chat.contact_name.is_empty()
                 && chat.contact_name != "Unknown"
                 && chat.contact_name != "You"
             {
                 entry.contact_name = chat.contact_name;
-                entry.verified = chat.verified;
+
+                // Only ever upgrade verification. Partial updates (e.g. the
+                // row rebuilt for an incoming message) carry `verified: false`
+                // by default and would otherwise silently strip a business
+                // badge; authoritative lists apply their own verified flag
+                // wholesale when they replace the row.
+                if chat.verified {
+                    entry.verified = true;
+                }
             }
 
             if let Some(status) = chat.status.clone()
@@ -276,11 +292,8 @@ impl ChatState {
                 entry.unread_count = chat.unread_count;
             }
 
-            if entry.fixed {
-                self.sort_fixed_first();
-            } else if pos > 0 && newer {
-                let item = self.chats.remove(pos);
-                self.chats.insert(0, item);
+            if entry.fixed || newer {
+                self.sort_pinned_then_recent();
             }
 
             if let Some(selected_id) = selected_id {
@@ -292,8 +305,8 @@ impl ChatState {
         }
 
         chat.scroll = 0;
-        self.chats.insert(0, chat);
-        self.sort_fixed_first();
+        self.chats.push(chat);
+        self.sort_pinned_then_recent();
 
         if let Some(selected_id) = selected_id {
             let selected = self.chats.iter().position(|item| item.id == selected_id);
@@ -305,20 +318,25 @@ impl ChatState {
 
     /// Reconcile one provider's successful dialog snapshot while preserving
     /// chats belonging to other providers and the current selection.
+    ///
+    /// Returns `true` when the chat list actually changed (any row added,
+    /// removed or reordered). Reconciles that produce the identical list are
+    /// no-ops, letting callers skip the persistence write and any churn.
     pub fn reconcile_provider_chats(
         &mut self,
         provider: crate::backend::Provider,
         chats: Vec<Chat>,
-    ) {
+    ) -> bool {
         // A non-empty snapshot is authoritative: the backend always sends its
         // complete chat list here, so rows this provider no longer reports
         // (e.g. an LID twin folded into its PN row) are pruned. An EMPTY
         // snapshot is the cold-start case where the provider has not re-synced
         // yet, and must not wipe the fuller cached list.
         if chats.is_empty() {
-            return;
+            return false;
         }
 
+        let before = self.chats.clone();
         let selected_id = self.selected_chat().map(|chat| chat.id.clone());
 
         self.chats.retain(|chat| {
@@ -337,13 +355,15 @@ impl ChatState {
             }
         }
 
-        self.sort_fixed_first();
+        self.sort_pinned_then_recent();
         self.deduplicate_chats();
 
         if let Some(selected_id) = selected_id {
             self.chat_list_state
                 .select(self.chats.iter().position(|chat| chat.id == selected_id));
         }
+
+        before != self.chats
     }
 
     /// Replace the open chat's history with freshly fetched data, preserving the
@@ -1010,5 +1030,171 @@ mod tests {
         assert_eq!(decoded[0].contact_name, "Group");
         assert_eq!(decoded[1].id, ChatId::Telegram(123));
         assert_eq!(decoded[1].unread_count, 3);
+    }
+
+    #[test]
+    fn sort_pinned_then_recent_groups_pins_then_recency() {
+        let mut state = ChatState::default();
+        let mut pin_a = chat(ChatId::Telegram(1), "pin-a");
+        pin_a.fixed = true;
+        pin_a.last_message_ts = Some(50);
+        let mut pin_b = chat(ChatId::Telegram(2), "pin-b");
+        pin_b.fixed = true;
+        pin_b.last_message_ts = Some(70);
+        let mut recent = chat(ChatId::Telegram(3), "recent");
+        recent.last_message_ts = Some(200);
+        let mut old = chat(ChatId::Telegram(4), "old");
+        old.last_message_ts = Some(100);
+        let no_ts = chat(ChatId::Telegram(5), "no-ts");
+
+        state.chats = vec![old, recent, pin_a, no_ts, pin_b];
+        state.sort_pinned_then_recent();
+
+        let ids: Vec<_> = state.chats.iter().map(|c| c.id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                ChatId::Telegram(2), // pinned band first (recency within it)
+                ChatId::Telegram(1),
+                ChatId::Telegram(3), // then recency across the whole list
+                ChatId::Telegram(4),
+                ChatId::Telegram(5), // no timestamp sinks to the bottom
+            ]
+        );
+    }
+
+    #[test]
+    fn upsert_activity_never_puts_chat_above_pins() {
+        let mut state = ChatState::default();
+        let setup = [
+            (ChatId::Telegram(10), "pin1", 500, true),
+            (ChatId::Telegram(11), "pin2", 400, true),
+            (ChatId::Telegram(12), "chat1", 100, false),
+            (ChatId::Telegram(13), "chat2", 200, false),
+        ];
+        for (id, name, ts, fixed) in setup {
+            let mut c = chat(id, name);
+            c.last_message_ts = Some(ts);
+            c.fixed = fixed;
+            state.upsert_chat(c);
+        }
+
+        // chat2 receives a new message: recency rises past both pinned chats,
+        // but it must land at the TOP OF THE UNPINNED band, never above pins.
+        state.upsert_chat(Chat {
+            id: ChatId::Telegram(13),
+            last_message_ts: Some(900),
+            ..Default::default()
+        });
+
+        let ids: Vec<_> = state.chats.iter().map(|c| c.id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                ChatId::Telegram(10),
+                ChatId::Telegram(11),
+                ChatId::Telegram(13),
+                ChatId::Telegram(12),
+            ]
+        );
+    }
+
+    #[test]
+    fn pinned_chat_incoming_message_stays_in_pinned_band() {
+        let mut state = ChatState::default();
+        let mut pin = chat(ChatId::Telegram(20), "pin");
+        pin.fixed = true;
+        pin.last_message_ts = Some(300);
+        let mut unpinned = chat(ChatId::Telegram(21), "unpinned");
+        unpinned.last_message_ts = Some(600);
+        state.chats = vec![pin, unpinned];
+        state.sort_pinned_then_recent();
+
+        // A pinned chat becomes the most recent chat overall; it still belongs
+        // in the pinned band, not at the top of the whole list's index 0.
+        state.upsert_chat(Chat {
+            id: ChatId::Telegram(20),
+            last_message_ts: Some(1000),
+            ..Default::default()
+        });
+
+        let ids: Vec<_> = state.chats.iter().map(|c| c.id.clone()).collect();
+        assert_eq!(ids, vec![ChatId::Telegram(20), ChatId::Telegram(21)]);
+        assert!(state.chats[0].fixed);
+    }
+
+    #[test]
+    fn reconcile_order_is_independent_of_snapshot_arrival() {
+        let tg = |id: i64, ts: i64| -> Chat {
+            let mut c = chat(ChatId::Telegram(id), &format!("tg-{id}"));
+            c.last_message_ts = Some(ts);
+            c
+        };
+        let wa = |id: i64| -> Chat {
+            let mut c = chat(
+                ChatId::WhatsApp(format!("1555000000{id}@s.whatsapp.net")),
+                &format!("wa-{id}"),
+            );
+            c.last_message_ts = Some(90 + id);
+            c
+        };
+
+        let mut wp_first = ChatState::default();
+        wp_first.reconcile_provider_chats(Provider::WhatsApp, vec![wa(1), wa(2)]);
+        wp_first.reconcile_provider_chats(Provider::Telegram, vec![tg(1, 500), tg(2, 300)]);
+
+        let mut tg_first = ChatState::default();
+        tg_first.reconcile_provider_chats(Provider::Telegram, vec![tg(1, 500), tg(2, 300)]);
+        tg_first.reconcile_provider_chats(Provider::WhatsApp, vec![wa(1), wa(2)]);
+
+        // The merged view is normalized by recency, not by whichever
+        // provider's snapshot landed last.
+        assert_eq!(wp_first.chats, tg_first.chats);
+        let ids: Vec<_> = wp_first.chats.iter().map(|c| c.id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                ChatId::Telegram(1),                                   // 500
+                ChatId::Telegram(2),                                   // 300
+                ChatId::WhatsApp("15550000002@s.whatsapp.net".into()), // 92
+                ChatId::WhatsApp("15550000001@s.whatsapp.net".into()), // 91
+            ]
+        );
+    }
+
+    #[test]
+    fn unchanged_reconcile_is_a_noop() {
+        let mut state = ChatState::default();
+        let snapshot = vec![chat(ChatId::Telegram(30), "tg")];
+        assert!(state.reconcile_provider_chats(Provider::Telegram, snapshot.clone()));
+        assert!(
+            !state.reconcile_provider_chats(Provider::Telegram, snapshot),
+            "re-applying the identical snapshot must report no change"
+        );
+
+        assert!(
+            !state.reconcile_provider_chats(Provider::Telegram, Vec::new()),
+            "an empty snapshot is a cold-start no-op, never a change"
+        );
+    }
+
+    #[test]
+    fn partial_update_never_strips_verified_badge() {
+        let mut state = ChatState::default();
+        let mut biz = chat(ChatId::WhatsApp("15550000001@s.whatsapp.net".into()), "Biz");
+        biz.verified = true;
+        state.chats.push(biz);
+        state.sort_pinned_then_recent();
+
+        // A message update rebuilds the row with `verified: false` by default;
+        // the badge must survive the partial upsert.
+        state.upsert_chat(Chat {
+            id: ChatId::WhatsApp("15550000001@s.whatsapp.net".into()),
+            contact_name: "Biz".into(),
+            last_message_ts: Some(50),
+            ..Default::default()
+        });
+
+        assert!(state.chats[0].verified);
     }
 }

@@ -1,6 +1,7 @@
 # Welcome to Sender!
 
 <!--toc:start-->
+
 - [Welcome to Sender!](#welcome-to-sender)
   - [Features](#features)
   - [Configuration](#configuration)
@@ -12,6 +13,7 @@
   - [Controls / Key Bindings](#controls-key-bindings)
   - [Built with](#built-with)
   - [Inspirations](#inspirations)
+
 <!--toc:end-->
 
 Sender is an TUI app for interacting with Whatsapp AND telegram (maybe more in
@@ -95,7 +97,7 @@ whatsapp = false
 | `max_write_lines`         | `5`     | How many text lines the Write box can grow to. The input wraps long lines and scrolls once it exceeds that.                                                                                                                                                                                                                                      |
 | `chat_poll_interval_secs` | `10`    | Fallback interval (in seconds) for reconciling messages in the **currently open** chat (any provider) when push updates are unavailable. Lower values feel more responsive but use more resources.                                                                                                                                               |
 | `sync_update_state_secs`  | `120`   | Telegram-only. How often (in seconds) the Telegram client persists its internal update-state (pts/qts/seq) to the session file. This does **not** call any Telegram API — it only saves local state so that `catch_up` on restart is faster. I recommend setting a high value, because it does consume Disk IO                                   |
-| `chat_list_sync_secs`       | `10`    | How often (in seconds) the TUI fetches the full chat list from the enabled providers (Telegram and WhatsApp) to detect **unread-count changes across all chats**. This is the mechanism that updates unread indicators on chats you are not currently viewing. Increase this if you notice high CPU usage; decrease it for snappier unread dots. |
+| `chat_list_sync_secs`     | `10`    | How often (in seconds) the TUI fetches the full chat list from the enabled providers (Telegram and WhatsApp) to detect **unread-count changes across all chats**. This is the mechanism that updates unread indicators on chats you are not currently viewing. Increase this if you notice high CPU usage; decrease it for snappier unread dots. |
 
 #### Providers
 
@@ -152,8 +154,8 @@ WhatsApp has no credentials — pairing happens through a QR code:
 > [!NOTE]
 > WhatsApp scroll-to-top (PageUp / `k` at the first message) requests older
 > messages from your primary phone via an on-demand history sync. The phone must
-> be online and reachable; if it ignores the request, Senders times out after
-> 10 seconds and keeps whatever is currently cached (scroll up again later to
+> be online and reachable; if it ignores the request, Senders times out after 10
+> seconds and keeps whatever is currently cached (scroll up again later to
 > retry).
 
 ## Controls / Key Bindings

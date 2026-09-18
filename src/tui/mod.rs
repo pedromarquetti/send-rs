@@ -367,10 +367,17 @@ async fn run_app(
 
                         match result {
                             Ok(chats) => {
-                                app.state
+                                // Skip the persistence write when nothing
+                                // changed (both messenger syncs every
+                                // `chat_list_sync_secs`; identical snapshots
+                                // must not churn the cache file).
+                                if app
+                                    .state
                                     .chat_state
-                                    .reconcile_provider_chats(provider, chats);
-                                app.state.persist_chats();
+                                    .reconcile_provider_chats(provider, chats)
+                                {
+                                    app.state.persist_chats();
+                                }
                                 debug!(provider = ?provider, "Chat list sync OK");
                             }
 

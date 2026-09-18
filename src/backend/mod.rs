@@ -158,7 +158,7 @@ impl<'de> serde::Deserialize<'de> for ChatId {
     }
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Chat {
     pub id: ChatId,
     pub contact_name: String,
