@@ -255,26 +255,30 @@ impl ChatState {
                 entry.fixed = true;
             }
 
-            let should_bump = chat.last_message_ts.is_some();
-            let has_last_message = chat.last_message_ts.is_some();
+            let incoming_has_ts = chat.last_message_ts.is_some();
+            let newer = match (chat.last_message_ts, entry.last_message_ts) {
+                (Some(incoming), Some(existing)) => incoming > existing,
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
 
-            if let Some(last_message) = chat.last_message_ts {
-                entry.last_message_ts = Some(last_message);
+            if newer {
+                entry.last_message_ts = chat.last_message_ts;
             }
 
             if chat.unread || chat.unread_count > 0 {
                 entry.unread = chat.unread || chat.unread_count > 0;
-            } else if !has_last_message {
+            } else if !incoming_has_ts {
                 entry.unread = false;
             }
 
-            if chat.unread_count > 0 || !has_last_message {
+            if chat.unread_count > 0 || !incoming_has_ts {
                 entry.unread_count = chat.unread_count;
             }
 
             if entry.fixed {
                 self.sort_fixed_first();
-            } else if pos > 0 && should_bump {
+            } else if pos > 0 && newer {
                 let item = self.chats.remove(pos);
                 self.chats.insert(0, item);
             }
@@ -596,7 +600,7 @@ mod tests {
         state.upsert_chat(Chat {
             id: id.clone(),
             contact_name: "Unknown".into(),
-            last_message_ts: Some("hi".into()),
+            last_message_ts: Some(100),
             ..Default::default()
         });
 
@@ -618,12 +622,46 @@ mod tests {
 
         state.upsert_chat(Chat {
             id: selected_id,
-            last_message_ts: Some("B: newest".into()),
+            last_message_ts: Some(200),
             ..Default::default()
         });
 
         assert_eq!(state.chat_list_state.selected(), Some(0));
         assert_eq!(state.selected_chat().unwrap().contact_name, "B");
+    }
+
+    #[test]
+    fn upsert_with_stale_or_missing_timestamp_does_not_reorder_or_regress() {
+        let id = ChatId::Telegram(2);
+        let mut state = ChatState {
+            chats: vec![
+                chat(ChatId::Telegram(1), "A"),
+                {
+                    let mut c = chat(id.clone(), "B");
+                    c.last_message_ts = Some(200);
+                    c
+                },
+                chat(ChatId::Telegram(3), "C"),
+            ],
+            ..Default::default()
+        };
+
+        // A stale timestamp (older than the stored one) must neither bump nor regress.
+        state.upsert_chat(Chat {
+            id: id.clone(),
+            last_message_ts: Some(100),
+            ..Default::default()
+        });
+        assert_eq!(state.chats[1].last_message_ts, Some(200));
+
+        // A ts-less update (e.g. presence/status-only) must not reorder either.
+        state.upsert_chat(Chat {
+            id: id.clone(),
+            contact_name: "B".into(),
+            ..Default::default()
+        });
+        assert_eq!(state.chats[1].last_message_ts, Some(200));
+        assert_eq!(state.chats[1].id, id);
     }
 
     #[test]

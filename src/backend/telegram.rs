@@ -404,7 +404,7 @@ impl TelegramMessenger {
                                             false,
                                         );
 
-                                        let preview = crate::helpers::message_preview(&sender, &text);
+                                        let last_message_ts = msg.date().timestamp();
                                         let _ = tx.send(BackendEvent::MessageReceived(message.clone()));
 
                                         *cached_chats.lock().await = None;
@@ -412,7 +412,7 @@ impl TelegramMessenger {
                                         let _ = tx.send(BackendEvent::ChatUpdated(Chat {
                                             id: chat_id,
                                             contact_name: pretty_peer_name(&msg, &sender),
-                                            last_message_ts: Some(preview),
+                                            last_message_ts: Some(last_message_ts),
                                             status: None,
                                             fixed: false,
                                             verified: false,
@@ -431,18 +431,7 @@ impl TelegramMessenger {
                                             own_chat = self_user_id(&current_client).await;
                                         }
 
-                                        let from_me =
-                                            msg.outgoing() || own_chat.as_ref() == Some(&chat_id);
-
-                                        let name = telegram_message_sender(&msg, from_me);
-                                        let display_text = telegram_message_text(&msg);
-
-                                        let last_message = if from_me {
-                                            Some(crate::helpers::message_preview("You", &display_text))
-                                        } else {
-                                            Some(crate::helpers::message_preview(&name, &display_text))
-                                        };
-
+                                        let last_message_ts = msg.date().timestamp();
                                         let message = normalize_telegram_message(
                                             &msg,
                                             &chat_id,
@@ -458,7 +447,7 @@ impl TelegramMessenger {
 
                                         debug!(
                                             chat_id = ?chat_id,
-                                            preview = ?last_message,
+                                            last_message_ts,
                                             "MessageUpdated"
                                         );
                                     }
@@ -687,17 +676,10 @@ impl TelegramMessenger {
                 continue;
             }
 
-            let last_message = dialog.last_message.as_ref().map(|msg| {
-                let prefix = if msg.outgoing() {
-                    "You".to_string()
-                } else {
-                    msg.sender()
-                        .and_then(|p| p.name())
-                        .unwrap_or("Unknown")
-                        .to_string()
-                };
-                format!("{prefix}: {}", msg.text())
-            });
+            let last_message_ts = dialog
+                .last_message
+                .as_ref()
+                .map(|msg| msg.date().timestamp());
 
             let unread_count = match &dialog.raw {
                 grammers_client::tl::enums::Dialog::Dialog(d) => d.unread_count,
@@ -716,7 +698,7 @@ impl TelegramMessenger {
             chats.push(Chat {
                 id,
                 contact_name,
-                last_message_ts: last_message,
+                last_message_ts,
                 status,
                 fixed,
                 verified: false,

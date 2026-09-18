@@ -9,7 +9,6 @@ use crate::backend::{
     Provider,
 };
 use crate::config::{Config, Keymap};
-use crate::helpers::message_preview;
 use crate::tui::chat::{ChatState, OpenChat};
 use crate::tui::popup::PopupKind;
 use tracing::{debug, error, info, warn};
@@ -259,12 +258,12 @@ impl AppState {
     }
 
     /// Update the chat list entry for `chat_id` after a poll refresh detected new messages.
-    /// Updates the last_message preview from the newest message in `history`.
+    /// Sets the recency timestamp from the newest message in `history`.
     pub fn update_chat_list_from_poll(&mut self, chat_id: &ChatId, history: &[Message]) {
         if let Some(chat) = self.chat_state.chats.iter_mut().find(|c| c.id == *chat_id)
             && let Some(newest) = history.last()
         {
-            chat.last_message_ts = Some(format!("{}: {}", newest.sender, newest.text));
+            chat.last_message_ts = Some(newest.timestamp);
         }
     }
 
@@ -616,6 +615,16 @@ impl AppState {
             Ok(confirmed) => {
                 self.write.clear();
                 self.chat_state.drafts.remove(&chat.id);
+
+                let sent_ts = confirmed.timestamp;
+                let sent_chat_id = confirmed.chat.clone();
+
+                self.chat_state.upsert_chat(Chat {
+                    id: sent_chat_id,
+                    last_message_ts: Some(sent_ts),
+                    ..Default::default()
+                });
+
                 self.chat_state.push_incoming(confirmed);
             }
             Err(e) => {
@@ -650,6 +659,16 @@ impl AppState {
             Ok(confirmed) => {
                 self.write.clear();
                 self.chat_state.drafts.remove(&draft.chat);
+
+                let sent_ts = confirmed.timestamp;
+                let sent_chat_id = confirmed.chat.clone();
+
+                self.chat_state.upsert_chat(Chat {
+                    id: sent_chat_id,
+                    last_message_ts: Some(sent_ts),
+                    ..Default::default()
+                });
+
                 self.chat_state.push_incoming(confirmed);
             }
             Err(e) => {
@@ -1118,7 +1137,6 @@ impl AppState {
                     .as_ref()
                     .map(|o| o.chat.id.clone());
 
-                let preview = message_preview(&message.sender, &message.text);
                 let previous_unread_count = self
                     .chat_state
                     .chats
@@ -1150,7 +1168,7 @@ impl AppState {
                 let mut chat_update = Chat {
                     id: message.chat.clone(),
                     contact_name: contact_name.clone(),
-                    last_message_ts: Some(preview),
+                    last_message_ts: Some(message.timestamp),
                     ..Default::default()
                 };
 
@@ -1195,17 +1213,20 @@ impl AppState {
 
             BackendEvent::MessageUpdated(message) => {
                 self.chat_state.update_message(message.clone());
-                self.refresh_chat_list_preview(&message.chat);
+                self.refresh_chat_list_timestamp(&message.chat);
             }
 
             BackendEvent::MessageDeleted { chat, message_ids } => {
                 let Some(chat) = chat else {
                     return;
                 };
+
                 for message_id in message_ids {
                     self.chat_state.remove_message(&message_id);
                 }
-                self.refresh_chat_list_preview(&chat);
+
+                self.refresh_chat_list_timestamp(&chat);
+                
                 if let Some(open) = self.chat_state.open_chat.as_ref()
                     && open.chat.id == chat
                 {
@@ -1277,17 +1298,27 @@ impl AppState {
 }
 
 impl AppState {
-    fn refresh_chat_list_preview(&mut self, chat_id: &ChatId) {
+    fn refresh_chat_list_timestamp(&mut self, chat_id: &ChatId) {
         let latest = self
             .chat_state
             .open_chat
             .as_ref()
             .filter(|open| open.chat.id == *chat_id)
             .and_then(|open| open.history.last())
-            .map(|message| message_preview(&message.sender, &message.text));
+            .map(|message| message.timestamp);
 
-        if let Some((_, chat)) = self.chat_state.find_mut(chat_id) {
-            chat.last_message_ts = latest;
+        let Some((_, chat)) = self.chat_state.find_mut(chat_id) else {
+            return;
+        };
+
+        let Some(ts) = latest else {
+            return;
+        };
+
+        // Never regress: an edit to a non-newest message (or a non-open chat)
+        // must not wipe or lower the row's recency timestamp.
+        if chat.last_message_ts.is_none_or(|since| ts > since) {
+            chat.last_message_ts = Some(ts);
         }
     }
 }
@@ -1894,7 +1925,7 @@ mod tests {
                 sender: "Telegram News".into(),
                 author_id: None,
                 text: "breaking".into(),
-                timestamp: 0,
+                timestamp: 1000,
                 from_me: false,
                 msg_actions: Vec::new(),
                 media: None,
@@ -1909,10 +1940,7 @@ mod tests {
             state.chat_state.open_chat.as_ref().unwrap().history.len(),
             3
         );
-        assert_eq!(
-            state.chat_state.chats[0].last_message_ts.as_deref(),
-            Some("Telegram News: breaking")
-        );
+        assert_eq!(state.chat_state.chats[0].last_message_ts, Some(1000));
         assert!(!state.chat_state.chats[0].unread);
     }
 
@@ -2009,7 +2037,7 @@ mod tests {
     async fn closed_chat_status_update_preserves_existing_chat_list_metadata() {
         let mut state = app_state().await;
         let original_name = state.chat_state.chats[1].contact_name.clone();
-        let original_preview = state.chat_state.chats[1].last_message_ts.clone();
+        let original_ts = state.chat_state.chats[1].last_message_ts;
 
         state.handle_backend_event(
             Provider::Telegram,
@@ -2022,7 +2050,7 @@ mod tests {
 
         let chat = &state.chat_state.chats[1];
         assert_eq!(chat.contact_name, original_name);
-        assert_eq!(chat.last_message_ts, original_preview);
+        assert_eq!(chat.last_message_ts, original_ts);
         assert_eq!(chat.status.as_deref(), Some("online"));
     }
 
@@ -2052,10 +2080,7 @@ mod tests {
 
         assert_eq!(state.chat_state.chats.len(), before + 1);
         assert_eq!(state.chat_state.chats[0].id, ChatId::Telegram(999));
-        assert_eq!(
-            state.chat_state.chats[0].last_message_ts.as_deref(),
-            Some("New contact: hello there")
-        );
+        assert_eq!(state.chat_state.chats[0].last_message_ts, Some(0));
         assert!(state.chat_state.chats[0].unread);
         assert_eq!(state.chat_state.chats[0].unread_count, 1);
     }
@@ -2100,37 +2125,8 @@ mod tests {
             chat.contact_name, "Car Budget",
             "a message sender must never rename the row title"
         );
-        assert_eq!(chat.last_message_ts.as_deref(), Some("A Member: updated"));
+        assert_eq!(chat.last_message_ts, Some(0));
         assert_eq!(chat.unread_count, 1);
-    }
-
-    #[tokio::test]
-    async fn message_preview_truncation_handles_multibyte_emoji() {
-        let mut state = app_state().await;
-
-        // 30 x 4-byte emoji = 120 bytes; byte 60 lands inside an emoji and
-        // used to panic the byte-index preview slice.
-        let text = "👇".repeat(30);
-        state.handle_backend_event(
-            Provider::Telegram,
-            BackendEvent::MessageReceived(Message {
-                message_id: "emoji-1".into(),
-                chat: ChatId::Telegram(101),
-                sender: "Alice".into(),
-                author_id: None,
-                text,
-                timestamp: 0,
-                from_me: false,
-                msg_actions: Vec::new(),
-                media: None,
-                reply_to_id: None,
-                reply_ctx: None,
-                pending: false,
-                failed: false,
-            }),
-        );
-
-        assert!(state.chat_state.chats[0].last_message_ts.is_some());
     }
 
     #[tokio::test]

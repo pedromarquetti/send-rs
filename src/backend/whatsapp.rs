@@ -45,6 +45,7 @@ struct WhatsAppState {
 
     /// JID -> push name cache populated from HistorySync pushnames.
     pushnames: HashMap<String, String>,
+    // BUG: Verified badge gets removed if new messages are present in business chat
     /// JID string -> display name learned from usync (the peer's username or
     /// verified business name), keyed the way `pushnames` are (peer PN or LID).
     /// Names the phone itself declines to sync still resolve to something
@@ -78,6 +79,17 @@ struct WhatsAppState {
     /// Peer JID string -> (online, last_seen) learned from `Event::Presence`.
     #[serde(default)]
     presence: HashMap<String, (bool, Option<i64>)>,
+    /// Canonical chat key (the same string the list row uses) -> (millisecond
+    /// epoch of the last pin change applied, pinned). A full-sync pin replay
+    /// delivers every chat's historical pin/unpin actions in arbitrary order,
+    /// so bare last-write-wins would leave `fixed` at whatever mutation
+    /// happened to arrive last. Keying by change-time (newest wins) makes the
+    /// replay converge to the phone's current pin state regardless of order,
+    /// and lets pins survive even when they arrive before the chat row exists.
+    #[serde(default)]
+    // TODO: check if storing a hashmap of pin state changes is really needed, doesn't the chat
+    // already store its pin state?
+    pin_state: HashMap<String, (i64, bool)>,
     /// The account's own LID and phone-number JIDs (`to_non_ad_string`), used
     /// to label the self-chat ("Myself") instead of the formatted phone number.
     /// Learned from `client.lid()`/`client.pn()` on connect and history sync
@@ -449,16 +461,6 @@ fn resolve_conversation_name(
     }
 
     (conv.id.clone(), false)
-}
-
-/// Build a preview line for the chat list from the most recent message.
-/// TODO: check this func: isn't this used elsewhere also?
-fn preview_line(sender: &str, text: &str, from_me: bool) -> String {
-    if from_me {
-        format!("You: {text}")
-    } else {
-        format!("{sender}: {text}")
-    }
 }
 
 /// The stanza id this message quotes, if any, from its `ContextInfo`.
@@ -887,7 +889,7 @@ impl WhatsAppMessenger {
                 if let Some(history) = state.history.get_mut(&chat_id) {
                     history.clear();
                 }
-                state.refresh_preview(&chat_id);
+                state.refresh_last_message_ts(&chat_id);
                 drop(state);
                 let _ = tx.send(BackendEvent::MessageDeleted {
                     chat: Some(chat_id),
@@ -905,7 +907,7 @@ impl WhatsAppMessenger {
                     removed = history.len() != before;
                 }
                 if removed {
-                    state.refresh_preview(&chat_id);
+                    state.refresh_last_message_ts(&chat_id);
                     drop(state);
                     let _ = tx.send(BackendEvent::MessageDeleted {
                         chat: Some(chat_id),
@@ -929,9 +931,6 @@ impl WhatsAppMessenger {
                 }
             }
             Event::PinUpdate(u) => {
-                // BUG: chatlist is not properly respecting pinned chats: most recent chats are
-                // being bumped to top even if there are pinned chats there (when app is running -
-                // The ordering issue fixes itself on app restart)
                 debug!("Pinning event! {:?}", u);
                 // WhatsApp pins 1:1 threads by LID on the wire, but the chat
                 // list rows are canonicalized to their phone-keyed twins; fold
@@ -946,18 +945,23 @@ impl WhatsAppMessenger {
 
                 let mut guard = state.write().await;
 
-                if let Some(chat_row) = guard.chats.iter_mut().find(|c| c.id == chat) {
-                    chat_row.fixed = u.action.pinned.unwrap_or(false);
+                // Full-sync pin replays deliver historical mutations out of
+                // order; only the newest change timestamp per chat is
+                // authoritative, so a stale unpin can never clobber the
+                // current pin (see `WhatsAppState::apply_pin`).
+                let pinned = u.action.pinned.unwrap_or(false);
+                let changed = guard.apply_pin(&chat, pinned, u.timestamp.timestamp_millis());
+
+                if changed {
+                    // Republish the whole list so the TUI reflects both pin
+                    // and unpin; `ChatUpdated` via `upsert_chat` can only
+                    // ever set `fixed = true` and could not clear one.
+                    let snapshot = guard.chats.clone();
+                    drop(guard);
+                    state.read().await.save_to(cache_path);
+
+                    let _ = tx.send(BackendEvent::ChatList(snapshot));
                 }
-
-                // Republish the whole list so the TUI reflects both pin and
-                // unpin; `ChatUpdated` via `upsert_chat` can only ever set
-                // `fixed = true` and could not clear one.
-                let snapshot = guard.chats.clone();
-                drop(guard);
-                state.read().await.save_to(cache_path);
-
-                let _ = tx.send(BackendEvent::ChatList(snapshot));
             }
             Event::ArchiveUpdate(u) => {
                 let mut state = state.write().await;
@@ -1274,7 +1278,7 @@ impl WhatsAppState {
             .find(|m| m.message_id == *id)?;
         existing.text = text.to_string();
         let updated = existing.clone();
-        self.refresh_preview(chat);
+        self.refresh_last_message_ts(chat);
         Some(updated)
     }
 
@@ -1319,15 +1323,52 @@ impl WhatsAppState {
         self.edit_message_text(chat, &target_id, &new_text)
     }
 
+    /// Apply a pin/unpin event for a chat, keyed by its change timestamp.
+    /// WhatsApp full-sync replays every chat's historical pin actions in
+    /// arbitrary order, so bare last-write-wins would leave `fixed` at
+    /// whatever mutation arrived last; the newest change-time always wins
+    /// here, making the replay converge to the phone's current pin state.
+    /// The pin state is recorded even when no row exists yet (pins commonly
+    /// replay before the first history sync lands) so a later
+    /// `upsert_conversation` can honor it.
+    ///
+    /// Returns `true` when the chat row's `fixed` flag actually changed.
+    fn apply_pin(&mut self, chat: &ChatId, pinned: bool, ts_millis: i64) -> bool {
+        let ChatId::WhatsApp(key) = chat else {
+            return false;
+        };
+
+        let stale = self
+            .pin_state
+            .get(key)
+            .is_some_and(|(applied_ts, _)| *applied_ts >= ts_millis);
+        if stale {
+            return false;
+        }
+
+        self.pin_state.insert(key.clone(), (ts_millis, pinned));
+
+        let Some(chat_row) = self.chats.iter_mut().find(|c| c.id == *chat) else {
+            return false;
+        };
+
+        if chat_row.fixed == pinned {
+            return false;
+        }
+
+        chat_row.fixed = pinned;
+        true
+    }
+
     /// Insert or update the chat list entry for `chat` from a freshly normalized
-    /// message, bumping preview and unread state. Used by the live
+    /// message, bumping recency timestamp and unread state. Used by the live
     /// `Event::Messages` path.
     fn upsert_chat_from_message(&mut self, chat: ChatId, msg: &Message) {
-        let preview = preview_line(&msg.sender, &msg.text, msg.from_me);
+        let last_message_ts = msg.timestamp;
 
         match self.chats.iter_mut().find(|c| c.id == chat) {
             Some(c) => {
-                c.last_message_ts = Some(preview);
+                c.last_message_ts = Some(last_message_ts);
 
                 if is_self_chat(&chat, self.own_lid.as_deref(), self.own_pn.as_deref()) {
                     c.contact_name = "Myself".to_string();
@@ -1364,7 +1405,7 @@ impl WhatsAppState {
                 self.chats.push(Chat {
                     id: chat.clone(),
                     contact_name,
-                    last_message_ts: Some(preview),
+                    last_message_ts: Some(last_message_ts),
                     unread: !msg.from_me,
                     unread_count: if msg.from_me { 0 } else { 1 },
                     ..Default::default()
@@ -1399,8 +1440,16 @@ impl WhatsAppState {
 
         // WhatsApp syncs `pinned` as None in practice (pins arrive only via
         // PinUpdate), so a sync must never clobber an applied pin back to
-        // false. Write `fixed` only when the conversation carries a pin value.
-        let fixed = conv.pinned.map(|pinned| pinned > 0);
+        // false. Write `fixed` only when the conversation carries a pin
+        // value, falling back to any recorded pin state (pins often replay
+        // before the row exists and are remembered by `apply_pin`).
+        let fixed = conv
+            .pinned
+            .map(|pinned| pinned > 0)
+            .or_else(|| match &chat {
+                ChatId::WhatsApp(key) => self.pin_state.get(key).map(|(_, pinned)| *pinned),
+                _ => None,
+            });
 
         let exists = self.chats.iter().any(|c| c.id == chat);
         let name_for_log = contact_name.clone();
@@ -1443,17 +1492,17 @@ impl WhatsAppState {
         );
     }
 
-    /// Refresh the `last_message` preview for a chat from its newest stored
-    /// history message (used by history sync after ingestion).
-    fn refresh_preview(&mut self, chat: &ChatId) {
-        let preview = self
+    /// Refresh the `last_message_ts` for a chat from its newest stored history
+    /// message (used by history sync after ingestion).
+    fn refresh_last_message_ts(&mut self, chat: &ChatId) {
+        let last_message_ts = self
             .history
             .get(chat)
             .and_then(|h| h.iter().max_by_key(|m| m.timestamp))
-            .map(|lm| preview_line(&lm.sender, &lm.text, lm.from_me));
+            .map(|lm| lm.timestamp);
 
         if let Some(c) = self.chats.iter_mut().find(|c| c.id == *chat) {
-            c.last_message_ts = preview;
+            c.last_message_ts = last_message_ts;
         }
     }
 }
@@ -1583,9 +1632,7 @@ async fn merge_lid_duplicates(
             pn_row.unread = pn_row.unread || orphan.unread;
             pn_row.unread_count = pn_row.unread_count.max(orphan.unread_count);
 
-            if pn_row.last_message_ts.is_none() {
-                pn_row.last_message_ts = orphan.last_message_ts;
-            }
+            pn_row.last_message_ts = pn_row.last_message_ts.max(orphan.last_message_ts);
 
             pn_row.verified = pn_row.verified || orphan.verified;
             pn_row.fixed = pn_row.fixed || orphan.fixed;
@@ -1937,7 +1984,7 @@ async fn handle_history_sync(
         }
 
         // Always finish with an up-to-date preview.
-        state.refresh_preview(&chat);
+        state.refresh_last_message_ts(&chat);
     }
 
     // Re-resolve senders the ingest froze bare before the pushnames bundle
@@ -2509,7 +2556,7 @@ impl Messenger for WhatsAppMessenger {
 
             for c in state.chats.iter_mut() {
                 if c.id == *chat {
-                    c.last_message_ts = Some(format!("You: {text}"));
+                    c.last_message_ts = Some(sent.timestamp);
                     c.unread = false;
                     c.unread_count = 0;
                 }
@@ -2556,7 +2603,7 @@ impl Messenger for WhatsAppMessenger {
                 state
                     .by_stanza_id
                     .retain(|_, (c, mid)| !(*c == *chat && *mid == *id));
-                state.refresh_preview(chat);
+                state.refresh_last_message_ts(chat);
             }
 
             removed
@@ -2685,6 +2732,7 @@ impl Messenger for WhatsAppMessenger {
 }
 
 #[cfg(test)]
+// TODO: check if these tests can use whatsapp-rust's mock server
 mod tests {
     use super::*;
     use chrono::TimeZone;
@@ -3064,6 +3112,75 @@ mod tests {
         assert!(!st.chats[0].fixed, "Some(0) is an explicit unpin");
     }
 
+    #[test]
+    fn apply_pin_shuffled_replay_converges_to_newest_change() {
+        // A full-sync pin replay delivers a chat's historical pin/unpin
+        // actions in arbitrary order; the newest change timestamp must win
+        // even when a stale unpin arrives last.
+        let chat = ChatId::jid_to_chat_id("15550000001@s.whatsapp.net");
+        let mut st = WhatsAppState {
+            chats: vec![Chat {
+                id: chat.clone(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(st.apply_pin(&chat, true, 1_000));
+        assert!(
+            !st.apply_pin(&chat, true, 2_000),
+            "re-pinning is a no-op, but its timestamp is recorded"
+        );
+        // Old unpin (500) delivered after both — must not clobber the pin.
+        assert!(!st.apply_pin(&chat, false, 500));
+        assert!(st.chats[0].fixed, "newest repin (2000) must remain applied");
+
+        // The change timestamps ride along: a genuinely newer unpin clears it.
+        assert!(st.apply_pin(&chat, false, 3_000));
+        assert!(!st.chats[0].fixed);
+    }
+
+    #[test]
+    fn apply_pin_stale_unpin_cannot_clobber_newer_repin() {
+        let chat = ChatId::jid_to_chat_id("15550000001@s.whatsapp.net");
+        let mut st = WhatsAppState {
+            chats: vec![Chat {
+                id: chat.clone(),
+                fixed: true,
+                ..Default::default()
+            }],
+            pin_state: HashMap::from([("15550000001@s.whatsapp.net".to_string(), (2_000, true))]),
+            ..Default::default()
+        };
+
+        assert!(!st.apply_pin(&chat, false, 500));
+        assert!(st.chats[0].fixed, "stale unpin must be ignored");
+    }
+
+    #[test]
+    fn apply_pin_remembered_for_later_row_creation() {
+        // Pins commonly replay before any history sync, so the chat row does
+        // not exist yet; the state must be remembered and honored when the
+        // row is later created unpinned by a history-sync upsert.
+        let chat = ChatId::jid_to_chat_id("15550000001@s.whatsapp.net");
+        let mut st = WhatsAppState::default();
+
+        assert!(
+            !st.apply_pin(&chat, true, 1_000),
+            "no row yet, nothing changed"
+        );
+
+        let conv = wa::Conversation {
+            id: "15550000001@s.whatsapp.net".to_string(),
+            ..Default::default()
+        };
+        st.upsert_conversation(&conv, chat);
+        assert!(
+            st.chats[0].fixed,
+            "history sync must honor the remembered pin"
+        );
+    }
+
     #[tokio::test]
     async fn canonical_chat_id_folds_known_lid_pin_to_phone_row() {
         // The PinUpdate handler canonicalizes the wire LID the same way live
@@ -3351,7 +3468,7 @@ mod tests {
         );
         st.chats.push(Chat {
             id: chat.clone(),
-            last_message_ts: Some("Alice: before".into()),
+            last_message_ts: Some(999),
             ..Default::default()
         });
 
@@ -3381,7 +3498,7 @@ mod tests {
         assert_eq!(updated.text, "after");
         assert_eq!(updated.message_id, MessageId("orig-1".into()));
         assert_eq!(st.history[&chat][0].text, "after");
-        assert_eq!(st.chats[0].last_message_ts.as_deref(), Some("Alice: after"));
+        assert_eq!(st.chats[0].last_message_ts, Some(1000));
     }
 
     #[test]
@@ -3525,7 +3642,7 @@ mod tests {
         );
         st.chats.push(Chat {
             id: chat.clone(),
-            last_message_ts: Some("Alice: before".into()),
+            last_message_ts: Some(999),
             ..Default::default()
         });
 
@@ -3535,7 +3652,7 @@ mod tests {
         assert_eq!(updated.text, "after");
         assert_eq!(updated.message_id, MessageId("orig-1".into()));
         assert_eq!(st.history[&chat][0].text, "after");
-        assert_eq!(st.chats[0].last_message_ts.as_deref(), Some("Alice: after"));
+        assert_eq!(st.chats[0].last_message_ts, Some(1000));
     }
 
     #[test]
@@ -3856,8 +3973,8 @@ mod tests {
         assert!(dm_chat.fixed, "pinned conversation should be marked fixed");
         assert_eq!(dm_chat.unread_count, 3);
         assert!(dm_chat.unread);
-        // Preview from the newest message.
-        assert_eq!(dm_chat.last_message_ts.as_deref(), Some("You: reply"));
+        // Recency timestamp from the newest message.
+        assert_eq!(dm_chat.last_message_ts, Some(1001));
 
         let group_chat = s
             .chats

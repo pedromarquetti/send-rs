@@ -239,7 +239,7 @@ impl Messenger for MockMessenger {
             .find(|c| c.id == *chat)
             .cloned()
             .map(|mut c| {
-                c.last_message_ts = Some(format!("You: {text}"));
+                c.last_message_ts = Some(msg.timestamp);
                 c
             });
         drop(state);
@@ -344,7 +344,7 @@ impl MockMessenger {
                 .find(|c| c.id == chat)
                 .cloned()
                 .map(|mut c| {
-                    c.last_message_ts = Some(format!("{sender}: {text}"));
+                    c.last_message_ts = Some(msg.timestamp);
                     c
                 });
             drop(state);
@@ -366,7 +366,7 @@ fn mock_data(name: &'static str) -> MockData {
                 Chat {
                     id: NEWS_ID.clone(),
                     contact_name: "Telegram News".into(),
-                    last_message_ts: Some("MTProto v0.10 released".into()),
+                    last_message_ts: Some(100),
                     unread: false,
                     unread_count: 0,
                     ..Default::default()
@@ -374,7 +374,7 @@ fn mock_data(name: &'static str) -> MockData {
                 Chat {
                     id: FAMILY_ID.clone(),
                     contact_name: "Family Group".into(),
-                    last_message_ts: Some("Mum: call me later".into()),
+                    last_message_ts: Some(200),
                     unread: true,
                     unread_count: 3,
                     ..Default::default()
@@ -382,7 +382,7 @@ fn mock_data(name: &'static str) -> MockData {
                 Chat {
                     id: ALICE_ID.clone(),
                     contact_name: "Alice".into(),
-                    last_message_ts: Some("You: ok, see you".into()),
+                    last_message_ts: Some(300),
                     unread: false,
                     unread_count: 0,
                     ..Default::default()
@@ -439,7 +439,7 @@ fn mock_data(name: &'static str) -> MockData {
                 Chat {
                     id: bob.clone(),
                     contact_name: "Bob".into(),
-                    last_message_ts: Some("Bob: did you push?".into()),
+                    last_message_ts: Some(400),
                     unread: true,
                     unread_count: 5,
                     ..Default::default()
@@ -447,7 +447,7 @@ fn mock_data(name: &'static str) -> MockData {
                 Chat {
                     id: design.clone(),
                     contact_name: "Design Team".into(),
-                    last_message_ts: Some("Lia: new figma board".into()),
+                    last_message_ts: Some(500),
                     unread: false,
                     unread_count: 0,
                     ..Default::default()
@@ -579,13 +579,17 @@ mod tests {
 
         let mut saw_message = false;
         let mut saw_chat = false;
+        let mut sent_ts = 0;
         while let Ok(event) = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
             match event.unwrap() {
                 BackendEvent::MessageReceived(msg) => {
-                    saw_message = msg.from_me && msg.text == "hi";
+                    if msg.from_me && msg.text == "hi" {
+                        sent_ts = msg.timestamp;
+                        saw_message = true;
+                    }
                 }
                 BackendEvent::ChatUpdated(c) => {
-                    saw_chat = c.last_message_ts.as_deref() == Some("You: hi");
+                    saw_chat = c.last_message_ts == Some(sent_ts);
                 }
                 _ => {}
             }
