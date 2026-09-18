@@ -18,10 +18,10 @@ pub struct OpenChat {
     pub has_more_history: bool,
 }
 
-/// A chat in the sidebar combined with its app-level metadata.
+/// A chat in the chat list combined with its app-level metadata.
 #[derive(Clone, Default)]
 pub struct ChatState {
-    /// Selection state for the chat list sidebar.
+    /// Selection state for the chat list.
     pub chat_list_state: ListState,
     pub chats: Vec<Chat>,
     /// responsible for keeping track of the actual visible page page on a chat
@@ -62,7 +62,7 @@ impl ChatState {
         if !duplicate_ids.is_empty() {
             tracing::warn!(
                 duplicates = ?duplicate_ids,
-                "Removed duplicate chat IDs from sidebar state"
+                "Removed duplicate chat IDs from chat list state"
             );
         }
     }
@@ -206,7 +206,7 @@ impl ChatState {
     pub fn find_mut(&mut self, id: &ChatId) -> Option<(usize, &mut Chat)> {
         if !self.chats.iter().any(|chat| chat.id == *id) {
             let ids: Vec<_> = self.chats.iter().map(|c| format!("{:?}", c.id)).collect();
-            tracing::trace!(search = ?id, sidebar = ?ids, "find_mut: chat not found in sidebar");
+            tracing::trace!(search = ?id, chat_list = ?ids, "find_mut: chat not found in chat list");
         }
         self.chats
             .iter_mut()
@@ -589,7 +589,7 @@ mod tests {
     }
 
     #[test]
-    fn upsert_does_not_insert_unknown_name_as_sidebar_title() {
+    fn upsert_does_not_insert_unknown_name_as_chat_list_title() {
         let id = ChatId::Telegram(1);
         let mut state = ChatState::default();
 

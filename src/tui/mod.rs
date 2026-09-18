@@ -204,11 +204,13 @@ async fn run_app(
 
     chat_poll_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-    let sidebar_period = Duration::from_secs(app.state.config.sidebar_sync_secs);
-    let mut sidebar_sync_interval =
-        tokio::time::interval_at(tokio::time::Instant::now() + sidebar_period, sidebar_period);
+    let chat_list_period = Duration::from_secs(app.state.config.chat_list_sync_secs);
+    let mut chatlist_sync_interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + chat_list_period,
+        chat_list_period,
+    );
 
-    sidebar_sync_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    chatlist_sync_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
         terminal.draw(|frame| app.draw(frame))?;
@@ -244,17 +246,17 @@ async fn run_app(
             }
 
             // load chatlist task
-            _ = sidebar_sync_interval.tick() => {
+            _ = chatlist_sync_interval.tick() => {
                 if !app.state.chats_loaded {
                     continue;
                 }
 
-                if app.state.sidebar_sync_in_flight {
+                if app.state.chatlist_sync_in_flight {
                     continue;
                 }
 
-                app.state.sidebar_sync_in_flight = true;
-                app.state.sidebar_sync_pending = app.state.messengers.len();
+                app.state.chatlist_sync_in_flight = true;
+                app.state.chatlist_sync_pending = app.state.messengers.len();
 
                 for messenger in app.state.messengers.iter() {
                     let provider = messenger.provider();
@@ -322,7 +324,7 @@ async fn run_app(
                             messages = history.len(),
                             "HistoryRefresh applied"
                         );
-                        app.state.update_sidebar_from_poll(&chat_id, &history);
+                        app.state.update_chat_list_from_poll(&chat_id, &history);
                         app.state.chat_state.refresh_chat_history(&chat_id, history);
                     }
                     UiEvent::HistoryRefreshResult(chat_id, result) => {
@@ -334,7 +336,7 @@ async fn run_app(
                         }
                         if let Ok(history) = result {
                             debug!(chat = ?chat_id, msgs = history.len(), "Poll refresh OK");
-                            app.state.update_sidebar_from_poll(&chat_id, &history);
+                            app.state.update_chat_list_from_poll(&chat_id, &history);
                             app.state.chat_state.refresh_chat_history(&chat_id, history);
                         } else if let Err(e) = result {
                             error!(chat = ?chat_id, error = %e, "Poll refresh failed");
@@ -355,9 +357,12 @@ async fn run_app(
                             status,
                         } => app.state.apply_chat_load(chat, generation, result, status),
                     UiEvent::ChatList(provider, result) => {
-                        app.state.sidebar_sync_pending =
-                            app.state.sidebar_sync_pending.saturating_sub(1);
-                        app.state.sidebar_sync_in_flight = app.state.sidebar_sync_pending > 0;
+                                // TODO: hide archived chats from the main list once the TUI has an
+                                    // Archived section; until then they stay visible to match the phone.
+
+                        app.state.chatlist_sync_pending =
+                            app.state.chatlist_sync_pending.saturating_sub(1);
+                        app.state.chatlist_sync_in_flight = app.state.chatlist_sync_pending > 0;
 
                         match result {
                             Ok(chats) => {
@@ -365,10 +370,10 @@ async fn run_app(
                                     .chat_state
                                     .reconcile_provider_chats(provider, chats);
                                 app.state.persist_chats();
-                                debug!(provider = ?provider, "Sidebar sync OK");
+                                debug!(provider = ?provider, "Chat list sync OK");
                             }
 
-                            Err(e) => error!(provider = ?provider, error = %e, "Sidebar sync failed"),
+                            Err(e) => error!(provider = ?provider, error = %e, "Chat list sync failed"),
                         }
                     }
                     UiEvent::ChatsLoaded { chats, errors } => {

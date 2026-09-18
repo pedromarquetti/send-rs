@@ -397,7 +397,7 @@ impl From<whatsapp_rust::SendError> for BackendError {
 pub trait Messenger: Send + Sync {
     fn platform(&self) -> &'static str;
     async fn is_authenticated(&self) -> bool;
-    /// get chat list for populating sidebar
+    /// Fetch the chat list.
     async fn chats(&self) -> Result<Vec<Chat>, BackendError>;
     /// mark a chat as read
     async fn set_read(&mut self, chat: &ChatId) -> Result<(), BackendError>;
@@ -598,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn dialog_carries_sidebar_fields() {
+    fn dialog_carries_chat_list_fields() {
         let chat = Chat {
             id: ChatId::WhatsApp("5511999999999@s.whatsapp.net".into()),
             contact_name: "Alice".into(),

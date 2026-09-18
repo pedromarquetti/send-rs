@@ -61,7 +61,7 @@ types.
   work in progress — keep the `chat_list`/`ChatState` invariants intact.
 - Event flow: provider → `BackendEvent` → `AppState::handle_backend_event` →
   `ChatState`. Push updates are authoritative where available; polling
-  (`chat_poll_interval_secs`, `sidebar_sync_secs`) is the fallback.
+  (`chat_poll_interval_secs`, `chat_list_sync_secs`) is the fallback.
 
 ## Backend integration docs — read before editing providers
 

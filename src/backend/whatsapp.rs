@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::broadcast::Sender;
 use tokio::sync::{RwLock, broadcast};
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use whatsapp_rust::Client;
 use whatsapp_rust::prelude::{
     Bot, Event, Jid, MessageBuilderExt, MessageExt, MessageInfo, Server, SqliteStore, wa,
@@ -69,6 +69,10 @@ struct WhatsAppState {
     /// LID↔PN cache (`Client::get_lid_pn_entry`). Lets live `@lid` messages and
     /// conversations route to the phone-keyed chat row the user opens, and gives
     /// LID senders a readable name.
+    ///
+    /// INFO: LID JID definitions:
+    /// JID => Group/Contact ids in the format <Phone Number>@<server>
+    /// LID (Long ID) => Non-Phone number id for user or group
     #[serde(default)]
     lid_pn: HashMap<String, String>,
     /// Peer JID string -> (online, last_seen) learned from `Event::Presence`.
@@ -539,6 +543,15 @@ impl WhatsAppMessenger {
                 .collect();
         }
 
+        // Cold-start sweep: history synced before the pushnames bundle arrived
+        // froze 1:1 senders as bare numbers; re-resolve them now that the
+        // cached maps are loaded, and persist the repairs before the UI renders.
+        let repaired = state.resolve_stale_senders();
+        if repaired > 0 {
+            info!("WA startup resolved {repaired} stale sender name(s)");
+            state.save_to(&chat_cache);
+        }
+
         let state: SharedState = Arc::new(RwLock::new(state));
         let shutdown = Arc::new(AtomicBool::new(false));
         let current_qr: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
@@ -710,7 +723,7 @@ impl WhatsAppMessenger {
         state: &SharedState,
         tx: &Sender<BackendEvent>,
         current_qr: &Arc<RwLock<Option<String>>>,
-        cache_path: &PathBuf,
+        cache_path: &Path,
     ) {
         match &**event {
             Event::Connected(_) => {
@@ -734,6 +747,11 @@ impl WhatsAppMessenger {
                 // history sync.
                 state.write().await.learn_own_identity(client);
                 for inbound in batch.messages.iter() {
+                    debug!(
+                        "Handling inbound WP Message: push_name={:?} from_me={} source - {:?}",
+                        inbound.info.push_name, inbound.info.source.is_from_me, inbound.info.source,
+                    );
+
                     // Skip status/24h broadcasts and any
                     // message with no payload: they do not
                     // belong in the chat list.
@@ -835,7 +853,7 @@ impl WhatsAppMessenger {
                         // usync, for chat partners without a saved contact name.
                         let client = client.clone();
                         let state = state.clone();
-                        let cache_path = cache_path.clone();
+                        let cache_path = cache_path.to_path_buf();
                         let tx = tx.clone();
                         tokio::spawn(async move {
                             enrich_chat_names(&client, &state, &cache_path, &tx).await;
@@ -911,6 +929,9 @@ impl WhatsAppMessenger {
                 }
             }
             Event::PinUpdate(u) => {
+                // BUG: chatlist is not properly respecting pinned chats: most recent chats are
+                // being bumped to top even if there are pinned chats there (when app is running -
+                // The ordering issue fixes itself on app restart)
                 debug!("Pinning event! {:?}", u);
                 // WhatsApp pins 1:1 threads by LID on the wire, but the chat
                 // list rows are canonicalized to their phone-keyed twins; fold
@@ -990,7 +1011,7 @@ impl WhatsAppMessenger {
                 // immediately even when the snapshot PDO fails to decompress.
                 let client = client.clone();
                 let state_for_enrich = state.clone();
-                let cache_path = cache_path.clone();
+                let cache_path = cache_path.to_path_buf();
                 let tx_for_enrich = tx.clone();
 
                 tokio::spawn(async move {
@@ -1004,6 +1025,13 @@ impl WhatsAppMessenger {
                 let _ = tx.send(BackendEvent::ChatList(snapshot));
             }
             Event::Presence(u) => {
+                // BUG: new Presence event is sending the chat to the top of the
+                // chat_list, this should not happen!
+                // TODO: Consider simplifying this:
+                // if unavailable {
+                // todo!();
+                // }
+                //
                 // Only track peers that have a chat row; unknown LIDs would
                 // otherwise grow the map without bounds.
                 let online = !u.unavailable;
@@ -1017,7 +1045,7 @@ impl WhatsAppMessenger {
                 for key in presence_keys(&u.from, &st) {
                     st.presence.insert(key, (online, last_seen));
                 }
-                // Surface the learned status in the open chat and sidebar; only
+                // Surface the learned status in the open chat and chat list; only
                 // broadcast when the row actually changes to avoid a flood of
                 // identical ChatUpdated events while a peer is active.
                 let Some(row) = st.chats.iter_mut().find(|c| c.id == chat) else {
@@ -1139,6 +1167,85 @@ impl WhatsAppState {
         self.name_self_chats();
     }
 
+    /// Re-derive cached message senders from the current pushname/LID↔PN maps.
+    ///
+    /// The first history sync lands before the pushnames bundle, freezing the
+    /// newest 1:1 messages with bare numbers; the dup guard later skips the
+    /// rows, so they never get a second chance to resolve. Sweep every stored
+    /// `!from_me` message: upgrade a bare sender to anything now known (a
+    /// pushname, a LID↔PN mapping, or a 1:1 chat's own display name), and
+    /// re-bind already-named rows when the peer renamed — but never downgrade
+    /// a known name back to a bare id when the maps lost it. Group rows whose
+    /// author is the group's own JID have no recoverable identity (HistorySync
+    /// omits `key.participant`) and are left untouched; group rows that did
+    /// capture a real participant via the live path still resolve by name.
+    /// Returns how many senders were rewritten.
+    fn resolve_stale_senders(&mut self) -> usize {
+        let chats = self.chats.clone();
+        let mut rewrites: Vec<(ChatId, MessageId, String)> = Vec::new();
+
+        for (chat_key, messages) in &self.history {
+            let ChatId::WhatsApp(raw) = chat_key else {
+                continue;
+            };
+
+            let chat_is_group = Jid::from_str(raw).map(|j| j.is_group()).unwrap_or(false);
+            let chat_contact = chats
+                .iter()
+                .find(|c| c.id == *chat_key)
+                .map(|c| c.contact_name.clone())
+                .filter(|n| !n.trim().is_empty());
+
+            for m in messages.iter().filter(|m| !m.from_me) {
+                let Some(author) = m.author_id.as_deref() else {
+                    continue;
+                };
+
+                let Ok(author_jid) = Jid::from_str(author) else {
+                    continue;
+                };
+
+                let bare = author_jid.user_base();
+                if bare.is_empty() {
+                    continue;
+                }
+
+                let resolved = resolve_sender_name("", &author_jid, &self.pushnames, &self.lid_pn);
+
+                // Unresolvable from the maps: only a 1:1 chat's own display
+                // name (usync-enriched) is a safe fallback. Group rows must
+                // keep the participant's raw id — applying the group title
+                // would label every message with the chat.
+                let name = if resolved == bare {
+                    if !chat_is_group && let Some(contact) = chat_contact.as_ref() {
+                        contact.clone()
+                    } else {
+                        continue;
+                    }
+                } else {
+                    resolved
+                };
+
+                // Upgrade a bare stored name to anything better; otherwise
+                // only rebind to another real name when the maps know the
+                // author differently. Never downgrade to a bare id.
+                if (m.sender == bare || name != bare) && name != m.sender {
+                    rewrites.push((chat_key.clone(), m.message_id.clone(), name));
+                }
+            }
+        }
+
+        let repaired = rewrites.len();
+        for (chat, id, name) in rewrites {
+            if let Some(h) = self.history.get_mut(&chat)
+                && let Some(m) = h.iter_mut().find(|m| m.message_id == id)
+            {
+                m.sender = name;
+            }
+        }
+        repaired
+    }
+
     /// Rename any cached row that addresses the account's own LID or phone
     /// number to "Myself". WhatsApp keeps the self-thread local on the phone
     /// (it may never arrive via HistorySync), so rows seeded from the cache
@@ -1153,7 +1260,7 @@ impl WhatsAppState {
     }
 
     /// Rewrite the text of a stored message (by its original id) and refresh
-    /// the sidebar preview. Used both for edits arriving back from the server
+    /// the chat list preview. Used both for edits arriving back from the server
     /// and for local edits confirmed by the send ack (which the server never
     /// re-delivers in the self-chat). Returns the updated copy, or `None` when
     /// the target is not in the cache.
@@ -1210,7 +1317,7 @@ impl WhatsAppState {
         self.edit_message_text(chat, &target_id, &new_text)
     }
 
-    /// Insert or update the sidebar entry for `chat` from a freshly normalized
+    /// Insert or update the chat list entry for `chat` from a freshly normalized
     /// message, bumping preview and unread state. Used by the live
     /// `Event::Messages` path.
     fn upsert_chat_from_message(&mut self, chat: ChatId, msg: &Message) {
@@ -1264,7 +1371,7 @@ impl WhatsAppState {
         }
     }
 
-    /// Upsert the given conversation into the sidebar using history-sync
+    /// Upsert the given conversation into the chat list using history-sync
     /// metadata (name, unread, pinned). Preserves any newer `last_message` set
     /// by live data. Conversations that are not really chats on the phone (see
     /// [`should_skip_conversation`]) are not inserted.
@@ -1287,7 +1394,7 @@ impl WhatsAppState {
             };
 
         let unread_count = conv.unread_count.unwrap_or(0) as i32;
-        
+
         // WhatsApp syncs `pinned` as None in practice (pins arrive only via
         // PinUpdate), so a sync must never clobber an applied pin back to
         // false. Write `fixed` only when the conversation carries a pin value.
@@ -1378,8 +1485,6 @@ fn should_skip_conversation(conv: &wa::Conversation) -> Option<&'static str> {
         return Some("terminated conversation");
     }
 
-    // TODO: hide archived chats from the main list once the TUI has an
-    // Archived section; until then they stay visible to match the phone.
     if conv.read_only.unwrap_or(false) {
         return Some("read-only (left/declined) conversation");
     }
@@ -1513,7 +1618,7 @@ async fn merge_lid_duplicates(
     merged
 }
 
-/// Find the sidebar chat row for a peer JID, trying the wire key and its
+/// Find the chat list row for a peer JID, trying the wire key and its
 /// phone-keyed twin when the key is a LID.
 fn find_peer_chat(state: &WhatsAppState, jid: &Jid) -> Option<ChatId> {
     let chat = fold_lid_key(&jid.to_non_ad_string(), state);
@@ -1544,13 +1649,14 @@ fn presence_label(online: bool, last_seen: Option<i64>) -> Option<String> {
     }
 }
 
-/// Sidebar order for WhatsApp chats: pinned first, then most-recently-active.
+/// Chat list order for WhatsApp chats: pinned first, then most-recently-active.
 /// WhatsApp syncs conversation rows without a reliable per-row timestamp, so
 /// the newest stored message is the recency signal. `chats()` and every chat
 /// list republish go through this so the running TUI never falls back to
 /// insertion order.
 fn sorted_chat_snapshot(st: &WhatsAppState) -> Vec<Chat> {
     let mut chats = st.chats.clone();
+    // TODO: let the TUI handle sorting - sorting here is breaking multi provider chat_list
     chats.sort_by_key(|c| {
         let recency = st
             .history
@@ -1599,7 +1705,7 @@ fn relative_time(unix_seconds: i64) -> String {
 }
 
 async fn handle_history_sync(
-    hs: &HistorySync,
+    history_sync: &HistorySync,
     client: Option<&Arc<Client>>,
     state: &SharedState,
     tx: &Sender<BackendEvent>,
@@ -1608,8 +1714,8 @@ async fn handle_history_sync(
     // Canonicalize every conversation key before taking the write lock: the
     // helper awaits the client's local LID↔PN cache and would otherwise
     // deadlock against a held write lock.
-    let mut canonical: Vec<ChatId> = Vec::with_capacity(hs.conversations.len());
-    for conversation in &hs.conversations {
+    let mut canonical: Vec<ChatId> = Vec::with_capacity(history_sync.conversations.len());
+    for conversation in &history_sync.conversations {
         canonical.push(
             canonical_chat_id(
                 client,
@@ -1628,7 +1734,7 @@ async fn handle_history_sync(
         {
             let st = state.read().await;
             let mut seen: HashSet<String> = HashSet::new();
-            for conversation in &hs.conversations {
+            for conversation in &history_sync.conversations {
                 for history in conversation.messages.iter() {
                     let Some(web) = history.message.as_option() else {
                         continue;
@@ -1646,14 +1752,21 @@ async fn handle_history_sync(
                     {
                         continue;
                     }
+
                     let sender = key
                         .participant
                         .as_deref()
                         .and_then(|p| Jid::from_str(p).ok())
+                        .or_else(|| {
+                            web.participant
+                                .as_deref()
+                                .and_then(|p| Jid::from_str(p).ok())
+                        })
                         .unwrap_or_else(|| {
                             Jid::from_str(&conversation.id)
                                 .unwrap_or_else(|_| Jid::new(&conversation.id, Server::Pn))
                         });
+
                     if sender.is_lid()
                         && sender.user_base().is_ascii()
                         && !st.lid_pn.contains_key(sender.user_base())
@@ -1682,13 +1795,13 @@ async fn handle_history_sync(
 
     debug!(
         "WA handle_history_sync: {} conversations, {} pushnames",
-        hs.conversations.len(),
-        hs.pushnames.len(),
+        history_sync.conversations.len(),
+        history_sync.pushnames.len(),
     );
 
     // Index the push names so both conversation and per-message resolutions can
     // reach them. Newer syncs overwrite stale entries keyed by the same JID.
-    for pn in hs.pushnames.iter() {
+    for pn in history_sync.pushnames.iter() {
         if let (Some(id), Some(name)) = (pn.id.as_deref(), pn.pushname.as_deref())
             && !name.trim().is_empty()
         {
@@ -1696,7 +1809,7 @@ async fn handle_history_sync(
         }
     }
 
-    for (conversation, chat) in hs.conversations.iter().zip(canonical.iter()) {
+    for (conversation, chat) in history_sync.conversations.iter().zip(canonical.iter()) {
         let chat = chat.clone();
 
         state.upsert_conversation(conversation, chat.clone());
@@ -1751,13 +1864,26 @@ async fn handle_history_sync(
             }
 
             let from_me = key.from_me.unwrap_or(false);
+
             let sender_jid = key
                 .participant
                 .as_deref()
                 .and_then(|p| Jid::from_str(p).ok())
+                .or_else(|| {
+                    web.participant
+                        .as_deref()
+                        .and_then(|p| Jid::from_str(p).ok())
+                })
                 .unwrap_or_else(|| {
                     // Own messages and one-to-one chats are authored by the chat
                     // itself; the per-message participant slot is absent.
+                    if !from_me && key.participant.is_none() && web.participant.is_none() {
+                        error!(
+                            "WA group message stanza_id={} has no participant identity \
+                             (key or web) and is not from_me; falling back to group JID",
+                            stanza_id,
+                        );
+                    }
                     Jid::from_str(&conversation.id)
                         .unwrap_or_else(|_| Jid::new(&conversation.id, Server::Pn))
                 });
@@ -1770,6 +1896,18 @@ async fn handle_history_sync(
                 web,
                 &state.pushnames,
                 &state.lid_pn,
+            );
+
+            debug!(
+                chat = %conversation.id,
+                stanza_id = %stanza_id,
+                from_me = from_me,
+                key_participant = ?key.participant.as_deref(),
+                msg_push_name = ?web.push_name.as_deref(),
+                sender_jid = %sender_jid,
+                resolved_sender = %info.push_name,
+                already_cached = already,
+                "WA history message sender resolution"
             );
 
             let mut normalized = to_senders_msg(chat.clone(), &info, msg, &state);
@@ -1816,9 +1954,17 @@ async fn handle_history_sync(
         // Always finish with an up-to-date preview.
         state.refresh_preview(&chat);
     }
+    // Re-resolve senders the ingest froze bare before the pushnames bundle
+    // landed, and persist any repairs with the newly learned names.
+    let repaired = state.resolve_stale_senders();
     let chats_total = state.chats.len();
     let chats_snapshot = sorted_chat_snapshot(&state);
     drop(state);
+
+    if repaired > 0 {
+        info!("WA resolved {repaired} stale sender name(s)");
+        shared.read().await.save_to(cache_path);
+    }
 
     info!("WA handle_history_sync done: chats={}", chats_total);
 
@@ -1844,11 +1990,10 @@ async fn handle_history_sync(
 /// phone number) under both the peer LID and PN keys, refreshes the cached chat
 /// rows, and persists the cache. Already-queried peers are skipped so a contact
 /// without a username/business name is not re-queried on every history sync.
-// BUG: WhatsApp: This is not working properly: Contact names in Chat view are being rendered incorrectly (not by their name, but by phone number or id).
 async fn enrich_chat_names(
     client: &Arc<Client>,
     state: &SharedState,
-    cache_path: &PathBuf,
+    cache_path: &Path,
     tx: &Sender<BackendEvent>,
 ) {
     let candidates: Vec<Jid> = {
@@ -1985,14 +2130,17 @@ async fn enrich_chat_names(
         }
     }
     if updated {
-        // Persist the learned names and immediately republish the dialog list
-        // so the running TUI refreshes without waiting for the next history
-        // sync (a cold start would otherwise keep showing cached bare JIDs
-        // until a sync happens to re-announce the chats).
-        let st = state.read().await;
+        // Learned names apply to stored messages too: re-resolve any senders
+        // frozen bare when their history synced before usync knew them, then
+        // persist one snapshot covering chats and messages.
+        let mut st = state.write().await;
+        let repaired = st.resolve_stale_senders();
         let chats_snapshot = sorted_chat_snapshot(&st);
         st.save_to(cache_path);
         drop(st);
+        if repaired > 0 {
+            info!("WA usync resolved {repaired} stale sender name(s)");
+        }
         let _ = tx.send(BackendEvent::ChatList(chats_snapshot));
         let _ = tx.send(BackendEvent::Status("names updated".into()));
         info!("WA usync name enrichment finished");
@@ -3063,6 +3211,142 @@ mod tests {
         assert!(!st.chats[0].verified);
         assert_eq!(st.chats[1].contact_name, "Myself");
         assert_eq!(st.chats[2].contact_name, "Alice");
+    }
+
+    #[test]
+    fn resolve_stale_senders_upgrades_bare_dm_via_pushnames() {
+        let chat = ChatId::jid_to_chat_id("15550000001@s.whatsapp.net");
+        let mut msg = build_msg("m1", "hi", &chat, false);
+        msg.sender = "15550000001".into();
+        msg.author_id = Some("15550000001@s.whatsapp.net".into());
+
+        let mut st = WhatsAppState {
+            chats: vec![Chat {
+                id: chat.clone(),
+                contact_name: "Alice".into(),
+                ..Default::default()
+            }],
+            pushnames: [(
+                "15550000001@s.whatsapp.net".to_string(),
+                "Alice".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            history: [(chat.clone(), vec![msg])].into_iter().collect(),
+            ..Default::default()
+        };
+
+        let repaired = st.resolve_stale_senders();
+        assert_eq!(repaired, 1);
+        assert_eq!(st.history[&chat][0].sender, "Alice");
+    }
+
+    #[test]
+    fn resolve_stale_senders_uses_dm_contact_when_no_pushname() {
+        let chat = ChatId::jid_to_chat_id("15550000002@s.whatsapp.net");
+        let mut msg = build_msg("m1", "hi", &chat, false);
+        msg.sender = "15550000002".into();
+        msg.author_id = Some("15550000002@s.whatsapp.net".into());
+
+        // No pushname/lid mappings at all: the usync-learned chat display name
+        // is the safe fallback for a 1:1 chat.
+        let mut st = WhatsAppState {
+            chats: vec![Chat {
+                id: chat.clone(),
+                contact_name: "Beatriz".into(),
+                ..Default::default()
+            }],
+            history: [(chat.clone(), vec![msg])].into_iter().collect(),
+            ..Default::default()
+        };
+
+        let repaired = st.resolve_stale_senders();
+        assert_eq!(repaired, 1);
+        assert_eq!(st.history[&chat][0].sender, "Beatriz");
+    }
+
+    #[test]
+    fn resolve_stale_senders_never_labels_group_rows_with_title() {
+        let group = "15550000001-111222333@g.us";
+        let chat = ChatId::jid_to_chat_id(group);
+
+        // History-synced row: the author is the group's own JID (no
+        // `key.participant` in the blob) — nothing to resolve.
+        let mut hist = build_msg("g-1", "hey", &chat, false);
+        hist.sender = "15550000001-111222333".into();
+        hist.author_id = Some(group.to_string());
+
+        // Live-captured row: a real participant JID, but unknown to the maps.
+        // Must stay bare — never rewritten to the group title.
+        let mut member = build_msg("g-2", "yo", &chat, false);
+        member.sender = "15550000003".into();
+        member.author_id = Some("15550000003@s.whatsapp.net".into());
+
+        let mut st = WhatsAppState {
+            chats: vec![Chat {
+                id: chat.clone(),
+                contact_name: "My Group".into(),
+                ..Default::default()
+            }],
+            history: [(chat.clone(), vec![hist, member])].into_iter().collect(),
+            ..Default::default()
+        };
+
+        let repaired = st.resolve_stale_senders();
+        assert_eq!(repaired, 0);
+        assert_eq!(st.history[&chat][0].sender, "15550000001-111222333");
+        assert_eq!(st.history[&chat][1].sender, "15550000003");
+    }
+
+    #[test]
+    fn resolve_stale_senders_names_known_group_member() {
+        let group = "15550000001-111222333@g.us";
+        let chat = ChatId::jid_to_chat_id(group);
+        let peer = "15550000003@s.whatsapp.net";
+        let mut msg = build_msg("g-1", "hey", &chat, false);
+        msg.sender = "15550000003".into();
+        msg.author_id = Some(peer.to_string());
+
+        let mut st = WhatsAppState {
+            chats: vec![Chat {
+                id: chat.clone(),
+                contact_name: "My Group".into(),
+                ..Default::default()
+            }],
+            pushnames: [(peer.to_string(), "Bob".to_string())]
+                .into_iter()
+                .collect(),
+            history: [(chat.clone(), vec![msg])].into_iter().collect(),
+            ..Default::default()
+        };
+
+        let repaired = st.resolve_stale_senders();
+        assert_eq!(repaired, 1);
+        assert_eq!(st.history[&chat][0].sender, "Bob");
+    }
+
+    #[test]
+    fn resolve_stale_senders_never_downgrades_a_known_name() {
+        let chat = ChatId::jid_to_chat_id("15550000004@s.whatsapp.net");
+        let mut msg = build_msg("m1", "hi", &chat, false);
+        msg.sender = "Beatriz".into();
+        msg.author_id = Some("15550000004@s.whatsapp.net".into());
+
+        // The stored pushname is gone from the maps and there is no chat
+        // contact to fall back on: keep the better stored name.
+        let mut st = WhatsAppState {
+            chats: vec![Chat {
+                id: chat.clone(),
+                contact_name: String::new(),
+                ..Default::default()
+            }],
+            history: [(chat.clone(), vec![msg])].into_iter().collect(),
+            ..Default::default()
+        };
+
+        let repaired = st.resolve_stale_senders();
+        assert_eq!(repaired, 0);
+        assert_eq!(st.history[&chat][0].sender, "Beatriz");
     }
 
     #[test]

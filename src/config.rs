@@ -17,7 +17,7 @@ pub struct Config {
     /// This call saves chat data to the local Telegram DB
     pub sync_update_state_secs: u64,
     /// How often (seconds) the TUI polls for unread-count changes across all chats.
-    pub sidebar_sync_secs: u64,
+    pub chat_list_sync_secs: u64,
 }
 
 impl Default for Config {
@@ -28,7 +28,7 @@ impl Default for Config {
             max_write_lines: 5,
             chat_poll_interval_secs: 10,
             sync_update_state_secs: 120,
-            sidebar_sync_secs: 10,
+            chat_list_sync_secs: 10,
         }
     }
 }

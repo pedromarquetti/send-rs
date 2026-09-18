@@ -9,6 +9,7 @@ use crate::backend::{
     Provider,
 };
 use crate::config::{Config, Keymap};
+use crate::helpers::message_preview;
 use crate::tui::chat::{ChatState, OpenChat};
 use crate::tui::popup::PopupKind;
 use tracing::{debug, error, info, warn};
@@ -67,8 +68,8 @@ pub struct AppState {
     pub local_seq: u64,
     pub chat_load_generation: u64,
     pub history_refresh_in_flight: bool,
-    pub sidebar_sync_in_flight: bool,
-    pub sidebar_sync_pending: usize,
+    pub chatlist_sync_in_flight: bool,
+    pub chatlist_sync_pending: usize,
     pub backend_status: Option<String>,
     pub retry_draft: Option<RetryDraft>,
 }
@@ -130,8 +131,8 @@ impl AppState {
             local_seq: 0,
             chat_load_generation: 0,
             history_refresh_in_flight: false,
-            sidebar_sync_in_flight: false,
-            sidebar_sync_pending: 0,
+            chatlist_sync_in_flight: false,
+            chatlist_sync_pending: 0,
             backend_status: None,
             retry_draft: None,
         };
@@ -250,16 +251,16 @@ impl AppState {
         self.persist_chats();
     }
 
-    /// Persist the current sidebar chat list so it survives a cold restart.
+    /// Persist the current chat list so it survives a cold restart.
     pub(crate) fn persist_chats(&self) {
         if let Err(e) = Config::save_chats(&self.chat_state.chats) {
             error!(error = %e, "Failed to persist chat list");
         }
     }
 
-    /// Update the sidebar entry for `chat_id` after a poll refresh detected new messages.
+    /// Update the chat list entry for `chat_id` after a poll refresh detected new messages.
     /// Updates the last_message preview from the newest message in `history`.
-    pub fn update_sidebar_from_poll(&mut self, chat_id: &ChatId, history: &[Message]) {
+    pub fn update_chat_list_from_poll(&mut self, chat_id: &ChatId, history: &[Message]) {
         if let Some(chat) = self.chat_state.chats.iter_mut().find(|c| c.id == *chat_id)
             && let Some(newest) = history.last()
         {
@@ -473,7 +474,7 @@ impl AppState {
         }
 
         // The presence subscription was sent before history loaded; surface
-        // the peer's status on the sidebar row and, when the load succeeds,
+        // the peer's status on the chat list row and, when the load succeeds,
         // on the freshly opened chat.
         if let Some(status) = status.as_deref()
             && let Some(chat) = self.chat_state.chats.iter_mut().find(|c| c.id == chat.id)
@@ -1117,7 +1118,7 @@ impl AppState {
                     .as_ref()
                     .map(|o| o.chat.id.clone());
 
-                let preview = crate::helpers::message_preview(&message.sender, &message.text);
+                let preview = message_preview(&message.sender, &message.text);
                 let previous_unread_count = self
                     .chat_state
                     .chats
@@ -1158,7 +1159,7 @@ impl AppState {
                     chat_update.unread_count = previous_unread_count.saturating_add(1);
                 }
 
-                // Guard against polluting the sidebar with a brand-new chat whose
+                // Guard against polluting the chat list with a brand-new chat whose
                 // sender name we cannot resolve (sender came through as
                 // "Unknown" -> empty). Such a chat would only render as an
                 // "Unnamed chat" and, when the provider is mid-lifecycle, can
@@ -1188,13 +1189,13 @@ impl AppState {
                 }
 
                 if !chatlist_found {
-                    debug!(chat = ?message.chat, "TUI MessageReceived: inserted sidebar chat from push event");
+                    debug!(chat = ?message.chat, "TUI MessageReceived: inserted chat list entry from push event");
                 }
             }
 
             BackendEvent::MessageUpdated(message) => {
                 self.chat_state.update_message(message.clone());
-                self.refresh_sidebar_preview(&message.chat);
+                self.refresh_chat_list_preview(&message.chat);
             }
 
             BackendEvent::MessageDeleted { chat, message_ids } => {
@@ -1204,7 +1205,7 @@ impl AppState {
                 for message_id in message_ids {
                     self.chat_state.remove_message(&message_id);
                 }
-                self.refresh_sidebar_preview(&chat);
+                self.refresh_chat_list_preview(&chat);
                 if let Some(open) = self.chat_state.open_chat.as_ref()
                     && open.chat.id == chat
                 {
@@ -1276,14 +1277,14 @@ impl AppState {
 }
 
 impl AppState {
-    fn refresh_sidebar_preview(&mut self, chat_id: &ChatId) {
+    fn refresh_chat_list_preview(&mut self, chat_id: &ChatId) {
         let latest = self
             .chat_state
             .open_chat
             .as_ref()
             .filter(|open| open.chat.id == *chat_id)
             .and_then(|open| open.history.last())
-            .map(|message| crate::helpers::message_preview(&message.sender, &message.text));
+            .map(|message| message_preview(&message.sender, &message.text));
 
         if let Some((_, chat)) = self.chat_state.find_mut(chat_id) {
             chat.last_message = latest;
@@ -1680,7 +1681,7 @@ mod tests {
             .collect();
         assert!(
             original_ids.len() > 1,
-            "test precondition: a populated sidebar"
+            "test precondition: a populated chat list"
         );
 
         // Two WhatsApp rows: one the backend still reports, one it merged away
@@ -1945,7 +1946,7 @@ mod tests {
             .chats
             .iter()
             .find(|chat| chat.id == ChatId::Telegram(103))
-            .expect("incoming chat remains in sidebar");
+            .expect("incoming chat remains in chat list");
         assert!(chat.unread);
         assert_eq!(chat.unread_count, 1);
     }
@@ -1970,13 +1971,13 @@ mod tests {
             .chats
             .iter()
             .find(|chat| chat.id == ChatId::Telegram(101))
-            .expect("open chat remains in sidebar");
+            .expect("open chat remains in chat list");
         assert!(!chat.unread);
         assert_eq!(chat.unread_count, 0);
     }
 
     #[tokio::test]
-    async fn status_update_refreshes_sidebar_and_open_chat() {
+    async fn status_update_refreshes_chat_list_and_open_chat() {
         let mut state = app_state().await;
         state.chat_state.chat_list_state.select(Some(0));
         state.select_chat(0).await;
@@ -2005,7 +2006,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closed_chat_status_update_preserves_existing_sidebar_metadata() {
+    async fn closed_chat_status_update_preserves_existing_chat_list_metadata() {
         let mut state = app_state().await;
         let original_name = state.chat_state.chats[1].contact_name.clone();
         let original_preview = state.chat_state.chats[1].last_message.clone();
@@ -2026,7 +2027,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incoming_message_to_unknown_chat_inserts_sidebar_entry() {
+    async fn incoming_message_to_unknown_chat_inserts_chat_list_entry() {
         let mut state = app_state().await;
         let before = state.chat_state.chats.len();
 
@@ -2060,7 +2061,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn message_never_renames_existing_sidebar_chat_to_sender() {
+    async fn message_never_renames_existing_chat_list_chat_to_sender() {
         let mut state = app_state().await;
 
         state.chat_state.upsert_chat(Chat {
@@ -2094,7 +2095,7 @@ mod tests {
             .chats
             .iter()
             .find(|c| c.id == ChatId::Telegram(777))
-            .expect("existing chat stays in sidebar");
+            .expect("existing chat stays in chat list");
         assert_eq!(
             chat.contact_name, "Car Budget",
             "a message sender must never rename the row title"
@@ -2133,12 +2134,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_sender_message_does_not_insert_nameless_sidebar_chat() {
+    async fn unknown_sender_message_does_not_insert_nameless_chat_list_chat() {
         let mut state = app_state().await;
         let before = state.chat_state.chats.len();
 
         // A brand-new chat with an unresolved ("Unknown") sender must not
-        // appear as an "Unnamed chat" entry in the sidebar.
+        // appear as an "Unnamed chat" entry in the chat list.
         state.handle_backend_event(
             Provider::Telegram,
             BackendEvent::MessageReceived(Message {
@@ -2161,7 +2162,7 @@ mod tests {
         assert_eq!(
             state.chat_state.chats.len(),
             before,
-            "an unresolved sender must not create a nameless sidebar chat"
+            "an unresolved sender must not create a nameless chat list chat"
         );
         assert!(
             state
