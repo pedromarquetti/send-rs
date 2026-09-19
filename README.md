@@ -28,21 +28,21 @@ the future?) in one TUI app!
 - [x] _**One-Executable-app**_ - no co dependencies, one binary to rule them
       all.
 - [x] Configurable
-- [ ] Draft / Myself conversation
+- [x] Draft / Myself conversation - using wp/tg integrated self chat
 - [ ] Help menu Popup to show keymaps
-- [ ] Descriptive error handling
+- [x] Descriptive error handling
 - [ ] WhatsApp integration
 - [ ] Message actions (reply, edit, delete) for whatsapp
-- [ ] Telegram integration
-- [ ] Message actions (reply, edit, delete) for telegram
+- [x] Telegram integration
+- [x] Message actions (reply, edit, delete) for telegram
 - [ ] Support for notifications
 - [x] **Telegram** - Support for endless chat scroll.
-- [ ] **WhatsApp** - Support for endless chat scroll.
+- [x] **WhatsApp** - Support for endless chat scroll.
 - [ ] Image rendering
 - [ ] Audio playback
-- [ ] Ordered chat list - All chats, ordered by pinned/most recent.
+- [x] Ordered chat list - All chats, ordered by pinned/most recent.
 - [ ] Dedicated chatlist for each provider
-- [ ] Chat List/Message search.
+- [x] Chat List/Message search.
 - [ ] Chat rename
 
 ## Configuration

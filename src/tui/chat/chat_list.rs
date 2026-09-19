@@ -44,7 +44,7 @@ impl StatefulWidget for ChatList<'_> {
 
         let block = Block::bordered()
             .title(" Chats ")
-            .title_bottom(search_title(self.search))
+            .title_bottom(self.search.title_line())
             .border_style(border);
 
         if self.chats.is_empty() {
@@ -128,43 +128,5 @@ impl StatefulWidget for ChatList<'_> {
             .highlight_symbol("> ");
 
         StatefulWidget::render(list, area, buf, state);
-    }
-}
-
-/// Bottom-title line for the chat list block: the search input when a search
-/// is active, otherwise empty. The cursor is drawn as a highlighted cell only
-/// while the user is actually typing.
-fn search_title(search: &SearchState) -> Line<'static> {
-    if !search.is_active() {
-        return Line::default();
-    }
-
-    let label = Span::styled(" Search: ", Style::default().fg(Color::DarkGray));
-    let text = search.query_text().to_string();
-    let body = Style::default().fg(Color::Gray);
-
-    if search.is_inserting() {
-        let mut chars: Vec<char> = text.chars().collect();
-        let col = search.cursor_col().min(chars.len());
-        let before: String = chars[..col].iter().collect();
-        let cursor = if col < chars.len() {
-            chars.remove(col)
-        } else {
-            ' '
-        };
-
-        Line::from(vec![
-            label,
-            Span::styled(before, body),
-            Span::styled(
-                cursor.to_string(),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ])
-    } else {
-        Line::from(vec![label, Span::styled(text, body)])
     }
 }

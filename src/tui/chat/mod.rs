@@ -30,6 +30,11 @@ pub struct ChatState {
     /// Filtering happens on `chats` — the full source list — while the visible
     /// view is selected through `SearchState::map_to_source`.
     pub search: SearchState,
+    /// Reusable search state for messages in the open chat (matches by message
+    /// text). `visible_indices` hold history indices of the matching messages.
+    pub message_search: SearchState,
+    /// History index selected when message search began, restored on cancel.
+    message_search_anchor: Option<usize>,
     /// responsible for keeping track of the actual visible page page on a chat
     pub visible_page: usize,
     /// The chat whose history is currently loaded, if any.
@@ -130,11 +135,8 @@ impl ChatState {
         // Keep the selected chat when it still matches, else jump to the first
         // match. The resolved source index is remembered as the anchor so a
         // cancelled search lands back on a useful chat.
-        let anchor_pos = anchor.and_then(|id| {
-            indices
-                .iter()
-                .position(|&idx| self.chats[idx].id == *id)
-        });
+        let anchor_pos =
+            anchor.and_then(|id| indices.iter().position(|&idx| self.chats[idx].id == *id));
         let selected_source = anchor_pos
             .map(|pos| indices[pos])
             .or_else(|| indices.first().copied());
@@ -146,6 +148,121 @@ impl ChatState {
 
         self.search.set_visible(indices);
         self.chat_list_state.select(selection);
+    }
+
+    /// Enter message search (insert mode) over the open chat's history and
+    /// live-filter on the query. No-op when no chat is open.
+    pub fn begin_message_search(&mut self) {
+        if self.open_chat.is_none() {
+            return;
+        }
+
+        self.message_search_anchor = self.message_list_state.selected();
+        self.message_search.begin();
+        self.refresh_message_search();
+    }
+
+    /// Exit insert mode, keeping the current filter (and match) applied.
+    pub fn commit_message_search(&mut self) {
+        self.message_search.commit();
+        self.refresh_message_search();
+    }
+
+    /// Cancel message search. While the user was still typing (nothing
+    /// accepted), the selection returns to the message that was selected when
+    /// the search began; once committed, the selected match is kept.
+    pub fn clear_message_search(&mut self) {
+        let was_inserting = self.message_search.is_inserting();
+        self.message_search.clear();
+
+        if was_inserting {
+            let anchor = self.message_search_anchor;
+            self.message_list_state.select(anchor.or_else(|| {
+                self.open_chat
+                    .as_ref()
+                    .map(|o| o.history.len().saturating_sub(1))
+            }));
+        }
+        self.message_search_anchor = None;
+    }
+
+    /// Feed a key event to the message search input and re-filter live.
+    pub fn message_search_input(&mut self, key: KeyEvent) {
+        self.message_search.input(key);
+        self.refresh_message_search();
+    }
+
+    /// Recompute the current message-search matches, keeping the currently
+    /// selected message when it still matches (otherwise the first match wins).
+    /// Runs on user input (begin/typing/commit). Background history mutations
+    /// use [`ChatState::refresh_message_search_if_active`] so the user's
+    /// position is never yanked by a poll or an incoming message.
+    pub fn refresh_message_search(&mut self) {
+        self.apply_message_search();
+    }
+
+    /// Background path: the open chat's history changed while a message search
+    /// is active (incoming message, poll result, prepend, edit). Recompute the
+    /// match indices so highlights stay correct, but never move the user's
+    /// selection — only live typing auto-jumps.
+    fn refresh_message_search_if_active(&mut self) {
+        if !self.message_search.is_active() {
+            return;
+        }
+
+        let needle = self.message_search.query_text().trim().to_lowercase();
+
+        self.message_search
+            .set_visible(self.message_search_indices(&needle));
+    }
+
+    fn apply_message_search(&mut self) {
+        let needle = self.message_search.query_text().trim().to_lowercase();
+        let history_len = self
+            .open_chat
+            .as_ref()
+            .map(|o| o.history.len())
+            .unwrap_or(0);
+
+        if needle.is_empty() {
+            // Unfiltered view: restore the anchor (or the last message).
+            self.message_search.set_visible(Vec::new());
+            self.message_list_state
+                .select(self.message_search_anchor.or(history_len.checked_sub(1)));
+            return;
+        }
+
+        let indices = self.message_search_indices(&needle);
+
+        // Keep the selected message when it still matches, else the first match.
+        let current = self.message_list_state.selected();
+        let selected = if current.is_some_and(|idx| indices.contains(&idx)) {
+            current
+        } else {
+            indices.first().copied()
+        };
+
+        self.message_search.set_visible(indices);
+        self.message_list_state.select(selected);
+    }
+
+    /// Source indices of the messages matching `needle` in the open chat's
+    /// history (an empty needle yields an empty result set).
+    fn message_search_indices(&self, needle: &str) -> Vec<usize> {
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        self.open_chat
+            .as_ref()
+            .map(|open| {
+                open.history
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, message)| message.text.to_lowercase().contains(needle))
+                    .map(|(idx, _)| idx)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Resolve a visible chat-list index to its source index, dropping any active
@@ -220,6 +337,7 @@ impl ChatState {
                 return true;
             }
             open.history.push(message);
+            self.refresh_message_search_if_active();
             true
         } else {
             false
@@ -238,6 +356,7 @@ impl ChatState {
             for msg in &mut open.history {
                 if msg.message_id == *old_id {
                     *msg = new;
+                    self.refresh_message_search_if_active();
                     return true;
                 }
             }
@@ -255,6 +374,9 @@ impl ChatState {
             if !msg.msg_actions.contains(&MessageAction::Retry) {
                 msg.msg_actions.push(MessageAction::Retry);
             }
+
+            self.refresh_message_search_if_active();
+
             true
         } else {
             false
@@ -266,7 +388,12 @@ impl ChatState {
         if let Some(open) = &mut self.open_chat {
             let before = open.history.len();
             open.history.retain(|m| m.message_id != *id);
-            open.history.len() != before
+            let removed = open.history.len() != before;
+
+            if removed {
+                self.refresh_message_search_if_active();
+            }
+            removed
         } else {
             false
         }
@@ -281,6 +408,7 @@ impl ChatState {
                 .find(|message| message.message_id == *id)
         {
             message.text = text.to_string();
+            self.refresh_message_search_if_active();
             true
         } else {
             false
@@ -295,6 +423,9 @@ impl ChatState {
                 .find(|existing| existing.message_id == message.message_id)
         {
             *existing = message;
+
+            self.refresh_message_search_if_active();
+
             true
         } else {
             false
@@ -410,13 +541,8 @@ impl ChatState {
                 self.sort_pinned_then_recent();
             }
 
-            if let Some(selected_id) = selected_id {
-                let selected = self.chats.iter().position(|item| item.id == selected_id);
-                self.chat_list_state.select(selected);
-            }
-
             self.deduplicate_chats();
-            self.refresh_search();
+            self.refresh_search_with_id(selected_id);
 
             return true;
         }
@@ -425,13 +551,8 @@ impl ChatState {
         self.chats.push(chat);
         self.sort_pinned_then_recent();
 
-        if let Some(selected_id) = selected_id {
-            let selected = self.chats.iter().position(|item| item.id == selected_id);
-            self.chat_list_state.select(selected);
-        }
-
         self.deduplicate_chats();
-        self.refresh_search();
+        self.refresh_search_with_id(selected_id);
 
         true
     }
@@ -478,12 +599,7 @@ impl ChatState {
         self.sort_pinned_then_recent();
         self.deduplicate_chats();
 
-        if let Some(selected_id) = selected_id {
-            self.chat_list_state
-                .select(self.chats.iter().position(|chat| chat.id == selected_id));
-        }
-
-        self.refresh_search();
+        self.refresh_search_with_id(selected_id);
 
         before != self.chats
     }
@@ -491,9 +607,11 @@ impl ChatState {
     /// Replace the open chat's history with freshly fetched data, preserving the
     /// current scroll position.
     pub fn refresh_chat_history(&mut self, chat_id: &ChatId, history: Vec<Message>) {
+        let mut handled = false;
         if let Some(chat) = &mut self.open_chat
             && chat.chat.id == *chat_id
         {
+            handled = true;
             let old_len = chat.history.len();
             let old_selected = self.message_list_state.selected();
             let mut merged = chat.history.clone();
@@ -538,15 +656,21 @@ impl ChatState {
                 self.message_list_state.select(Some(new_len - 1));
             }
         }
+
+        if handled {
+            self.refresh_message_search_if_active();
+        }
     }
 
     /// Prepend older messages to the open chat history without dropping the
     /// current selection or duplicate entries. This is the foundation for lazy
     /// history loading in phase 11.
     pub fn prepend_history(&mut self, chat_id: &ChatId, older: Vec<Message>) {
+        let mut handled = false;
         if let Some(open) = &mut self.open_chat
             && open.chat.id == *chat_id
         {
+            handled = true;
             let current_len = open.history.len();
             let mut merged = Vec::new();
 
@@ -578,6 +702,10 @@ impl ChatState {
                 self.message_list_state
                     .select(Some(open.history.len().saturating_sub(1)));
             }
+        }
+
+        if handled {
+            self.refresh_message_search_if_active();
         }
     }
 
@@ -651,6 +779,15 @@ mod tests {
         }
     }
 
+    fn chat_with_ts(id: ChatId, name: &str, last_message_ts: i64) -> Chat {
+        Chat {
+            id,
+            contact_name: name.into(),
+            last_message_ts: Some(last_message_ts),
+            ..Default::default()
+        }
+    }
+
     fn message(chat: ChatId) -> Message {
         message_with_id(chat, "m", 0)
     }
@@ -671,6 +808,13 @@ mod tests {
             pending: false,
             failed: false,
         }
+    }
+
+    fn message_with_text(chat: ChatId, text: &str) -> Message {
+        let mut m = message(chat);
+        m.message_id = MessageId::from(text);
+        m.text = text.into();
+        m
     }
 
     /// The chats the state would currently render (filtered or all), as the
@@ -1312,6 +1456,78 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_reorder_keeps_the_selected_chat_selected_in_a_filtered_view() {
+        let mut state = ChatState {
+            chats: vec![
+                chat_with_ts(ChatId::Telegram(1), "alice", 5),
+                chat_with_ts(ChatId::Telegram(2), "bob", 4),
+                chat_with_ts(ChatId::Telegram(3), "carol", 3),
+                chat_with_ts(ChatId::Telegram(4), "dave", 2),
+            ],
+            ..Default::default()
+        };
+        state.sort_pinned_then_recent();
+
+        state.begin_search();
+        state.search_input(KeyEvent::from(KeyCode::Char('a')));
+        state.commit_search();
+        assert_eq!(state.search.indices(), &[0, 2, 3]);
+
+        state.chat_list_state.select(Some(1));
+        assert_eq!(state.selected_chat().unwrap().contact_name, "carol");
+
+        // A fresh snapshot bumps "dave" to the top, reordering the source list
+        // behind the committed filter.
+        state.reconcile_provider_chats(
+            Provider::Telegram,
+            vec![
+                chat_with_ts(ChatId::Telegram(4), "dave", 100),
+                chat_with_ts(ChatId::Telegram(1), "alice", 5),
+                chat_with_ts(ChatId::Telegram(2), "bob", 4),
+                chat_with_ts(ChatId::Telegram(3), "carol", 3),
+            ],
+        );
+
+        assert_eq!(
+            state.selected_chat().map(|c| c.id.clone()),
+            Some(ChatId::Telegram(3)),
+            "a reorder must re-anchor by chat id, not by the stale index"
+        );
+    }
+
+    #[test]
+    fn upsert_reorder_keeps_the_selected_chat_selected_in_a_filtered_view() {
+        let mut state = ChatState {
+            chats: vec![
+                chat_with_ts(ChatId::Telegram(1), "alice", 5),
+                chat_with_ts(ChatId::Telegram(2), "bob", 4),
+                chat_with_ts(ChatId::Telegram(3), "carol", 3),
+                chat_with_ts(ChatId::Telegram(4), "dave", 2),
+            ],
+            ..Default::default()
+        };
+        state.sort_pinned_then_recent();
+
+        state.begin_search();
+        state.search_input(KeyEvent::from(KeyCode::Char('a')));
+        state.commit_search();
+        assert_eq!(state.search.indices(), &[0, 2, 3]);
+
+        state.chat_list_state.select(Some(1));
+        assert_eq!(state.selected_chat().unwrap().contact_name, "carol");
+
+        // "dave" gets a newer message and moves to the top of the list.
+        state.upsert_chat(chat_with_ts(ChatId::Telegram(4), "dave", 100));
+
+        assert_eq!(
+            state.selected_chat().map(|c| c.id.clone()),
+            Some(ChatId::Telegram(3)),
+            "an upsert-triggered reorder must not switch the selection to the \
+             first match"
+        );
+    }
+
+    #[test]
     fn unchanged_reconcile_is_a_noop() {
         let mut state = ChatState::default();
         let snapshot = vec![chat(ChatId::Telegram(30), "tg")];
@@ -1512,5 +1728,317 @@ mod tests {
             "a non-matching upsert must not change the filtered view"
         );
         assert!(state.search.is_filtered());
+    }
+
+    #[test]
+    fn message_search_matches_case_insensitively_and_selects_first_match() {
+        let mut state = ChatState {
+            open_chat: Some(OpenChat {
+                chat: chat(ChatId::Telegram(1), "A"),
+                history: vec![
+                    message_with_text(ChatId::Telegram(1), "hello"),
+                    message_with_text(ChatId::Telegram(1), "hi"),
+                    message_with_text(ChatId::Telegram(1), "HELLO"),
+                ],
+                has_more_history: true,
+            }),
+            ..Default::default()
+        };
+        state.message_list_state.select(Some(1));
+
+        state.begin_message_search();
+        assert!(state.message_search.is_inserting());
+
+        state.message_search_input(KeyEvent::from(KeyCode::Char('h')));
+        state.message_search_input(KeyEvent::from(KeyCode::Char('e')));
+
+        // "he" matches index 0 ("Hello") and 2 ("HELLO"); the currently selected
+        // message (1) no longer matches, so the first match wins.
+        assert_eq!(state.message_search.indices(), &[0, 2]);
+        assert_eq!(state.message_list_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn message_search_keeps_current_message_when_still_matching() {
+        let mut state = ChatState {
+            open_chat: Some(OpenChat {
+                chat: chat(ChatId::Telegram(1), "A"),
+                history: vec![
+                    message_with_text(ChatId::Telegram(1), "foo"),
+                    message_with_text(ChatId::Telegram(1), "bar"),
+                    message_with_text(ChatId::Telegram(1), "foobar"),
+                ],
+                has_more_history: true,
+            }),
+            ..Default::default()
+        };
+        state.message_list_state.select(Some(2));
+
+        state.begin_message_search();
+        state.message_search_input(KeyEvent::from(KeyCode::Char('f')));
+
+        assert_eq!(state.message_search.indices(), &[0, 2]);
+        assert_eq!(
+            state.message_list_state.selected(),
+            Some(2),
+            "the selected 'foobar' still matches, so selection is kept"
+        );
+
+        state.message_search_input(KeyEvent::from(KeyCode::Char('z')));
+        assert!(
+            state.message_search.indices().is_empty()
+                && state.message_list_state.selected().is_none(),
+            "no message contains 'fz', selection clears"
+        );
+    }
+
+    #[test]
+    fn message_search_no_match_then_backspace_restores_anchor() {
+        let mut state = ChatState {
+            open_chat: Some(OpenChat {
+                chat: chat(ChatId::Telegram(1), "A"),
+                history: vec![
+                    message_with_text(ChatId::Telegram(1), "hello"),
+                    message_with_text(ChatId::Telegram(1), "world"),
+                ],
+                has_more_history: true,
+            }),
+            ..Default::default()
+        };
+        state.message_list_state.select(Some(0));
+
+        state.begin_message_search();
+        state.message_search_input(KeyEvent::from(KeyCode::Char('q')));
+        assert!(state.message_list_state.selected().is_none());
+
+        state.message_search_input(KeyEvent::from(KeyCode::Backspace));
+        assert!(!state.message_search.is_filtered());
+        assert_eq!(
+            state.message_list_state.selected(),
+            Some(0),
+            "an empty query restores the message selected before searching"
+        );
+    }
+
+    #[test]
+    fn commit_message_search_keeps_filter_and_selection() {
+        let mut state = ChatState {
+            open_chat: Some(OpenChat {
+                chat: chat(ChatId::Telegram(1), "A"),
+                history: vec![
+                    message_with_text(ChatId::Telegram(1), "hello"),
+                    message_with_text(ChatId::Telegram(1), "hi"),
+                    message_with_text(ChatId::Telegram(1), "yo"),
+                ],
+                has_more_history: true,
+            }),
+            ..Default::default()
+        };
+        state.message_list_state.select(Some(2));
+
+        state.begin_message_search();
+        state.message_search_input(KeyEvent::from(KeyCode::Char('h')));
+        state.commit_message_search();
+
+        assert!(!state.message_search.is_inserting());
+        assert!(state.message_search.is_filtered());
+        assert_eq!(state.message_search.indices(), &[0, 1]);
+        assert_eq!(state.message_list_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn clear_message_search_restores_anchor_while_typing() {
+        let mut state = ChatState {
+            open_chat: Some(OpenChat {
+                chat: chat(ChatId::Telegram(1), "A"),
+                history: vec![
+                    message_with_text(ChatId::Telegram(1), "hello"),
+                    message_with_text(ChatId::Telegram(1), "swell"),
+                ],
+                has_more_history: true,
+            }),
+            ..Default::default()
+        };
+        state.message_list_state.select(Some(1));
+
+        state.begin_message_search();
+        state.message_search_input(KeyEvent::from(KeyCode::Char('e')));
+
+        state.clear_message_search();
+        assert!(!state.message_search.is_active());
+        assert_eq!(
+            state.message_list_state.selected(),
+            Some(1),
+            "cancelling before accepting returns to the pre-search message"
+        );
+    }
+
+    #[test]
+    fn clear_after_commit_keeps_the_selected_match() {
+        let mut state = ChatState {
+            open_chat: Some(OpenChat {
+                chat: chat(ChatId::Telegram(1), "A"),
+                history: vec![
+                    message_with_text(ChatId::Telegram(1), "hello"),
+                    message_with_text(ChatId::Telegram(1), "hello again"),
+                ],
+                has_more_history: true,
+            }),
+            ..Default::default()
+        };
+        state.message_list_state.select(Some(0));
+
+        state.begin_message_search();
+        state.message_search_input(KeyEvent::from(KeyCode::Char('h')));
+        state.commit_message_search();
+
+        // The user browses on from the accepted match, then cancels the search.
+        state.message_list_state.select(Some(1));
+        state.clear_message_search();
+
+        assert!(!state.message_search.is_active());
+        assert_eq!(
+            state.message_list_state.selected(),
+            Some(1),
+            "cancelling an accepted search must not jump back to the anchor"
+        );
+    }
+
+    #[test]
+    fn message_search_is_a_noop_without_an_open_chat() {
+        let mut state = ChatState::default();
+        state.begin_message_search();
+        assert!(!state.message_search.is_active());
+        assert!(!state.message_search.is_inserting());
+    }
+
+    #[test]
+    fn incoming_message_refreshes_an_active_message_search() {
+        let mut state = ChatState {
+            open_chat: Some(OpenChat {
+                chat: chat(ChatId::Telegram(1), "A"),
+                history: vec![message_with_text(ChatId::Telegram(1), "hello")],
+                has_more_history: true,
+            }),
+            ..Default::default()
+        };
+
+        state.begin_message_search();
+        state.message_search_input(KeyEvent::from(KeyCode::Char('x')));
+        assert!(state.message_search.indices().is_empty());
+
+        state.push_incoming(message_with_text(ChatId::Telegram(1), "xylophone"));
+
+        assert_eq!(state.message_search.indices(), &[1]);
+        assert_eq!(
+            state.message_list_state.selected(),
+            None,
+            "a background arrival refreshes the matches but must not yank the \
+             selection; only live typing auto-jumps"
+        );
+    }
+
+    #[test]
+    fn incoming_message_does_not_yank_a_committed_search_selection() {
+        let mut state = ChatState {
+            open_chat: Some(OpenChat {
+                chat: chat(ChatId::Telegram(1), "A"),
+                history: vec![
+                    message_with_text(ChatId::Telegram(1), "hello"),
+                    message_with_text(ChatId::Telegram(1), "hi"),
+                    message_with_text(ChatId::Telegram(1), "yo"),
+                ],
+                has_more_history: true,
+            }),
+            ..Default::default()
+        };
+
+        state.begin_message_search();
+        state.message_search_input(KeyEvent::from(KeyCode::Char('h')));
+        state.commit_message_search();
+        assert_eq!(state.message_search.indices(), &[0, 1]);
+        assert_eq!(state.message_list_state.selected(), Some(0));
+
+        // The user browses on from the accepted match to a non-match.
+        state.message_list_state.select(Some(2));
+
+        state.push_incoming(message_with_text(ChatId::Telegram(1), "harp"));
+
+        assert_eq!(state.message_search.indices(), &[0, 1, 3]);
+        assert_eq!(
+            state.message_list_state.selected(),
+            Some(2),
+            "new matching messages are highlighted but never steal the selection"
+        );
+    }
+
+    #[test]
+    fn periodic_history_refresh_does_not_yank_a_committed_search_selection() {
+        let mut state = ChatState {
+            open_chat: Some(OpenChat {
+                chat: chat(ChatId::Telegram(1), "A"),
+                history: vec![
+                    message_with_text(ChatId::Telegram(1), "hello"),
+                    message_with_text(ChatId::Telegram(1), "hi"),
+                    message_with_text(ChatId::Telegram(1), "yo"),
+                    message_with_text(ChatId::Telegram(1), "sup"),
+                ],
+                has_more_history: true,
+            }),
+            ..Default::default()
+        };
+
+        state.begin_message_search();
+        state.message_search_input(KeyEvent::from(KeyCode::Char('h')));
+        state.commit_message_search();
+        assert_eq!(state.message_list_state.selected(), Some(0));
+
+        // The user browses on from the accepted match to a non-match.
+        state.message_list_state.select(Some(2));
+
+        state.refresh_chat_history(
+            &ChatId::Telegram(1),
+            vec![message_with_text(ChatId::Telegram(1), "hiya")],
+        );
+
+        assert_eq!(state.message_search.indices(), &[0, 1, 4]);
+        assert_eq!(
+            state.message_list_state.selected(),
+            Some(2),
+            "the periodic poll recomputes the matches without moving the selection"
+        );
+    }
+
+    #[test]
+    fn prepend_history_keeps_message_search_consistent() {
+        let mut state = ChatState {
+            open_chat: Some(OpenChat {
+                chat: chat(ChatId::Telegram(1), "A"),
+                history: vec![
+                    message_with_text(ChatId::Telegram(1), "hello"),
+                    message_with_text(ChatId::Telegram(1), "world"),
+                ],
+                has_more_history: true,
+            }),
+            ..Default::default()
+        };
+
+        state.begin_message_search();
+        state.message_search_input(KeyEvent::from(KeyCode::Char('h')));
+        assert_eq!(state.message_search.indices(), &[0]);
+        assert_eq!(state.message_list_state.selected(), Some(0));
+
+        let older = vec![
+            message_with_text(ChatId::Telegram(1), "aaa"),
+            message_with_text(ChatId::Telegram(1), "bbb"),
+        ];
+        state.prepend_history(&ChatId::Telegram(1), older);
+
+        assert_eq!(
+            state.message_search.indices(),
+            &[2],
+            "after the prepend, 'hello' (the only 'h' match) sits at index 2"
+        );
+        assert_eq!(state.message_list_state.selected(), Some(2));
     }
 }

@@ -14,14 +14,26 @@ pub struct ChatWidget<'a> {
     focus: Focus,
     write: &'a mut TextArea<'static>,
     max_write_lines: usize,
+    /// Precomputed bottom-title search bar (empty when no search is active).
+    search_bar: Line<'static>,
+    /// Active message-search query text used to highlight matches.
+    message_needle: Option<String>,
 }
 
 impl<'a> ChatWidget<'a> {
-    pub fn new(focus: Focus, write: &'a mut TextArea<'static>, max_write_lines: usize) -> Self {
+    pub fn new(
+        focus: Focus,
+        write: &'a mut TextArea<'static>,
+        max_write_lines: usize,
+        search_bar: Line<'static>,
+        message_needle: Option<String>,
+    ) -> Self {
         Self {
             focus,
             write,
             max_write_lines: max_write_lines.max(1),
+            search_bar,
+            message_needle,
         }
     }
 }
@@ -76,7 +88,10 @@ impl StatefulWidget for ChatWidget<'_> {
             })
             .unwrap_or_else(|| " No chat selected ".into());
 
-        let block = Block::bordered().title(title).border_style(border);
+        let block = Block::bordered()
+            .title(title)
+            .title_bottom(self.search_bar.clone())
+            .border_style(border);
 
         let content_width = area.width.saturating_sub(2);
         let write_height = write_box_height(
@@ -116,11 +131,13 @@ impl StatefulWidget for ChatWidget<'_> {
 
             let max_lines = Some(5);
 
+            let needle = self.message_needle.as_deref();
+
             // Render each message once; the ListItem line count IS the item
             // height, so the scrollbar and the list always agree.
             let rendered: Vec<Vec<Line<'static>>> = history
                 .iter()
-                .map(|msg| message_lines(msg, content.width, max_lines))
+                .map(|msg| message_lines(msg, content.width, max_lines, needle))
                 .collect();
 
             let item_heights: Vec<usize> = rendered.iter().map(Vec::len).collect();
@@ -236,7 +253,12 @@ impl StatefulWidget for ChatWidget<'_> {
 /// If `max_lines` is set, output is capped and a "Press Enter for full message…" hint is added.
 /// A reply indicator ("X replied") is rendered as a line above the message, and outgoing
 /// messages that are still pending (or failed) are shown grayed out.
-fn message_lines(message: &Message, width: u16, max_lines: Option<usize>) -> Vec<Line<'static>> {
+fn message_lines(
+    message: &Message,
+    width: u16,
+    max_lines: Option<usize>,
+    needle: Option<&str>,
+) -> Vec<Line<'static>> {
     let sender = if message.from_me {
         "You".to_string()
     } else {
@@ -305,13 +327,14 @@ fn message_lines(message: &Message, width: u16, max_lines: Option<usize>) -> Vec
 
             any_truncated = first_chunks.iter().any(|c| c.ends_with('…'));
             if let Some((first_chunk, rest)) = first_chunks.split_first() {
-                result.push(Line::from(vec![
+                let mut spans = vec![
                     Span::styled(head.clone(), header_style),
                     Span::raw("  "),
-                    Span::styled(first_chunk.clone(), body_style),
-                ]));
+                ];
+                spans.extend(body_spans(first_chunk, needle, body_style));
+                result.push(Line::from(spans));
                 for chunk in rest {
-                    result.push(Line::from(Span::styled(chunk.clone(), body_style)));
+                    result.push(Line::from(body_spans(chunk, needle, body_style)));
                 }
             }
         }
@@ -328,7 +351,7 @@ fn message_lines(message: &Message, width: u16, max_lines: Option<usize>) -> Vec
         let chunks = wrap_text(line, available);
         any_truncated |= chunks.iter().any(|c| c.ends_with('…'));
         for chunk in chunks {
-            result.push(Line::from(Span::styled(chunk, body_style)));
+            result.push(Line::from(body_spans(&chunk, needle, body_style)));
         }
     }
 
@@ -363,6 +386,53 @@ fn message_lines(message: &Message, width: u16, max_lines: Option<usize>) -> Vec
     // } else {
     //     result
     // }
+}
+
+/// Split `text` into styled spans, flagging every case-insensitive occurrence
+/// of `needle` with a highlight. Without a needle the whole text keeps `style`.
+fn body_spans(text: &str, needle: Option<&str>, style: Style) -> Vec<Span<'static>> {
+    let needle = needle.map(str::to_lowercase);
+    let Some(needle) = needle.filter(|n| !n.is_empty()) else {
+        return vec![Span::styled(text.to_string(), style)];
+    };
+
+    let chars: Vec<char> = text.chars().collect();
+    let needle_chars: Vec<char> = needle.chars().collect();
+    let len = needle_chars.len();
+
+    let mut segments: Vec<(String, bool)> = Vec::new();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let is_match = i + len <= chars.len()
+            && chars[i..i + len]
+                .iter()
+                .collect::<String>()
+                .to_lowercase()
+                == needle;
+
+        if is_match {
+            let matched: String = chars[i..i + len].iter().collect();
+            segments.push((matched, true));
+            i += len;
+        } else {
+            match segments.last_mut() {
+                Some((seg, false)) => seg.push(chars[i]),
+                _ => segments.push((chars[i].to_string(), false)),
+            }
+            i += 1;
+        }
+    }
+
+    let highlight = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+
+    segments
+        .into_iter()
+        .map(|(seg, matched)| Span::styled(seg, if matched { highlight } else { style }))
+        .collect()
 }
 
 /// Number of visual rows the Write box needs for the given text at `width` columns, counting
@@ -419,7 +489,7 @@ mod tests {
 
     #[test]
     fn message_lines_splits_on_newlines() {
-        let lines = message_lines(&message("first\nsecond\nthird"), 80, None);
+        let lines = message_lines(&message("first\nsecond\nthird"), 80, None, None);
         assert_eq!(lines.len(), 3);
         assert!(lines[0].to_string().contains("Alice"));
         assert!(lines[0].to_string().contains("first"));
@@ -429,7 +499,7 @@ mod tests {
 
     #[test]
     fn message_lines_empty_text_keeps_header() {
-        let lines = message_lines(&message(""), 80, None);
+        let lines = message_lines(&message(""), 80, None, None);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].to_string().contains("Alice"));
     }
@@ -437,7 +507,7 @@ mod tests {
     #[test]
     fn message_lines_word_wraps_long_text() {
         let msg = message("hello world this is a long line");
-        let lines = message_lines(&msg, 20, None);
+        let lines = message_lines(&msg, 20, None, None);
         // Header "Alice 01-01 00:00" = 17 chars, text_avail = 20-2-17-2 = -1 → fallback
         // Should produce multiple lines
         assert!(lines.len() > 1);
@@ -446,7 +516,7 @@ mod tests {
     #[test]
     fn message_lines_adds_hint_when_truncated() {
         let msg = message("abcdefghijklmnopqrstuvwxyz0123456789");
-        let lines = message_lines(&msg, 10, None);
+        let lines = message_lines(&msg, 10, None, None);
         let last = lines.last().unwrap().to_string();
         assert!(last.contains("Press Enter"));
     }
@@ -456,17 +526,18 @@ mod tests {
         // The scrollbar height is the exact Line count from message_lines; the
         // two must never disagree.
         let msg = message("hello");
-        assert_eq!(message_lines(&msg, 80, None).len(), 1);
+        assert_eq!(message_lines(&msg, 80, None, None).len(), 1);
     }
 
     #[test]
     fn message_height_counts_reply_indicator_and_wrapped_lines() {
         let mut msg = message("some words that get soft-wrapped at this narrow width");
         msg.reply_to_id = Some("x".into());
-        let count = message_lines(&msg, 20, None).len();
+        let count = message_lines(&msg, 20, None, None).len();
         let plain = message_lines(
             &message("some words that get soft-wrapped at this narrow width"),
             20,
+            None,
             None,
         )
         .len();
@@ -476,7 +547,7 @@ mod tests {
     #[test]
     fn message_height_caps_at_max_lines_with_hint() {
         let msg = message("a\nb\nc\nd\ne\nf");
-        let lines = message_lines(&msg, 80, Some(5));
+        let lines = message_lines(&msg, 80, Some(5), None);
         assert_eq!(lines.len(), 6, "5 content lines + the hint line");
         assert!(lines.last().unwrap().to_string().contains("Press Enter"));
     }
@@ -511,6 +582,48 @@ mod tests {
         assert_eq!(write_visual_rows(&["hello world".into()], 5), 2);
         assert_eq!(write_visual_rows(&["hello".into(), "world".into()], 100), 2);
         assert_eq!(write_visual_rows(&["".into()], 10), 1);
+    }
+
+    #[test]
+    fn body_spans_highlights_case_insensitive_matches() {
+        let style = Style::default().fg(Color::Gray);
+        let spans = body_spans("say Hello then hello again", Some("hello"), style);
+        assert_eq!(
+            spans.iter().map(|s| s.to_string()).collect::<String>(),
+            "say Hello then hello again"
+        );
+        let highlighted = spans
+            .iter()
+            .filter(|s| s.style.bg == Some(Color::Yellow))
+            .count();
+        assert_eq!(highlighted, 2);
+    }
+
+    #[test]
+    fn body_spans_without_needle_is_a_single_span() {
+        let style = Style::default().fg(Color::Gray);
+        let spans = body_spans("plain text", None, style);
+        assert_eq!(spans.len(), 1);
+    }
+
+    #[test]
+    fn body_spans_ignores_empty_needle() {
+        let style = Style::default().fg(Color::Gray);
+        let spans = body_spans("plain text", Some(""), style);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].to_string(), "plain text");
+    }
+
+    #[test]
+    fn message_lines_highlights_needle_occurrences_in_body() {
+        let lines = message_lines(&message("say hello there"), 80, None, Some("hello"));
+        let highlighted = lines[0]
+            .spans
+            .iter()
+            .filter(|s| s.style.bg == Some(Color::Yellow))
+            .count();
+        assert_eq!(highlighted, 1);
+        assert!(lines[0].to_string().contains("hello"));
     }
 
     #[test]

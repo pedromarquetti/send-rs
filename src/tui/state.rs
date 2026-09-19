@@ -163,6 +163,16 @@ impl AppState {
         self.focus == Focus::ChatList && self.chat_state.search.is_inserting()
     }
 
+    /// True while the message search UI is engaged and focused.
+    pub fn message_search_active(&self) -> bool {
+        self.focus == Focus::Chat && self.chat_state.message_search.is_active()
+    }
+
+    /// True while the message search input is focused and being typed in.
+    pub fn message_search_typing(&self) -> bool {
+        self.focus == Focus::Chat && self.chat_state.message_search.is_inserting()
+    }
+
     /// Apply a previously fetched chat list to the TUI chat state, preserving
     /// each chat's saved scroll position. Providers that appear in a fresh,
     /// non-empty snapshot are treated as authoritative: rows they no longer
@@ -265,11 +275,11 @@ impl AppState {
     /// Sets the recency timestamp from the newest message in `history` and re-sorts,
     /// keeping the currently selected chat selected.
     pub fn update_chat_list_from_poll(&mut self, chat_id: &ChatId, history: &[Message]) {
-        let Some((_, chat)) = self.chat_state.find_mut(chat_id) else {
+        let Some(newest) = history.last() else {
             return;
         };
 
-        let Some(newest) = history.last() else {
+        let Some((_, chat)) = self.chat_state.find_mut(chat_id) else {
             return;
         };
 
@@ -280,8 +290,11 @@ impl AppState {
 
         chat.last_message_ts = Some(newest.timestamp);
 
+        // The sort reorders the source list, so a filtered selection must be
+        // re-anchored by chat id (not by the stale index it held).
+        let selected_id = self.chat_state.selected_chat().map(|chat| chat.id.clone());
         self.chat_state.sort_pinned_then_recent();
-        self.chat_state.refresh_search();
+        self.chat_state.refresh_search_with_id(selected_id);
     }
 
     pub fn create_popup(&mut self, popup_type: PopupKind) {
@@ -358,6 +371,8 @@ impl AppState {
     pub fn begin_chat_load(&mut self, index: usize) -> Option<(Chat, u64, MessengerKind)> {
         let src = self.chat_state.resolve_open_index(index)?;
         let chat = self.chat_state.chats.get(src).cloned()?;
+
+        self.chat_state.clear_message_search();
 
         if let Some(current_chat_id) = self
             .chat_state
@@ -1257,15 +1272,7 @@ impl AppState {
             chat.last_message_ts = Some(ts);
             let selected_id = self.chat_state.selected_chat().map(|chat| chat.id.clone());
             self.chat_state.sort_pinned_then_recent();
-
-            if let Some(selected_id) = selected_id {
-                let selected = self
-                    .chat_state
-                    .chats
-                    .iter()
-                    .position(|chat| chat.id == selected_id);
-                self.chat_state.chat_list_state.select(selected);
-            }
+            self.chat_state.refresh_search_with_id(selected_id);
         }
     }
 }
@@ -1327,6 +1334,8 @@ mod tests {
         let Some(chat) = state.chat_state.chats.get(src).cloned() else {
             return;
         };
+
+        state.chat_state.clear_message_search();
 
         debug!(chat = %chat.contact_name, id = ?chat.id, "Opening chat");
 
@@ -2865,5 +2874,157 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn message_search_active_helpers_gate_on_chat_focus() {
+        let mut state = app_state().await;
+        state.chat_state.open_chat = Some(OpenChat {
+            chat: Chat {
+                id: ChatId::Telegram(1),
+                contact_name: "Bob".into(),
+                ..Default::default()
+            },
+            history: vec![Message {
+                message_id: "m".into(),
+                chat: ChatId::Telegram(1),
+                sender: "Sender".into(),
+                author_id: None,
+                text: "hello".into(),
+                timestamp: 0,
+                from_me: false,
+                msg_actions: Vec::new(),
+                media: None,
+                reply_to_id: None,
+                reply_ctx: None,
+                pending: false,
+                failed: false,
+            }],
+            has_more_history: true,
+        });
+        state.focus = Focus::Chat;
+        state.chat_state.begin_message_search();
+        state
+            .chat_state
+            .message_search_input(KeyEvent::from(KeyCode::Char('l')));
+
+        assert!(state.message_search_active());
+        assert!(state.message_search_typing());
+
+        state.focus = Focus::ChatList;
+        assert!(!state.message_search_active());
+        assert!(!state.message_search_typing());
+    }
+
+    #[tokio::test]
+    async fn opening_a_chat_clears_an_active_message_search() {
+        let mut state = app_state().await;
+        state.apply_chats(vec![Chat {
+            id: ChatId::Telegram(1),
+            contact_name: "Alpha".into(),
+            ..Default::default()
+        }]);
+        state.chat_state.open_chat = Some(OpenChat {
+            chat: Chat {
+                id: ChatId::Telegram(1),
+                contact_name: "Alpha".into(),
+                ..Default::default()
+            },
+            history: vec![Message {
+                message_id: "m".into(),
+                chat: ChatId::Telegram(1),
+                sender: "Sender".into(),
+                author_id: None,
+                text: "hello".into(),
+                timestamp: 0,
+                from_me: false,
+                msg_actions: Vec::new(),
+                media: None,
+                reply_to_id: None,
+                reply_ctx: None,
+                pending: false,
+                failed: false,
+            }],
+            has_more_history: true,
+        });
+        state
+            .chat_state
+            .begin_message_search();
+        assert!(state.chat_state.message_search.is_active());
+
+        // Opening a chat (as Enter on the chat list does) drops the search
+        // bound to the previous history. Mirrors `begin_chat_load`, which the
+        // test-only helper reproduces without cloning the messenger.
+        select_chat(&mut state, 0).await;
+        assert!(!state.chat_state.message_search.is_active());
+    }
+
+    #[tokio::test]
+    async fn chatlist_poll_reorder_keeps_the_selected_chat_selected_in_a_filtered_view() {
+        let mut state = app_state().await;
+        state.chat_state.chats = vec![
+            Chat {
+                id: ChatId::Telegram(1),
+                contact_name: "alice".into(),
+                last_message_ts: Some(5),
+                ..Default::default()
+            },
+            Chat {
+                id: ChatId::Telegram(2),
+                contact_name: "bob".into(),
+                last_message_ts: Some(4),
+                ..Default::default()
+            },
+            Chat {
+                id: ChatId::Telegram(3),
+                contact_name: "carol".into(),
+                last_message_ts: Some(3),
+                ..Default::default()
+            },
+            Chat {
+                id: ChatId::Telegram(4),
+                contact_name: "dave".into(),
+                last_message_ts: Some(2),
+                ..Default::default()
+            },
+        ];
+        state.chat_state.sort_pinned_then_recent();
+
+        state.chat_state.begin_search();
+        state
+            .chat_state
+            .search_input(KeyEvent::from(KeyCode::Char('a')));
+        state.chat_state.commit_search();
+        assert_eq!(state.chat_state.search.indices(), &[0, 2, 3]);
+
+        state.chat_state.chat_list_state.select(Some(1));
+        assert_eq!(state.chat_state.selected_chat().unwrap().contact_name, "carol");
+
+        // The open chat's poll returns a newer message for "dave", bumping it
+        // to the top and reordering the source list behind the committed filter.
+        state.update_chat_list_from_poll(
+            &ChatId::Telegram(4),
+            &[Message {
+                message_id: "poll".into(),
+                chat: ChatId::Telegram(4),
+                sender: "Dave".into(),
+                author_id: None,
+                text: "new".into(),
+                timestamp: 100,
+                from_me: false,
+                msg_actions: Vec::new(),
+                media: None,
+                reply_to_id: None,
+                reply_ctx: None,
+                pending: false,
+                failed: false,
+            }],
+        );
+
+        assert_eq!(
+            state.chat_state.selected_chat().map(|c| c.id.clone()),
+            Some(ChatId::Telegram(3)),
+            "the poll-triggered reorder must keep the filtered selection on carol"
+        );
     }
 }

@@ -602,8 +602,8 @@ impl App {
 
     async fn handle_main_key(&mut self, key: KeyEvent) {
         let km = self.state.keymap.clone();
-        let searching = self.state.chat_list_search_active();
-        let typing_search = self.state.chat_list_search_typing();
+        let searching = self.state.chat_list_search_active() || self.state.message_search_active();
+        let typing_search = self.state.chat_list_search_typing() || self.state.message_search_typing();
 
         // While an active chat-list search is showing, Esc is handled inside the
         // ChatList branch (cancel the search) instead of cycling focus.
@@ -684,6 +684,27 @@ impl App {
                 }
             }
             Focus::Chat => {
+                if self.state.message_search_typing() {
+                    if key == km.dismiss {
+                        self.state.chat_state.clear_message_search();
+                    } else if key == km.select {
+                        self.state.chat_state.commit_message_search();
+                    } else {
+                        self.state.chat_state.message_search_input(key);
+                    }
+                    return;
+                }
+
+                if key == km.dismiss && self.state.message_search_active() {
+                    self.state.chat_state.clear_message_search();
+                    return;
+                }
+
+                if key == km.search_text {
+                    self.state.chat_state.begin_message_search();
+                    return;
+                }
+
                 if key == km.scroll_up {
                     if self
                         .state
@@ -961,10 +982,22 @@ impl App {
             .render(horizontal[0], frame.buffer_mut());
         }
 
+        let (message_search_bar, message_needle) = {
+            let search = &self.state.chat_state.message_search;
+            (
+                search.title_line(),
+                search
+                    .is_active()
+                    .then(|| search.query_text().trim().to_string()),
+            )
+        };
+
         ChatWidget::new(
             self.state.focus,
             &mut self.state.write,
             self.state.config.max_write_lines,
+            message_search_bar,
+            message_needle,
         )
         .render(
             horizontal[1],

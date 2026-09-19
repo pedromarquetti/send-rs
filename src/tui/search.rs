@@ -1,4 +1,6 @@
 use ratatui::crossterm::event::KeyEvent;
+use ratatui::prelude::*;
+use ratatui::text::Line;
 use ratatui_textarea::TextArea;
 
 /// Reusable single-field search/filter state for list views.
@@ -108,6 +110,44 @@ impl SearchState {
             Some(idx)
         }
     }
+
+    /// Bottom-title line for the surrounding block: the search input when a
+    /// search is active, otherwise empty. The cursor is drawn as a highlighted
+    /// cell only while the user is actually typing.
+    pub fn title_line(&self) -> Line<'static> {
+        if !self.is_active() {
+            return Line::default();
+        }
+
+        let label = Span::styled(" Search: ", Style::default().fg(Color::DarkGray));
+        let text = self.query_text().to_string();
+        let body = Style::default().fg(Color::Gray);
+
+        if self.is_inserting() {
+            let mut chars: Vec<char> = text.chars().collect();
+            let col = self.cursor_col().min(chars.len());
+            let before: String = chars[..col].iter().collect();
+            let cursor = if col < chars.len() {
+                chars.remove(col)
+            } else {
+                ' '
+            };
+
+            Line::from(vec![
+                label,
+                Span::styled(before, body),
+                Span::styled(
+                    cursor.to_string(),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ])
+        } else {
+            Line::from(vec![label, Span::styled(text, body)])
+        }
+    }
 }
 
 #[cfg(test)]
@@ -200,5 +240,41 @@ mod tests {
         state.input(key('X'));
         assert_eq!(state.query_text(), "abXc");
         assert_eq!(state.cursor_col(), 3);
+    }
+
+    #[test]
+    fn title_line_is_empty_when_inactive() {
+        let state = SearchState::default();
+        assert_eq!(state.title_line(), Line::default());
+    }
+
+    #[test]
+    fn title_line_shows_query_while_inserting() {
+        let mut state = SearchState::default();
+        state.begin();
+        state.input(key('a'));
+        state.input(key('b'));
+        let line = state.title_line();
+        let text: String = line.spans.iter().map(|s| s.to_string()).collect();
+        assert!(text.contains("Search:"));
+        assert!(text.contains("ab"));
+    }
+
+    #[test]
+    fn title_line_shows_committed_query_without_cursor() {
+        let mut state = SearchState::default();
+        state.begin();
+        state.input(key('a'));
+        state.input(key('b'));
+        state.commit();
+        let line = state.title_line();
+        let text: String = line.spans.iter().map(|s| s.to_string()).collect();
+        assert!(text.contains("ab"));
+        assert!(
+            line.spans
+                .iter()
+                .all(|s| s.style.bg != Some(Color::Yellow)),
+            "no cursor cell while not typing"
+        );
     }
 }

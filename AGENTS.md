@@ -24,7 +24,8 @@ types.
   (Telegram/WhatsApp)
 - chat - The page/widget that displays the conversation itself
 - chat list - The list of chats returned by the Messenger
-- message - Messages from the providers: a group of messages are rendered in a chat
+- message - Messages from the providers: a group of messages are rendered in a
+  chat
 
 ## Project layout
 
@@ -130,6 +131,8 @@ the pinned source above.
 - If you must put something in a shared struct, first confirm it is genuinely
   needed by the trait boundary, then make it modular/generic (opaque,
   provider-neutral naming and types) so any provider can implement it.
+- Don't create methods that would be only used for tests. If a helper must be
+  created for a test, insert it into the test mod
 
 ## Boundaries / do not touch
 
