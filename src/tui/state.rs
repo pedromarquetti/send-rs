@@ -153,6 +153,16 @@ impl AppState {
         self.chat_state.chat_list_state.selected()
     }
 
+    /// True while the chat-list search UI is engaged and focused.
+    pub fn chat_list_search_active(&self) -> bool {
+        self.focus == Focus::ChatList && self.chat_state.search.is_active()
+    }
+
+    /// True while the chat-list search input is focused and being typed in.
+    pub fn chat_list_search_typing(&self) -> bool {
+        self.focus == Focus::ChatList && self.chat_state.search.is_inserting()
+    }
+
     /// Apply a previously fetched chat list to the TUI chat state, preserving
     /// each chat's saved scroll position. Providers that appear in a fresh,
     /// non-empty snapshot are treated as authoritative: rows they no longer
@@ -161,6 +171,7 @@ impl AppState {
     /// live entries at all (e.g. WhatsApp during a cold start, where the
     /// realtime client has not re-synced yet) is kept rather than wiped out.
     pub fn apply_chats(&mut self, chats: Vec<Chat>) {
+        let selected_id = self.chat_state.selected_chat().map(|chat| chat.id.clone());
         let saved_scrolls: HashMap<ChatId, usize> = self
             .chat_state
             .chats
@@ -206,18 +217,11 @@ impl AppState {
 
         self.chat_state.chats = chat_list;
         self.chat_state.sort_pinned_then_recent();
-
-        let len = self.chat_state.chats.len();
-        let index = if len == 0 {
-            None
-        } else {
-            self.chat_state
-                .chat_list_state
-                .selected()
-                .map(|i| i.min(len - 1))
-        };
-        self.chat_state.chat_list_state.select(index);
-        debug!(total = len, "Chat list applied");
+        self.chat_state.refresh_search_with_id(selected_id);
+        debug!(
+            total = self.chat_state.chats.len(),
+            "Chat list applied"
+        );
     }
 
     pub async fn rebuild_chats(&mut self) -> Vec<BackendError> {
@@ -276,18 +280,8 @@ impl AppState {
 
         chat.last_message_ts = Some(newest.timestamp);
 
-        let selected_id = self.chat_state.selected_chat().map(|chat| chat.id.clone());
-
         self.chat_state.sort_pinned_then_recent();
-
-        if let Some(selected_id) = selected_id {
-            let selected = self
-                .chat_state
-                .chats
-                .iter()
-                .position(|chat| chat.id == selected_id);
-            self.chat_state.chat_list_state.select(selected);
-        }
+        self.chat_state.refresh_search();
     }
 
     pub fn create_popup(&mut self, popup_type: PopupKind) {
@@ -361,93 +355,9 @@ impl AppState {
         self.chat_load_generation = self.chat_load_generation.wrapping_add(1);
     }
 
-    pub async fn select_chat(&mut self, index: usize) {
-        let Some(chat) = self.chat_state.chats.get(index).cloned() else {
-            return;
-        };
-
-        debug!(chat = %chat.contact_name, id = ?chat.id, "Opening chat");
-
-        // Save current draft and message selection before switching
-        if let Some(current_chat_id) = self
-            .chat_state
-            .open_chat
-            .as_ref()
-            .map(|o| o.chat.id.clone())
-        {
-            let text = self.write.lines().join("\n");
-            self.chat_state.save_draft(&current_chat_id, text);
-            self.chat_state.save_message_selection();
-        }
-
-        let read_result = match self.chat_owner_mut(&chat.id) {
-            Some(messenger) => messenger.set_read(&chat.id).await,
-            None => Ok(()),
-        };
-
-        if let Err(e) = read_result {
-            warn!(chat = %chat.contact_name, error = %e, "Failed to mark chat as read");
-            self.create_popup(PopupKind::Error(format!(
-                "{} failed to mark chat as read: {e}",
-                chat.id.platform()
-            )));
-            return;
-        }
-
-        self.chat_state.chats[index].unread = false;
-        self.chat_state.chats[index].unread_count = 0;
-
-        let status = match self.chat_owner(&chat.id) {
-            Some(messenger) => messenger.status(&chat.id).await.ok().flatten(),
-            None => None,
-        };
-
-        if let Some(status) = status.clone() {
-            self.chat_state.chats[index].status = Some(status.clone());
-        }
-
-        let history_result = match self.chat_owner(&chat.id) {
-            Some(messenger) => messenger.history(&chat.id).await,
-            None => Ok(Vec::new()),
-        };
-        match history_result {
-            Ok(messages) => {
-                let history_len = messages.len();
-                debug!(chat = %chat.contact_name, messages = history_len, "History loaded");
-
-                self.chat_state.open_chat = Some(OpenChat {
-                    chat: Chat {
-                        status: status.clone(),
-                        ..chat.clone()
-                    },
-                    history: messages,
-                    has_more_history: true,
-                });
-
-                self.chat_state.restore_message_selection(history_len);
-            }
-            Err(e) => {
-                error!(chat = %chat.contact_name, error = %e, "Failed to load history");
-                self.chat_state.open_chat = None;
-                self.create_popup(PopupKind::Error(format!(
-                    "{} failed to load history for {}: {e}",
-                    chat.id.platform(),
-                    chat.contact_name
-                )));
-            }
-        }
-
-        // Load draft for the new chat
-        self.write.clear();
-        if let Some(draft) = self.chat_state.load_draft(&chat.id) {
-            self.write.insert_str(draft);
-        }
-
-        self.focus = Focus::Chat;
-    }
-
     pub fn begin_chat_load(&mut self, index: usize) -> Option<(Chat, u64, MessengerKind)> {
-        let chat = self.chat_state.chats.get(index).cloned()?;
+        let src = self.chat_state.resolve_open_index(index)?;
+        let chat = self.chat_state.chats.get(src).cloned()?;
 
         if let Some(current_chat_id) = self
             .chat_state
@@ -462,8 +372,8 @@ impl AppState {
 
         self.chat_load_generation = self.chat_load_generation.wrapping_add(1);
         self.chat_state.open_chat = None;
-        self.chat_state.chats[index].unread = false;
-        self.chat_state.chats[index].unread_count = 0;
+        self.chat_state.chats[src].unread = false;
+        self.chat_state.chats[src].unread_count = 0;
         self.write.clear();
 
         if let Some(draft) = self.chat_state.load_draft(&chat.id) {
@@ -1302,6 +1212,7 @@ impl AppState {
                 debug!(chat = ?chat.id, "TUI ChatRemoved");
 
                 self.chat_state.chats.retain(|c| c.id != chat.id);
+                self.chat_state.refresh_search();
 
                 if let Some(open) = self.chat_state.open_chat.as_mut()
                     && open.chat.id == chat.id
@@ -1402,7 +1313,100 @@ mod tests {
     use super::*;
     use crate::backend::mock::MockMessenger;
     use crate::backend::{Message, MessageId, Messenger};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent};
     use tokio::sync::broadcast;
+
+    /// Test helper: synchronously open the chat at the given *visible*
+    /// chat-list index, loading history through the messenger directly. Mirrors
+    /// the async open flow the production event loop drives via
+    /// `begin_chat_load` + `apply_chat_load`.
+    async fn select_chat(state: &mut AppState, index: usize) {
+        let Some(src) = state.chat_state.search.map_to_source(index) else {
+            return;
+        };
+        let Some(chat) = state.chat_state.chats.get(src).cloned() else {
+            return;
+        };
+
+        debug!(chat = %chat.contact_name, id = ?chat.id, "Opening chat");
+
+        // Save current draft and message selection before switching
+        if let Some(current_chat_id) = state
+            .chat_state
+            .open_chat
+            .as_ref()
+            .map(|o| o.chat.id.clone())
+        {
+            let text = state.write.lines().join("\n");
+            state.chat_state.save_draft(&current_chat_id, text);
+            state.chat_state.save_message_selection();
+        }
+
+        let read_result = match state.chat_owner_mut(&chat.id) {
+            Some(messenger) => messenger.set_read(&chat.id).await,
+            None => Ok(()),
+        };
+
+        if let Err(e) = read_result {
+            warn!(chat = %chat.contact_name, error = %e, "Failed to mark chat as read");
+            state.create_popup(PopupKind::Error(format!(
+                "{} failed to mark chat as read: {e}",
+                chat.id.platform()
+            )));
+            return;
+        }
+
+        state.chat_state.chats[src].unread = false;
+        state.chat_state.chats[src].unread_count = 0;
+
+        let status = match state.chat_owner(&chat.id) {
+            Some(messenger) => messenger.status(&chat.id).await.ok().flatten(),
+            None => None,
+        };
+
+        if let Some(status) = status.clone() {
+            state.chat_state.chats[src].status = Some(status.clone());
+        }
+
+        let history_result = match state.chat_owner(&chat.id) {
+            Some(messenger) => messenger.history(&chat.id).await,
+            None => Ok(Vec::new()),
+        };
+        match history_result {
+            Ok(messages) => {
+                let history_len = messages.len();
+                debug!(chat = %chat.contact_name, messages = history_len, "History loaded");
+
+                state.chat_state.open_chat = Some(OpenChat {
+                    chat: Chat {
+                        status: status.clone(),
+                        ..chat.clone()
+                    },
+                    history: messages,
+                    has_more_history: true,
+                });
+
+                state.chat_state.restore_message_selection(history_len);
+            }
+            Err(e) => {
+                error!(chat = %chat.contact_name, error = %e, "Failed to load history");
+                state.chat_state.open_chat = None;
+                state.create_popup(PopupKind::Error(format!(
+                    "{} failed to load history for {}: {e}",
+                    chat.id.platform(),
+                    chat.contact_name
+                )));
+            }
+        }
+
+        // Load draft for the new chat
+        state.write.clear();
+        if let Some(draft) = state.chat_state.load_draft(&chat.id) {
+            state.write.insert_str(draft);
+        }
+
+        state.focus = Focus::Chat;
+    }
 
     async fn app_state() -> AppState {
         let mut config = Config::default();
@@ -1506,7 +1510,7 @@ mod tests {
             .position(|c| c.id.to_provider() == Provider::WhatsApp)
             .expect("expected a WhatsApp chat when enabled");
         state.chat_state.chat_list_state.select(Some(wa_idx));
-        state.select_chat(wa_idx).await;
+        select_chat(&mut state, wa_idx).await;
         assert!(
             matches!(
                 state.chat_state.open_chat.as_ref().map(|o| &o.chat.id),
@@ -1545,7 +1549,7 @@ mod tests {
         let mut state = app_state().await;
         state.config.providers.whatsapp = false;
         state.chat_state.chat_list_state.select(Some(0));
-        state.select_chat(0).await;
+        select_chat(&mut state, 0).await;
 
         let chat_id = state.chat_state.open_chat.as_ref().unwrap().chat.id.clone();
         let before = state.chat_state.open_chat.as_ref().unwrap().history.len();
@@ -1618,7 +1622,7 @@ mod tests {
         let mut state = app_state().await;
         state.config.providers.whatsapp = false;
         state.chat_state.chat_list_state.select(Some(0));
-        state.select_chat(0).await;
+        select_chat(&mut state, 0).await;
 
         let chat_id = state.chat_state.open_chat.as_ref().unwrap().chat.id.clone();
         let len = state.chat_state.open_chat.as_ref().unwrap().history.len();
@@ -1662,7 +1666,7 @@ mod tests {
         let mut state = app_state().await;
         state.config.providers.whatsapp = false;
         state.chat_state.chat_list_state.select(Some(0));
-        state.select_chat(0).await;
+        select_chat(&mut state, 0).await;
 
         let len = state.chat_state.open_chat.as_ref().unwrap().history.len();
         let other_id = ChatId::Telegram(999_999);
@@ -1733,6 +1737,61 @@ mod tests {
                 .count(),
             1,
             "duplicate chat id must be deduplicated"
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_a_chat_clears_the_committed_search_filter() {
+        let mut state = app_state().await;
+        state.apply_chats(vec![
+            crate::backend::Chat {
+                id: ChatId::Telegram(1),
+                contact_name: "Alpha".into(),
+                ..Default::default()
+            },
+            crate::backend::Chat {
+                id: ChatId::Telegram(2),
+                contact_name: "Bob".into(),
+                ..Default::default()
+            },
+            crate::backend::Chat {
+                id: ChatId::Telegram(3),
+                contact_name: "Charlie".into(),
+                ..Default::default()
+            },
+        ]);
+
+        state.chat_state.begin_search();
+        state.chat_state.search_input(KeyEvent::from(KeyCode::Char('b')));
+        state.chat_state.commit_search();
+
+        assert!(state.chat_list_search_active());
+        assert_eq!(state.chat_state.visible_indices().len(), 1, "only Bob matches");
+        assert_eq!(
+            state.chat_state.selected_chat().map(|c| c.contact_name.as_str()),
+            Some("Bob")
+        );
+
+        // Opening the highlighted match (visible index 0 -> source index 1)
+        // must drop the filter and re-select the opened chat in the full list.
+        assert_eq!(
+            state.chat_state.resolve_open_index(0),
+            Some(1),
+            "visible index resolves to the matching source chat"
+        );
+        assert!(
+            !state.chat_state.search.is_active(),
+            "opening a chat must clear the active search"
+        );
+        assert_eq!(state.chat_state.chats.len(), 3, "full list restored");
+        assert_eq!(
+            state.selected_chat_idx(),
+            Some(1),
+            "opened chat re-selected by id after the filter drops"
+        );
+        assert_eq!(
+            state.chat_state.selected_chat().map(|c| c.contact_name.as_str()),
+            Some("Bob")
         );
     }
 
@@ -1914,16 +1973,16 @@ mod tests {
         let mut state = app_state().await;
 
         state.chat_state.chat_list_state.select(Some(0));
-        state.select_chat(0).await;
+        select_chat(&mut state, 0).await;
         assert_eq!(state.chat_state.chats[0].scroll, 0);
         state.chat_state.chats[0].scroll = 10;
 
         state.chat_state.chat_list_state.select(Some(1));
-        state.select_chat(1).await;
+        select_chat(&mut state, 1).await;
         assert_eq!(state.chat_state.chats[1].scroll, 0);
 
         state.chat_state.chat_list_state.select(Some(0));
-        state.select_chat(0).await;
+        select_chat(&mut state, 0).await;
         assert_eq!(state.chat_state.chats[0].scroll, 10);
     }
 
@@ -1932,7 +1991,7 @@ mod tests {
         let mut state = app_state().await;
 
         state.chat_state.chat_list_state.select(Some(1));
-        state.select_chat(1).await;
+        select_chat(&mut state, 1).await;
 
         let current = state.chat_state.open_chat.unwrap();
         assert_eq!(current.chat.id, ChatId::Telegram(102));
@@ -1944,7 +2003,7 @@ mod tests {
         let mut state = app_state().await;
 
         state.chat_state.chat_list_state.select(Some(0));
-        state.select_chat(0).await;
+        select_chat(&mut state, 0).await;
 
         assert_eq!(
             state.chat_state.open_chat.as_ref().unwrap().history.len(),
@@ -1984,7 +2043,7 @@ mod tests {
     async fn incoming_message_to_closed_chat_marks_unread() {
         let mut state = app_state().await;
         state.chat_state.chat_list_state.select(Some(0));
-        state.select_chat(0).await;
+        select_chat(&mut state, 0).await;
 
         state.handle_backend_event(
             Provider::Telegram,
@@ -2019,7 +2078,7 @@ mod tests {
     async fn unread_update_does_not_mark_open_chat_unread() {
         let mut state = app_state().await;
         state.chat_state.chat_list_state.select(Some(0));
-        state.select_chat(0).await;
+        select_chat(&mut state, 0).await;
 
         state.handle_backend_event(
             Provider::Telegram,
@@ -2044,7 +2103,7 @@ mod tests {
     async fn status_update_refreshes_chat_list_and_open_chat() {
         let mut state = app_state().await;
         state.chat_state.chat_list_state.select(Some(0));
-        state.select_chat(0).await;
+        select_chat(&mut state, 0).await;
 
         state.handle_backend_event(
             Provider::Telegram,
@@ -2210,7 +2269,7 @@ mod tests {
     async fn message_deleted_event_removes_open_history_message() {
         let mut state = app_state().await;
         state.chat_state.chat_list_state.select(Some(0));
-        state.select_chat(0).await;
+        select_chat(&mut state, 0).await;
 
         let removed = state
             .chat_state
@@ -2245,11 +2304,11 @@ mod tests {
         let mut state = app_state().await;
 
         state.chat_state.chat_list_state.select(Some(0));
-        state.select_chat(0).await;
+        select_chat(&mut state, 0).await;
         state.write.insert_str("hello from chat 0");
 
         state.chat_state.chat_list_state.select(Some(1));
-        state.select_chat(1).await;
+        select_chat(&mut state, 1).await;
 
         assert_eq!(
             state.chat_state.load_draft(&ChatId::Telegram(103)),
@@ -2262,14 +2321,14 @@ mod tests {
         let mut state = app_state().await;
 
         state.chat_state.chat_list_state.select(Some(0));
-        state.select_chat(0).await;
+        select_chat(&mut state, 0).await;
         state.write.insert_str("draft message");
 
         state.chat_state.chat_list_state.select(Some(1));
-        state.select_chat(1).await;
+        select_chat(&mut state, 1).await;
 
         state.chat_state.chat_list_state.select(Some(0));
-        state.select_chat(0).await;
+        select_chat(&mut state, 0).await;
 
         assert_eq!(state.write.lines().join("\n"), "draft message");
     }
@@ -2279,7 +2338,7 @@ mod tests {
         let mut state = app_state().await;
 
         state.chat_state.chat_list_state.select(Some(0));
-        state.select_chat(0).await;
+        select_chat(&mut state, 0).await;
         state.write.insert_str("unsent text");
 
         state.focus = Focus::Chat;
@@ -2322,7 +2381,7 @@ mod tests {
         let mut state = app_state().await;
 
         state.chat_state.chat_list_state.select(Some(0));
-        state.select_chat(0).await;
+        select_chat(&mut state, 0).await;
         state.write.insert_str("hello");
 
         state
@@ -2343,15 +2402,15 @@ mod tests {
         let mut state = app_state().await;
 
         state.chat_state.chat_list_state.select(Some(0));
-        state.select_chat(0).await;
+        select_chat(&mut state, 0).await;
         state.write.insert_str("msg for chat 0");
 
         state.chat_state.chat_list_state.select(Some(1));
-        state.select_chat(1).await;
+        select_chat(&mut state, 1).await;
         state.write.insert_str("msg for chat 1");
 
         state.chat_state.chat_list_state.select(Some(0));
-        state.select_chat(0).await;
+        select_chat(&mut state, 0).await;
 
         assert_eq!(
             state.chat_state.load_draft(&ChatId::Telegram(103)),
@@ -2596,7 +2655,7 @@ mod tests {
         .await;
         fetch_and_apply(&mut state).await;
         state.chat_state.chat_list_state.select(Some(0));
-        state.select_chat(0).await;
+        select_chat(&mut state, 0).await;
         let popup = state
             .pop_up
             .as_ref()
@@ -2632,7 +2691,7 @@ mod tests {
         .await;
         fetch_and_apply(&mut state).await;
         state.chat_state.chat_list_state.select(Some(0));
-        state.select_chat(0).await;
+        select_chat(&mut state, 0).await;
         let popup = state
             .pop_up
             .as_ref()

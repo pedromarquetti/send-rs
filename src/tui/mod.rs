@@ -11,7 +11,7 @@ use tokio::time::{Duration, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 
 use crate::backend::{
-    self, AuthSteps, BackendEvent, ChatId, MessageAction, MessengerKind, Provider,
+    self, AuthSteps, BackendEvent, Chat, ChatId, MessageAction, MessengerKind, Provider,
 };
 use crate::config::{Config, Keymap};
 use crate::helpers::available_message_actions;
@@ -27,6 +27,7 @@ mod chat;
 mod loading;
 mod login;
 mod popup;
+mod search;
 mod settings;
 mod state;
 mod status_bar;
@@ -43,14 +44,14 @@ enum UiEvent {
     /// topmost message); applied by `AppState::apply_history_page`.
     HistoryPageResult(ChatId, Result<Vec<backend::Message>, backend::BackendError>),
     ChatLoaded {
-        chat: backend::Chat,
+        chat: Chat,
         generation: u64,
         result: Result<Vec<backend::Message>, backend::BackendError>,
         status: Option<String>,
     },
-    ChatList(Provider, Result<Vec<backend::Chat>, backend::BackendError>),
+    ChatList(Provider, Result<Vec<Chat>, backend::BackendError>),
     ChatsLoaded {
-        chats: Vec<backend::Chat>,
+        chats: Vec<Chat>,
         errors: Vec<backend::BackendError>,
     },
 }
@@ -601,8 +602,12 @@ impl App {
 
     async fn handle_main_key(&mut self, key: KeyEvent) {
         let km = self.state.keymap.clone();
+        let searching = self.state.chat_list_search_active();
+        let typing_search = self.state.chat_list_search_typing();
 
-        if key == km.dismiss {
+        // While an active chat-list search is showing, Esc is handled inside the
+        // ChatList branch (cancel the search) instead of cycling focus.
+        if key == km.dismiss && !searching {
             if self.state.focus == Focus::Chat && self.state.chat_state.open_chat.is_none() {
                 self.cancel_chat_load();
                 self.state.focus = Focus::ChatList;
@@ -612,18 +617,18 @@ impl App {
             return;
         }
 
-        if key == km.open_settings && self.state.focus != Focus::Write {
+        if key == km.open_settings && self.state.focus != Focus::Write && !typing_search {
             self.state.screen = Screen::Settings;
             return;
         }
 
-        if key == km.pane_next {
+        if key == km.pane_next && !typing_search {
             self.state.cycle_focus();
             return;
         }
 
         // Jump from chat list to Write Box in selected chat
-        if key == km.focus_write && self.state.focus != Focus::Write {
+        if key == km.focus_write && self.state.focus != Focus::Write && !typing_search {
             match &self.state.chat_state.open_chat {
                 Some(_) => {
                     self.state.focus = Focus::Write;
@@ -644,7 +649,22 @@ impl App {
 
         match self.state.focus {
             Focus::ChatList => {
-                if key == km.scroll_up {
+                if typing_search {
+                    if key == km.dismiss {
+                        self.state.chat_state.clear_search();
+                    } else if key == km.select {
+                        self.state.chat_state.commit_search();
+                    } else {
+                        self.state.chat_state.search_input(key);
+                    }
+                    return;
+                }
+
+                if key == km.dismiss && searching {
+                    self.state.chat_state.clear_search();
+                } else if key == km.search_text {
+                    self.state.chat_state.begin_search();
+                } else if key == km.scroll_up {
                     self.state.chat_state.chat_list_state.select_previous();
                 } else if key == km.scroll_to_bottom {
                     self.state.chat_state.chat_list_state.select_last();
@@ -655,9 +675,7 @@ impl App {
                     && self.state.chat_state.chat_list_state.selected().is_some()
                 {
                     match self.state.selected_chat_idx() {
-                        Some(chat) => {
-                            self.start_chat_load(chat);
-                        }
+                        Some(chat) => self.start_chat_load(chat),
                         None => {
                             self.state
                                 .create_popup(PopupKind::Error(String::from("No chat selected")));
@@ -913,10 +931,20 @@ impl App {
             Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)])
                 .split(vertical[0]);
 
+        let visible = self.state.chat_state.visible_indices();
+        let visible_chats: Vec<&Chat> = if visible.is_empty() {
+            self.state.chat_state.chats.iter().collect()
+        } else {
+            visible
+                .iter()
+                .filter_map(|&idx| self.state.chat_state.chats.get(idx))
+                .collect()
+        };
         ChatList::new(
             self.state.chat_state.get_tag(),
-            &self.state.chat_state.chats,
+            visible_chats,
             self.state.focus,
+            &self.state.chat_state.search,
         )
         .render(
             horizontal[0],

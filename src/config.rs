@@ -57,6 +57,7 @@ impl TelegramConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct KeymapConfig {
+    pub search_text: String,
     pub scroll_up: String,
     pub scroll_down: String,
     pub select: String,
@@ -75,6 +76,7 @@ impl Default for KeymapConfig {
     fn default() -> Self {
         Self {
             scroll_up: "k".into(),
+            search_text: "/".into(),
             scroll_down: "j".into(),
             select: "enter".into(),
             pane_prev: "shift+tab".into(),
@@ -94,6 +96,7 @@ impl KeymapConfig {
     pub fn parse(&self) -> Result<Keymap> {
         Ok(Keymap {
             scroll_up: parse_key(&self.scroll_up)?,
+            search_text: parse_key(&self.search_text)?,
             scroll_down: parse_key(&self.scroll_down)?,
             select: parse_key(&self.select)?,
             pane_prev: parse_key(&self.pane_prev)?,
@@ -112,6 +115,7 @@ impl KeymapConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Keymap {
     pub scroll_up: KeyEvent,
+    pub search_text: KeyEvent,
     pub scroll_down: KeyEvent,
     pub select: KeyEvent,
     pub pane_next: KeyEvent,

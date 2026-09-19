@@ -60,7 +60,7 @@ impl StatefulWidget for ChatWidget<'_> {
                 let bullet = match status {
                     "online" => Span::from("•").style(Style::new().fg(Color::Green)),
                     "" => Span::from(""),
-                    _ => Span::from("•"),
+                    _ => Span::from("•").style(Style::new().fg(Color::DarkGray)),
                 };
 
                 Line::from(vec![

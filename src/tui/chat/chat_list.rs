@@ -1,21 +1,29 @@
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, StatefulWidget, Widget};
+use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, StatefulWidget};
 
 use crate::backend::Chat;
+use crate::tui::search::SearchState;
 use crate::tui::state::Focus;
 
 pub struct ChatList<'a> {
-    chats: &'a [Chat],
+    chats: Vec<&'a Chat>,
     curr_tag: Option<&'static str>,
     focus: Focus,
+    search: &'a SearchState,
 }
 
 impl<'a> ChatList<'a> {
-    pub fn new(curr_tag: Option<&'static str>, chats: &'a [Chat], focus: Focus) -> Self {
+    pub fn new(
+        curr_tag: Option<&'static str>,
+        chats: Vec<&'a Chat>,
+        focus: Focus,
+        search: &'a SearchState,
+    ) -> Self {
         Self {
             chats,
             focus,
             curr_tag,
+            search,
         }
     }
 }
@@ -25,17 +33,28 @@ impl StatefulWidget for ChatList<'_> {
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
         let border = if self.focus == Focus::ChatList {
-            Style::default().fg(Color::Yellow)
+            match self.curr_tag {
+                Some("TG") => Style::default().fg(Color::Blue),
+                Some("WA") => Style::default().fg(Color::Green),
+                _ => Style::default(),
+            }
         } else {
             Style::default()
         };
 
-        let block = Block::bordered().title(" Chats ").border_style(border);
+        let block = Block::bordered()
+            .title(" Chats ")
+            .title_bottom(search_title(self.search))
+            .border_style(border);
 
         if self.chats.is_empty() {
-            let message =
-                Paragraph::new("No chats yet.\nPress s to enable a provider.").block(block);
-            message.render(area, buf);
+            let message = if self.search.is_active() {
+                "No matching chats."
+            } else {
+                "No chats yet.\nPress s to enable a provider."
+            };
+            let paragraph = Paragraph::new(message).block(block);
+            paragraph.render(area, buf);
             return;
         }
 
@@ -102,10 +121,50 @@ impl StatefulWidget for ChatList<'_> {
         } else {
             Style::default().add_modifier(Modifier::REVERSED)
         };
+
         let list = List::new(items)
             .block(block)
             .highlight_style(highlight)
             .highlight_symbol("> ");
+
         StatefulWidget::render(list, area, buf, state);
+    }
+}
+
+/// Bottom-title line for the chat list block: the search input when a search
+/// is active, otherwise empty. The cursor is drawn as a highlighted cell only
+/// while the user is actually typing.
+fn search_title(search: &SearchState) -> Line<'static> {
+    if !search.is_active() {
+        return Line::default();
+    }
+
+    let label = Span::styled(" Search: ", Style::default().fg(Color::DarkGray));
+    let text = search.query_text().to_string();
+    let body = Style::default().fg(Color::Gray);
+
+    if search.is_inserting() {
+        let mut chars: Vec<char> = text.chars().collect();
+        let col = search.cursor_col().min(chars.len());
+        let before: String = chars[..col].iter().collect();
+        let cursor = if col < chars.len() {
+            chars.remove(col)
+        } else {
+            ' '
+        };
+
+        Line::from(vec![
+            label,
+            Span::styled(before, body),
+            Span::styled(
+                cursor.to_string(),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])
+    } else {
+        Line::from(vec![label, Span::styled(text, body)])
     }
 }

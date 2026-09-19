@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 
+use ratatui::crossterm::event::KeyEvent;
 use ratatui::widgets::ListState;
 
 use crate::backend::{Chat, ChatId, Message, MessageAction, MessageId};
+use crate::tui::search::SearchState;
 
 pub mod chat_list;
 pub mod chat_widget;
@@ -24,6 +26,10 @@ pub struct ChatState {
     /// Selection state for the chat list.
     pub chat_list_state: ListState,
     pub chats: Vec<Chat>,
+    /// Reusable search/filter state for the chat list (matches by contact name).
+    /// Filtering happens on `chats` — the full source list — while the visible
+    /// view is selected through `SearchState::map_to_source`.
+    pub search: SearchState,
     /// responsible for keeping track of the actual visible page page on a chat
     pub visible_page: usize,
     /// The chat whose history is currently loaded, if any.
@@ -46,6 +52,117 @@ pub struct ChatState {
 }
 
 impl ChatState {
+    /// Enter chat-list search (insert mode) and live-filter on the query.
+    pub fn begin_search(&mut self) {
+        self.search.begin();
+        self.refresh_search();
+    }
+
+    /// Exit insert mode, keeping the current filter applied.
+    pub fn commit_search(&mut self) {
+        self.search.commit();
+        self.refresh_search();
+    }
+
+    /// Cancel chat-list search: drop the query and the filter. The selection is
+    /// restored to the chat that was selected just before the filter dropped
+    /// (derived while the filter is still applied, so the visible index still
+    /// maps to the right source chat).
+    pub fn clear_search(&mut self) {
+        let anchor = self
+            .selected_chat()
+            .map(|chat| chat.id.clone())
+            .or_else(|| search_anchor_id(self));
+
+        self.search.clear();
+        self.apply_search(anchor.as_ref());
+    }
+
+    /// Feed a key event to the search input and re-filter live.
+    pub fn search_input(&mut self, key: KeyEvent) {
+        self.search.input(key);
+        self.refresh_search();
+    }
+
+    /// Recompute the filtered view from the current query, keeping the
+    /// currently selected chat selected when it still matches (otherwise the
+    /// first match wins). Falls back to the remembered anchor when the current
+    /// selection was already cleared by an empty result set.
+    pub fn refresh_search(&mut self) {
+        let anchor = self
+            .selected_chat()
+            .map(|chat| chat.id.clone())
+            .or_else(|| search_anchor_id(self));
+        self.apply_search(anchor.as_ref());
+    }
+
+    /// Like [`ChatState::refresh_search`], but anchored on an explicit chat id
+    /// (used when the source list was just replaced).
+    pub fn refresh_search_with_id(&mut self, anchor: Option<ChatId>) {
+        let anchor = anchor.or_else(|| search_anchor_id(self));
+        self.apply_search(anchor.as_ref());
+    }
+
+    fn apply_search(&mut self, anchor: Option<&ChatId>) {
+        let needle = self.search.query_text().trim().to_lowercase();
+
+        if needle.is_empty() {
+            // Unfiltered view: never force a selection; restore the anchor if
+            // one is remembered (a full-list load keeps "nothing selected").
+            self.search.set_visible(Vec::new());
+            let anchor_id = anchor.cloned().or_else(|| search_anchor_id(self));
+            let selection = anchor_id
+                .as_ref()
+                .and_then(|id| self.chats.iter().position(|chat| chat.id == *id));
+            self.search.set_anchor(selection);
+            self.chat_list_state.select(selection);
+            return;
+        }
+
+        let indices: Vec<usize> = self
+            .chats
+            .iter()
+            .enumerate()
+            .filter(|(_, chat)| chat.contact_name.to_lowercase().contains(&needle))
+            .map(|(idx, _)| idx)
+            .collect();
+
+        // Keep the selected chat when it still matches, else jump to the first
+        // match. The resolved source index is remembered as the anchor so a
+        // cancelled search lands back on a useful chat.
+        let anchor_pos = anchor.and_then(|id| {
+            indices
+                .iter()
+                .position(|&idx| self.chats[idx].id == *id)
+        });
+        let selected_source = anchor_pos
+            .map(|pos| indices[pos])
+            .or_else(|| indices.first().copied());
+        let selection = selected_source.and_then(|src| indices.iter().position(|&idx| idx == src));
+
+        if selected_source.is_some() {
+            self.search.set_anchor(selected_source);
+        }
+
+        self.search.set_visible(indices);
+        self.chat_list_state.select(selection);
+    }
+
+    /// Resolve a visible chat-list index to its source index, dropping any active
+    /// search filter in the process (opening a chat is a decision: the filter
+    /// no longer applies). No-op when no filter is active.
+    pub fn resolve_open_index(&mut self, index: usize) -> Option<usize> {
+        let src = self.search.map_to_source(index)?;
+        self.clear_search();
+        Some(src)
+    }
+
+    /// Source indices of the currently visible chats, in display order.
+    /// Empty when unfiltered (the full list is on display).
+    pub fn visible_indices(&self) -> Vec<usize> {
+        self.search.indices().to_vec()
+    }
+
     fn deduplicate_chats(&mut self) {
         let mut seen = std::collections::HashSet::new();
         let mut duplicate_ids = Vec::new();
@@ -73,16 +190,13 @@ impl ChatState {
             None => None,
         }
     }
-    pub fn selected_chat_mut(&mut self) -> Option<&mut Chat> {
-        self.chat_list_state
-            .selected()
-            .and_then(move |sel| self.chats.get_mut(sel))
-    }
 
     pub fn selected_chat(&self) -> Option<&Chat> {
-        self.chat_list_state
+        let src = self
+            .chat_list_state
             .selected()
-            .and_then(|sel| self.chats.get(sel))
+            .and_then(|sel| self.search.map_to_source(sel))?;
+        self.chats.get(src)
     }
 
     pub fn is_open(&self, id: &ChatId) -> bool {
@@ -300,7 +414,10 @@ impl ChatState {
                 let selected = self.chats.iter().position(|item| item.id == selected_id);
                 self.chat_list_state.select(selected);
             }
+
             self.deduplicate_chats();
+            self.refresh_search();
+
             return true;
         }
 
@@ -312,7 +429,10 @@ impl ChatState {
             let selected = self.chats.iter().position(|item| item.id == selected_id);
             self.chat_list_state.select(selected);
         }
+
         self.deduplicate_chats();
+        self.refresh_search();
+
         true
     }
 
@@ -362,6 +482,8 @@ impl ChatState {
             self.chat_list_state
                 .select(self.chats.iter().position(|chat| chat.id == selected_id));
         }
+
+        self.refresh_search();
 
         before != self.chats
     }
@@ -503,8 +625,20 @@ impl ChatState {
     }
 }
 
+/// The id of the chat the search should land back on when its filter clears
+/// (the last source index the search selection resolved to).
+fn search_anchor_id(state: &ChatState) -> Option<ChatId> {
+    state
+        .search
+        .anchor_source()
+        .and_then(|src| state.chats.get(src))
+        .map(|chat| chat.id.clone())
+}
+
 #[cfg(test)]
 mod tests {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent};
+
     use crate::backend::Provider;
 
     use super::*;
@@ -536,6 +670,21 @@ mod tests {
             reply_ctx: None,
             pending: false,
             failed: false,
+        }
+    }
+
+    /// The chats the state would currently render (filtered or all), as the
+    /// production `draw_main` assembles them via `visible_indices`.
+    fn visible_chats(state: &ChatState) -> Vec<&Chat> {
+        if state.search.is_filtered() {
+            state
+                .search
+                .indices()
+                .iter()
+                .filter_map(|&idx| state.chats.get(idx))
+                .collect()
+        } else {
+            state.chats.iter().collect()
         }
     }
 
@@ -1196,5 +1345,172 @@ mod tests {
         });
 
         assert!(state.chats[0].verified);
+    }
+
+    #[test]
+    fn search_filters_by_case_insensitive_contact_name() {
+        let mut state = ChatState {
+            chats: vec![
+                chat(ChatId::Telegram(1), "Alice"),
+                chat(ChatId::Telegram(2), "Bob"),
+                chat(ChatId::Telegram(3), "alice in ops"),
+            ],
+            ..Default::default()
+        };
+
+        state.begin_search();
+        state.search_input(KeyEvent::from(KeyCode::Char('a')));
+
+        assert!(state.search.is_filtered());
+        assert!(state.search.is_inserting());
+        let names: Vec<&str> = visible_chats(&state)
+            .iter()
+            .map(|c| c.contact_name.as_str())
+            .collect();
+        assert_eq!(names, ["Alice", "alice in ops"]);
+    }
+
+    #[test]
+    fn search_keeps_selection_when_still_matching_and_falls_back_to_first() {
+        let mut state = ChatState {
+            chats: vec![
+                chat(ChatId::Telegram(1), "Alice"),
+                chat(ChatId::Telegram(2), "Bob"),
+                chat(ChatId::Telegram(3), "Charlie"),
+            ],
+            ..Default::default()
+        };
+        state.chat_list_state.select(Some(1));
+
+        state.begin_search();
+        state.search_input(KeyEvent::from(KeyCode::Char('b')));
+        assert_eq!(state.selected_chat().unwrap().contact_name, "Bob");
+
+        state.search_input(KeyEvent::from(KeyCode::Char('a')));
+        assert!(
+            state.selected_chat().is_none(),
+            "no match left after 'ba', selection clears"
+        );
+
+        state.search_input(KeyEvent::from(KeyCode::Backspace));
+        assert_eq!(
+            state.selected_chat().unwrap().contact_name,
+            "Bob",
+            "re-matching re-selects the previously selected chat"
+        );
+    }
+
+    #[test]
+    fn empty_query_after_backspace_shows_the_full_list() {
+        let mut state = ChatState {
+            chats: vec![
+                chat(ChatId::Telegram(1), "Alice"),
+                chat(ChatId::Telegram(2), "Bob"),
+                chat(ChatId::Telegram(3), "Charlie"),
+            ],
+            ..Default::default()
+        };
+
+        state.begin_search();
+        state.search_input(KeyEvent::from(KeyCode::Char('z')));
+        assert!(state.search.is_filtered());
+
+        state.search_input(KeyEvent::from(KeyCode::Backspace));
+        assert!(!state.search.is_filtered());
+        assert_eq!(visible_chats(&state).len(), state.chats.len());
+    }
+
+    #[test]
+    fn commit_keeps_the_filter_and_clear_restores_everything() {
+        let mut state = ChatState {
+            chats: vec![
+                chat(ChatId::Telegram(1), "Alice"),
+                chat(ChatId::Telegram(2), "Bob"),
+                chat(ChatId::Telegram(3), "Charlie"),
+            ],
+            ..Default::default()
+        };
+
+        state.begin_search();
+        state.search_input(KeyEvent::from(KeyCode::Char('e')));
+        state.commit_search();
+
+        assert!(!state.search.is_inserting());
+        assert!(state.search.is_filtered());
+        assert_eq!(visible_chats(&state).len(), 2);
+
+        state.clear_search();
+        assert!(!state.search.is_active());
+        assert_eq!(visible_chats(&state).len(), 3);
+    }
+
+    #[test]
+    fn selected_chat_maps_through_the_filtered_view() {
+        let mut state = ChatState {
+            chats: vec![
+                chat(ChatId::Telegram(1), "Alice"),
+                chat(ChatId::Telegram(2), "Bob"),
+                chat(ChatId::Telegram(3), "Aaron"),
+            ],
+            ..Default::default()
+        };
+
+        state.begin_search();
+        state.search_input(KeyEvent::from(KeyCode::Char('a')));
+
+        // Displayed order is the source order: Alice (0) then Aaron (2).
+        assert_eq!(visible_chats(&state).len(), 2);
+
+        state.chat_list_state.select(Some(1));
+        assert_eq!(state.selected_chat().unwrap().contact_name, "Aaron");
+        assert_eq!(
+            state.selected_chat().unwrap().id,
+            ChatId::Telegram(3),
+            "selection maps to the correct source chat"
+        );
+    }
+
+    #[test]
+    fn clear_search_preserves_the_previously_selected_chat() {
+        let mut state = ChatState {
+            chats: vec![
+                chat(ChatId::Telegram(1), "Alice"),
+                chat(ChatId::Telegram(2), "Bob"),
+                chat(ChatId::Telegram(3), "Charlie"),
+            ],
+            ..Default::default()
+        };
+        state.chat_list_state.select(Some(2));
+
+        state.begin_search();
+        state.search_input(KeyEvent::from(KeyCode::Char('Z'))); // no match
+        assert!(state.selected_chat().is_none());
+
+        state.clear_search();
+        assert_eq!(state.selected_chat().unwrap().contact_name, "Charlie");
+    }
+
+    #[test]
+    fn upsert_while_filtering_keeps_the_filter_consistent() {
+        let mut state = ChatState {
+            chats: vec![
+                chat(ChatId::Telegram(1), "Alice"),
+                chat(ChatId::Telegram(2), "Bob"),
+            ],
+            ..Default::default()
+        };
+
+        state.begin_search();
+        state.search_input(KeyEvent::from(KeyCode::Char('a')));
+        let before = visible_chats(&state).len();
+
+        state.upsert_chat(chat(ChatId::Telegram(3), "Zed"));
+
+        assert_eq!(
+            visible_chats(&state).len(),
+            before,
+            "a non-matching upsert must not change the filtered view"
+        );
+        assert!(state.search.is_filtered());
     }
 }
