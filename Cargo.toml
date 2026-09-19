@@ -1,6 +1,6 @@
 [package]
-name = "senders"
-version = "0.2.0"
+name = "sende-rs"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
