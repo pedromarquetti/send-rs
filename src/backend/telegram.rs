@@ -224,6 +224,15 @@ pub struct TelegramMessenger {
     shutdown: Arc<AtomicBool>,
     cancel_refresh: Arc<AtomicBool>,
     connection_lost: Arc<AtomicBool>,
+    /// Whether the provider is enabled in the config. A disabled messenger
+    /// never starts its update listener, so it makes no requests and emits no
+    /// `Disconnected`/`Status` events.
+    enabled: Arc<AtomicBool>,
+    /// The pool's `updates` receiver, kept here so the update listener can be
+    /// started lazily on the first [`Self::subscribe`] (mirroring WhatsApp's
+    /// lazy bot start). Holding it here also means an enabled-but-not-yet-started
+    /// messenger stays silent: no listener, no events.
+    updates: Arc<StdMutex<Option<mpsc::UnboundedReceiver<UpdatesLike>>>>,
 }
 
 impl TelegramMessenger {
@@ -231,11 +240,16 @@ impl TelegramMessenger {
     /// Spawns the pool runner in a background task.
     /// Does **not** attempt to log in – call [`Messenger::is_authenticated`]
     /// or [`Messenger::login`] afterwards.
+    ///
+    /// The update listener is started lazily on the first [`Self::subscribe`]
+    /// and only when `enabled`, so a configured-but-disabled account is retained
+    /// without making any network requests or emitting any events.
     pub async fn new(
         session_dir: PathBuf,
         api_id: u32,
         api_hash: &str,
         sync_update_state_secs: u64,
+        enabled: bool,
     ) -> Result<Self, BackendError> {
         let session_path = session_dir.join("tg_session.sqlite");
         let session = Arc::new(
@@ -271,9 +285,10 @@ impl TelegramMessenger {
             shutdown: Arc::new(AtomicBool::new(false)),
             cancel_refresh: Arc::new(AtomicBool::new(false)),
             connection_lost: Arc::new(AtomicBool::new(false)),
+            enabled: Arc::new(AtomicBool::new(enabled)),
+            updates: Arc::new(StdMutex::new(Some(updates))),
         };
 
-        messenger.spawn_update_listener(updates);
         Ok(messenger)
     }
 
@@ -290,7 +305,30 @@ impl TelegramMessenger {
         pool.updates
     }
 
-    // TODO: check if this should be called if telegram has credentials but is disabled
+    /// Start the update listener now if the provider is enabled and the
+    /// startup `updates` receiver has not been consumed yet. Mirrors WhatsApp's
+    /// lazy bot start: registering the first subscriber before the listener
+    /// runs guarantees the initial `Connected` event is never dropped by the
+    /// `broadcast` channel for a not-yet-registered receiver.
+    fn maybe_start_listener(&self) {
+        if !self.enabled.load(Ordering::SeqCst) {
+            return;
+        }
+
+        let updates = self.updates.lock().unwrap().take();
+        if let Some(updates) = updates {
+            self.spawn_update_listener(updates);
+        }
+    }
+
+    /// Reflect the configured enabled state on the messenger. A disabled
+    /// messenger never starts its listener (no requests, no events); enabling
+    /// it later starts the listener if it has not been started already.
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::SeqCst);
+        self.maybe_start_listener();
+    }
+
     fn spawn_update_listener(&self, updates: mpsc::UnboundedReceiver<UpdatesLike>) {
         const MAX_RECONNECT_ATTEMPTS: u32 = 5;
 
@@ -872,7 +910,7 @@ impl Messenger for TelegramMessenger {
     }
 
     async fn reconnect(&self) -> Result<(), BackendError> {
-        if self.shutdown.load(Ordering::SeqCst) {
+        if self.shutdown.load(Ordering::SeqCst) || !self.enabled.load(Ordering::SeqCst) {
             return Ok(());
         }
         if !self.connection_lost.swap(false, Ordering::SeqCst) {
@@ -1134,7 +1172,12 @@ impl Messenger for TelegramMessenger {
     }
 
     fn subscribe(&self) -> broadcast::Receiver<BackendEvent> {
-        self.tx.subscribe()
+        let receiver = self.tx.subscribe();
+        // Register the receiver above before starting the listener so the
+        // initial `Connected` event is delivered and not dropped by the
+        // `broadcast` channel having no subscribers yet.
+        self.maybe_start_listener();
+        receiver
     }
 
     async fn disconnect(&mut self) -> Result<(), BackendError> {
@@ -1275,5 +1318,65 @@ impl Messenger for TelegramMessenger {
             }
             _ => Err(BackendError::Other("unknown login step".into())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn test_messenger(enabled: bool) -> (TelegramMessenger, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "senders_tg_lazy_{}_{}",
+            std::process::id(),
+            std::thread::current()
+                .name()
+                .unwrap_or("")
+                .replace(':', "_")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let messenger = TelegramMessenger::new(
+            dir.clone(),
+            12345,
+            "0123456789abcdef0123456789abcdef",
+            1,
+            enabled,
+        )
+        .await
+        .expect("messenger constructs offline");
+        (messenger, dir)
+    }
+
+    fn updates_stored(messenger: &TelegramMessenger) -> bool {
+        messenger.updates.lock().unwrap().is_some()
+    }
+
+    #[tokio::test]
+    async fn listener_is_lazy_and_gated_on_enabled() {
+        let (messenger, dir) = test_messenger(false).await;
+
+        // Construction never starts the listener: the `updates` receiver stays
+        // parked in the messenger.
+        assert!(updates_stored(&messenger), "no eager listener");
+
+        // A disabled messenger that is subscribed to must not spawn the
+        // listener either (no requests, no events) — the receiver is kept.
+        let receiver = messenger.subscribe();
+        assert!(updates_stored(&messenger), "disabled subscribe stays inert");
+        drop(receiver);
+
+        // Enabling consumes the receiver exactly once and starts the listener;
+        // further enable calls are no-ops.
+        messenger.set_enabled(true);
+        assert!(
+            !updates_stored(&messenger),
+            "enabled subscribe starts listener"
+        );
+        messenger.set_enabled(true);
+        assert!(!updates_stored(&messenger), "listener started only once");
+
+        messenger.shutdown.store(true, Ordering::SeqCst);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

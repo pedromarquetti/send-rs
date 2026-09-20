@@ -845,8 +845,14 @@ impl AppState {
                     w.start();
                     m
                 }
-
-                _ => m,
+                MessengerKind::Telegram(t) => {
+                    // A configured-but-disabled messenger has no running
+                    // listener; enabling it kicks one off so updates flow.
+                    t.set_enabled(true);
+                    m
+                }
+                #[cfg(test)]
+                MessengerKind::Stub(_) => m,
             },
             None => {
                 self.create_popup(PopupKind::Error(format!(
