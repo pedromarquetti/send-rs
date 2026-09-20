@@ -70,6 +70,7 @@ pub struct KeymapConfig {
     pub scroll_to_bottom: String,
     pub send: String,
     pub newline: String,
+    pub retry_connection: String,
 }
 
 impl Default for KeymapConfig {
@@ -88,6 +89,7 @@ impl Default for KeymapConfig {
             scroll_to_bottom: "G".into(),
             send: "enter".into(),
             newline: "shift+enter".into(),
+            retry_connection: "r".into(),
         }
     }
 }
@@ -108,6 +110,7 @@ impl KeymapConfig {
             scroll_to_bottom: parse_key(&self.scroll_to_bottom)?,
             send: parse_key(&self.send)?,
             newline: parse_key(&self.newline)?,
+            retry_connection: parse_key(&self.retry_connection)?,
         })
     }
 }
@@ -131,6 +134,9 @@ pub struct Keymap {
     /// Enter (with a modifier) also inserts a newline; this key is honored if the terminal
     /// reports it (e.g. Shift+Enter on kitty-protocol terminals).
     pub newline: KeyEvent,
+    /// Manually force a reconnection after a provider entered the
+    /// "connection lost" state.
+    pub retry_connection: KeyEvent,
 }
 
 impl Config {
@@ -313,6 +319,10 @@ mod tests {
             keymap.scroll_to_bottom,
             KeyEvent::new(KeyCode::Char('g'), KeyModifiers::SHIFT)
         );
+        assert_eq!(
+            keymap.retry_connection,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)
+        );
     }
 
     #[test]
@@ -349,5 +359,15 @@ mod tests {
         assert!(!config.providers.telegram.enabled);
         assert!(config.providers.whatsapp);
         assert_eq!(config.max_write_lines, 5);
+    }
+
+    #[test]
+    fn partial_keys_fall_back_for_new_actions() {
+        // A config written before `retry_connection` existed must still load
+        // and pick up the default binding for the new action.
+        let raw = "[keys]\nsearch_text = \"s\"\n";
+        let config: Config = toml::from_str(raw).unwrap();
+        assert_eq!(config.keys.search_text, "s");
+        assert_eq!(config.keys.retry_connection, "r");
     }
 }

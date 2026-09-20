@@ -213,11 +213,19 @@ async fn run_app(
 
     chatlist_sync_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
+    let mut status_clock = tokio::time::interval(Duration::from_secs(1));
+    status_clock.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
     loop {
         terminal.draw(|frame| app.draw(frame))?;
 
         tokio::select! {
             biased;
+
+            // Wakes the loop every second so the live flood-wait countdown and
+            // reconnect hint re-render without needing an input or a backend
+            // event to drive the redraw.
+            _ = status_clock.tick() => {}
 
             _ = chat_poll_interval.tick() => {
                 let chat_id = match app.state.chat_state.open_chat.as_ref() {
@@ -603,7 +611,32 @@ impl App {
     async fn handle_main_key(&mut self, key: KeyEvent) {
         let km = self.state.keymap.clone();
         let searching = self.state.chat_list_search_active() || self.state.message_search_active();
-        let typing_search = self.state.chat_list_search_typing() || self.state.message_search_typing();
+        let typing_search =
+            self.state.chat_list_search_typing() || self.state.message_search_typing();
+
+        // Esc while a flood-wait countdown is active cancels the in-flight
+        // refresh and defers it to the next chat-list sync tick, instead of
+        // cycling focus like a regular dismiss.
+        if key == km.dismiss
+            && !searching
+            && !typing_search
+            && self.state.rate_limit.is_some()
+            && self.state.cancel_rate_limit_wait().await
+        {
+            return;
+        }
+
+        // Manually force a reconnection after a provider entered the
+        // "connection lost" state. No-op for providers without a persistent
+        // transport or when no reconnect is pending.
+        if key == km.retry_connection && !typing_search {
+            if let Some(messenger) = self.state.provider_to_messenger(Provider::Telegram)
+                && let Err(e) = messenger.reconnect().await
+            {
+                warn!(error = %e, "Manual reconnect failed");
+            }
+            return;
+        }
 
         // While an active chat-list search is showing, Esc is handled inside the
         // ChatList branch (cancel the search) instead of cycling focus.
@@ -1011,7 +1044,7 @@ impl App {
             .selected_chat()
             .map(|c| c.contact_name.clone());
 
-        StatusBarWidget::new(name, self.state.focus, self.state.backend_status.clone())
+        StatusBarWidget::new(name, self.state.focus, self.state.status_hint())
             .render(vertical[1], frame.buffer_mut());
 
         if let Some(open) = &self.state.chat_state.open_chat {

@@ -318,6 +318,15 @@ pub struct Message {
 pub enum BackendEvent {
     Connected,
     Disconnected(String),
+    /// Provider became rate limited; `retry_after_secs` is the wait before the
+    /// next attempt. Emitted once per flood-wait onset; the TUI renders a live
+    /// countdown from the deadline instead of a one-shot status string.
+    RateLimited {
+        retry_after_secs: u64,
+    },
+    /// The provider's session was revoked/expired/invalidated. The TUI disables
+    /// the provider and lets the user re-login manually.
+    AuthInvalid(String),
     Status(String),
     MessageReceived(Message),
     MessageUpdated(Message),
@@ -443,6 +452,15 @@ pub trait Messenger: Send + Sync {
     /// The default is `None`; a provider may fill this in later without changing the UI contract.
     async fn status(&self, _chat: &ChatId) -> Result<Option<String>, BackendError> {
         Ok(None)
+    }
+    /// Abort an in-flight chat-list refresh (e.g. a flood-wait the user wants to
+    /// defer to the next sync tick). The provider aborts the wait early so the
+    /// refresh finishes promptly instead of sleeping out the full backoff.
+    async fn cancel_chat_refresh(&self) {}
+    /// Force the transport to reconnect after entering a "connection lost"
+    /// state. Default is a no-op for providers without a persistent transport.
+    async fn reconnect(&self) -> Result<(), BackendError> {
+        Ok(())
     }
     /// Graceful shutdown: flush pending work, close transport, stop background tasks.
     async fn disconnect(&mut self) -> Result<(), BackendError>;
@@ -576,6 +594,8 @@ impl MessengerKind {
         , async fn edit(&self, chat: &ChatId, id: &MessageId, text: &str) -> Result<(), BackendError> ;
         , fn subscribe(&self) -> broadcast::Receiver<BackendEvent> ;
         , async fn status(&self, chat: &ChatId) -> Result<Option<String>, BackendError> ;
+        , async fn cancel_chat_refresh(&self) -> () ;
+        , async fn reconnect(&self) -> Result<(), BackendError> ;
         , async fn disconnect(&mut self) -> Result<(), BackendError> ;
         , async fn login(&mut self) -> Result<(), BackendError> ;
         , async fn logout(&mut self) -> Result<(), BackendError> ;

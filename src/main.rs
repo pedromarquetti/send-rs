@@ -71,6 +71,7 @@ async fn main() -> Result<()> {
                 telegram.api_id,
                 &telegram.api_hash,
                 config.sync_update_state_secs,
+                telegram.enabled,
             )
             .await
             {

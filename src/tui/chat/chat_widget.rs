@@ -327,10 +327,7 @@ fn message_lines(
 
             any_truncated = first_chunks.iter().any(|c| c.ends_with('…'));
             if let Some((first_chunk, rest)) = first_chunks.split_first() {
-                let mut spans = vec![
-                    Span::styled(head.clone(), header_style),
-                    Span::raw("  "),
-                ];
+                let mut spans = vec![Span::styled(head.clone(), header_style), Span::raw("  ")];
                 spans.extend(body_spans(first_chunk, needle, body_style));
                 result.push(Line::from(spans));
                 for chunk in rest {
@@ -405,11 +402,7 @@ fn body_spans(text: &str, needle: Option<&str>, style: Style) -> Vec<Span<'stati
 
     while i < chars.len() {
         let is_match = i + len <= chars.len()
-            && chars[i..i + len]
-                .iter()
-                .collect::<String>()
-                .to_lowercase()
-                == needle;
+            && chars[i..i + len].iter().collect::<String>().to_lowercase() == needle;
 
         if is_match {
             let matched: String = chars[i..i + len].iter().collect();
