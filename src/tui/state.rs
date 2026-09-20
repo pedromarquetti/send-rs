@@ -3,6 +3,7 @@ use ratatui::style::{Color, Style};
 use ratatui::widgets::ListState;
 use ratatui_textarea::{TextArea, WrapMode};
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use crate::backend::{
     BackendError, BackendEvent, Chat, ChatId, LoginStepState, Message, MessageId, MessengerKind,
@@ -71,6 +72,14 @@ pub struct AppState {
     pub chatlist_sync_pending: usize,
     pub backend_status: Option<String>,
     pub retry_draft: Option<RetryDraft>,
+
+    /// Set while a provider is flood-waiting; the deadline drives the live
+    /// countdown in the status bar.
+    pub rate_limit: Option<(Provider, Instant)>,
+
+    /// Providers whose transport has successfully connected at least once.
+    /// Drives the persistent disconnected indicator in the status bar.
+    pub provider_connected: HashSet<Provider>,
 }
 
 pub struct LoginState {
@@ -134,6 +143,8 @@ impl AppState {
             chatlist_sync_pending: 0,
             backend_status: None,
             retry_draft: None,
+            rate_limit: None,
+            provider_connected: HashSet::new(),
         };
 
         if let Ok(chat_cache) = Config::load_chats() {
@@ -228,10 +239,7 @@ impl AppState {
         self.chat_state.chats = chat_list;
         self.chat_state.sort_pinned_then_recent();
         self.chat_state.refresh_search_with_id(selected_id);
-        debug!(
-            total = self.chat_state.chats.len(),
-            "Chat list applied"
-        );
+        debug!(total = self.chat_state.chats.len(), "Chat list applied");
     }
 
     pub async fn rebuild_chats(&mut self) -> Vec<BackendError> {
@@ -735,6 +743,53 @@ impl AppState {
             .find(|m| m.provider() == provider)
     }
 
+    /// Status-line text rendered under the chat list. Precedence: live
+    /// flood-wait countdown > transient backend status > persistent
+    /// disconnect/connection-lost hint.
+    pub fn status_hint(&self) -> Option<String> {
+        if let Some((provider, until)) = self.rate_limit {
+            let remaining = until.saturating_duration_since(Instant::now());
+            if !remaining.is_zero() {
+                return Some(format!(
+                    "{} rate limited — retry in {}s",
+                    provider.name(),
+                    remaining.as_secs().max(1)
+                ));
+            }
+        }
+
+        if let Some(status) = self
+            .backend_status
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            return Some(status.to_string());
+        }
+
+        for provider in Provider::all() {
+            if provider.is_enabled(&self.config.providers)
+                && !self.provider_connected.contains(provider)
+            {
+                return Some(format!("{} disconnected — reconnecting", provider.name()));
+            }
+        }
+
+        None
+    }
+
+    /// Abort an in-flight flood-wait chat refresh, deferring the retry to the
+    /// next chat-list sync tick. Returns whether a countdown was active.
+    pub async fn cancel_rate_limit_wait(&mut self) -> bool {
+        let Some((provider, _)) = self.rate_limit.take() else {
+            return false;
+        };
+
+        if let Some(messenger) = self.provider_to_messenger(provider) {
+            messenger.cancel_chat_refresh().await;
+        }
+        true
+    }
+
     pub async fn toggle_provider(&mut self, provider: Provider) {
         let name = provider.name();
 
@@ -988,6 +1043,9 @@ impl AppState {
         match event {
             BackendEvent::Connected => {
                 info!(?provider, "Backend connected");
+                self.provider_connected.insert(provider);
+                self.rate_limit = None;
+                self.backend_status = None;
 
                 // A newly authenticated provider becomes usable: close any
                 // active pairing/login screen and enable it in config. The
@@ -1004,8 +1062,6 @@ impl AppState {
                         self.screen = Screen::Main;
                     }
 
-                    self.backend_status = None;
-
                     if !provider.is_enabled(&self.config.providers) {
                         provider.toggle_enabled(&mut self.config.providers);
 
@@ -1016,12 +1072,60 @@ impl AppState {
                     }
                 }
             }
+            BackendEvent::RateLimited { retry_after_secs } => {
+                warn!(?provider, retry_after_secs, "Provider rate limited");
+                self.rate_limit = Some((
+                    provider,
+                    Instant::now() + std::time::Duration::from_secs(retry_after_secs),
+                ));
+            }
+            BackendEvent::AuthInvalid(reason) => {
+                error!(?provider, reason, "Provider session invalid");
+
+                if provider == Provider::Telegram {
+                    self.provider_connected.remove(&provider);
+
+                    if provider.is_enabled(&self.config.providers) {
+                        provider.toggle_enabled(&mut self.config.providers);
+
+                        if let Err(e) = self.config.save_config() {
+                            self.create_popup(PopupKind::Error(format!(
+                                "could not save config: {e}"
+                            )));
+                        }
+                    }
+
+                    // The provider is gone for good until the user re-logs in;
+                    // prune its chats so the list does not show a dead provider.
+                    self.chat_state
+                        .chats
+                        .retain(|c| c.id.to_provider() != provider);
+                    self.chat_state.refresh_search();
+
+                    if let Some(open) = self.chat_state.open_chat.as_mut()
+                        && open.chat.id.to_provider() == provider
+                    {
+                        self.chat_state.open_chat = None;
+                    }
+
+                    self.persist_chats();
+
+                    self.create_popup(PopupKind::Error(format!(
+                        "Telegram session invalid or revoked — re-enable Telegram in \
+                         Settings to log in again. ({reason})"
+                    )));
+                }
+            }
             BackendEvent::Status(status) => {
                 // TODO: make this auto dissapear
+                if status.is_empty() {
+                    self.rate_limit = None;
+                }
                 self.backend_status = (!status.is_empty()).then_some(status);
             }
             BackendEvent::Disconnected(message) => {
                 warn!(message, "Backend disconnected");
+                self.provider_connected.remove(&provider);
                 self.create_popup(PopupKind::Error(message));
             }
             BackendEvent::QrCode(code) => {
@@ -1771,13 +1875,22 @@ mod tests {
         ]);
 
         state.chat_state.begin_search();
-        state.chat_state.search_input(KeyEvent::from(KeyCode::Char('b')));
+        state
+            .chat_state
+            .search_input(KeyEvent::from(KeyCode::Char('b')));
         state.chat_state.commit_search();
 
         assert!(state.chat_list_search_active());
-        assert_eq!(state.chat_state.visible_indices().len(), 1, "only Bob matches");
         assert_eq!(
-            state.chat_state.selected_chat().map(|c| c.contact_name.as_str()),
+            state.chat_state.visible_indices().len(),
+            1,
+            "only Bob matches"
+        );
+        assert_eq!(
+            state
+                .chat_state
+                .selected_chat()
+                .map(|c| c.contact_name.as_str()),
             Some("Bob")
         );
 
@@ -1799,7 +1912,10 @@ mod tests {
             "opened chat re-selected by id after the filter drops"
         );
         assert_eq!(
-            state.chat_state.selected_chat().map(|c| c.contact_name.as_str()),
+            state
+                .chat_state
+                .selected_chat()
+                .map(|c| c.contact_name.as_str()),
             Some("Bob")
         );
     }
@@ -2439,6 +2555,7 @@ mod tests {
         send_result: std::sync::Mutex<Option<Result<(), BackendError>>>,
         history_result: std::sync::Mutex<Option<Result<Vec<Message>, BackendError>>>,
         set_read_result: std::sync::Mutex<Option<Result<(), BackendError>>>,
+        cancel_refresh_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         tx: broadcast::Sender<BackendEvent>,
     }
 
@@ -2451,6 +2568,7 @@ mod tests {
                 send_result: std::sync::Mutex::new(None),
                 history_result: std::sync::Mutex::new(None),
                 set_read_result: std::sync::Mutex::new(None),
+                cancel_refresh_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 tx,
             }
         }
@@ -2561,6 +2679,11 @@ mod tests {
 
         fn subscribe(&self) -> broadcast::Receiver<BackendEvent> {
             self.tx.subscribe()
+        }
+
+        async fn cancel_chat_refresh(&self) {
+            self.cancel_refresh_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
 
         async fn disconnect(&mut self) -> Result<(), BackendError> {
@@ -2947,9 +3070,7 @@ mod tests {
             }],
             has_more_history: true,
         });
-        state
-            .chat_state
-            .begin_message_search();
+        state.chat_state.begin_message_search();
         assert!(state.chat_state.message_search.is_active());
 
         // Opening a chat (as Enter on the chat list does) drops the search
@@ -2998,7 +3119,10 @@ mod tests {
         assert_eq!(state.chat_state.search.indices(), &[0, 2, 3]);
 
         state.chat_state.chat_list_state.select(Some(1));
-        assert_eq!(state.chat_state.selected_chat().unwrap().contact_name, "carol");
+        assert_eq!(
+            state.chat_state.selected_chat().unwrap().contact_name,
+            "carol"
+        );
 
         // The open chat's poll returns a newer message for "dave", bumping it
         // to the top and reordering the source list behind the committed filter.
@@ -3026,5 +3150,113 @@ mod tests {
             Some(ChatId::Telegram(3)),
             "the poll-triggered reorder must keep the filtered selection on carol"
         );
+    }
+
+    #[tokio::test]
+    async fn rate_limited_event_shows_countdown_and_esc_cancels() {
+        let stub = StubMessenger::new("Telegram");
+        let cancel_calls = stub.cancel_refresh_calls.clone();
+        let mut config = Config::default();
+        config.providers.telegram.enabled = true;
+        let keymap = config.keys.parse().unwrap();
+        let mut state = AppState::new(
+            config,
+            keymap,
+            vec![MessengerKind::Stub(Box::new(stub))],
+            false,
+        )
+        .await;
+
+        // An enabled provider that has not connected yet gets the persistent
+        // disconnect hint rather than a blank status line.
+        let initial = state.status_hint().expect("initial disconnect hint");
+        assert!(initial.contains("Telegram disconnected"), "{initial}");
+
+        state.handle_backend_event(Provider::Telegram, BackendEvent::Connected);
+        assert!(state.status_hint().is_none());
+
+        state.handle_backend_event(
+            Provider::Telegram,
+            BackendEvent::RateLimited {
+                retry_after_secs: 30,
+            },
+        );
+        let hint = state.status_hint().expect("rate-limit countdown hint");
+        assert!(hint.contains("Telegram rate limited"), "{hint}");
+        let remainder = hint
+            .strip_prefix("Telegram rate limited — retry in ")
+            .expect("countdown prefix");
+        let secs: u64 = remainder
+            .strip_suffix('s')
+            .expect("countdown suffix")
+            .parse()
+            .expect("countdown is numeric");
+        assert!((1..=30).contains(&secs), "unexpected countdown: {hint}");
+
+        assert!(state.cancel_rate_limit_wait().await);
+        assert!(state.rate_limit.is_none());
+        assert_eq!(cancel_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(state.status_hint().is_none());
+    }
+
+    #[tokio::test]
+    async fn rate_limit_wait_is_not_cancelled_when_inactive() {
+        let stub = StubMessenger::new("Telegram");
+        let cancel_calls = stub.cancel_refresh_calls.clone();
+        let mut config = Config::default();
+        config.providers.telegram.enabled = true;
+        let keymap = config.keys.parse().unwrap();
+        let mut state = AppState::new(
+            config,
+            keymap,
+            vec![MessengerKind::Stub(Box::new(stub))],
+            false,
+        )
+        .await;
+
+        assert!(!state.cancel_rate_limit_wait().await);
+        assert_eq!(cancel_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn auth_invalid_disables_telegram_and_prunes_its_chats() {
+        let mut config = Config::default();
+        config.providers.telegram.enabled = true;
+        let keymap = config.keys.parse().unwrap();
+        let mock = MockMessenger::new("Telegram");
+        let mut state = AppState::new(
+            config,
+            keymap,
+            vec![MessengerKind::Stub(Box::new(mock))],
+            false,
+        )
+        .await;
+        fetch_and_apply(&mut state).await;
+        assert!(!state.chat_state.chats.is_empty());
+        assert!(state.config.providers.telegram.enabled);
+
+        state.handle_backend_event(
+            Provider::Telegram,
+            BackendEvent::AuthInvalid("session revoked".into()),
+        );
+
+        assert!(
+            !state.config.providers.telegram.enabled,
+            "Telegram should be disabled after AuthInvalid"
+        );
+        assert!(
+            state.chat_state.chats.is_empty(),
+            "Telegram chats should be pruned after AuthInvalid"
+        );
+        let popup = state.pop_up.as_ref().expect("AuthInvalid popup");
+        match &popup.popup_type {
+            PopupKind::Error(msg) => {
+                assert!(
+                    msg.contains("session invalid or revoked"),
+                    "unexpected popup text: {msg}"
+                );
+            }
+            other => panic!("expected Error popup, got {other:?}"),
+        }
     }
 }

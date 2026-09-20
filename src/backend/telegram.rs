@@ -222,6 +222,8 @@ pub struct TelegramMessenger {
     flood_wait_until: Arc<Mutex<Option<Instant>>>,
     sync_update_state_secs: u64,
     shutdown: Arc<AtomicBool>,
+    cancel_refresh: Arc<AtomicBool>,
+    connection_lost: Arc<AtomicBool>,
 }
 
 impl TelegramMessenger {
@@ -267,6 +269,8 @@ impl TelegramMessenger {
             flood_wait_until: Arc::new(Mutex::new(None)),
             sync_update_state_secs,
             shutdown: Arc::new(AtomicBool::new(false)),
+            cancel_refresh: Arc::new(AtomicBool::new(false)),
+            connection_lost: Arc::new(AtomicBool::new(false)),
         };
 
         messenger.spawn_update_listener(updates);
@@ -288,13 +292,9 @@ impl TelegramMessenger {
 
     // TODO: check if this should be called if telegram has credentials but is disabled
     fn spawn_update_listener(&self, updates: mpsc::UnboundedReceiver<UpdatesLike>) {
-        let client = self.client.clone();
-        let tx = self.tx.clone();
-        let sync_secs = self.sync_update_state_secs;
-        let cached_chats = self.cached_chats.clone();
-        let shutdown = self.shutdown.clone();
-        let session = self.session.clone();
-        let api_id = self.api_id;
+        const MAX_RECONNECT_ATTEMPTS: u32 = 5;
+
+        let telegram = self.clone();
 
         tokio::spawn(async move {
             let mut current_updates = Some(updates);
@@ -305,11 +305,11 @@ impl TelegramMessenger {
                     break;
                 };
 
-                if shutdown.load(Ordering::SeqCst) {
+                if telegram.shutdown.load(Ordering::SeqCst) {
                     break;
                 }
 
-                let current_client = client.read().await.clone();
+                let current_client = telegram.current_client().await;
 
                 let config = UpdatesConfiguration {
                     catch_up: false,
@@ -321,34 +321,43 @@ impl TelegramMessenger {
                     Err(e) => {
                         let reason = format!("Telegram update stream failed to start: {e}");
                         warn!(reason);
-                        let _ = tx.send(BackendEvent::Disconnected(reason.clone()));
-                        let delay = Self::reconnect_delay(
-                            &reason,
-                            reconnect_attempt,
-                            !current_client.is_authorized().await.unwrap_or(false),
-                        );
+                        let _ = telegram.tx.send(BackendEvent::Disconnected(reason.clone()));
+                        let Some(delay) = telegram
+                            .handle_stream_failure(
+                                &reason,
+                                reconnect_attempt,
+                                !current_client.is_authorized().await.unwrap_or(false),
+                                MAX_RECONNECT_ATTEMPTS,
+                            )
+                            .await
+                        else {
+                            break;
+                        };
                         reconnect_attempt += 1;
-                        if shutdown.load(Ordering::SeqCst) || delay.is_zero() {
+                        if telegram.shutdown.load(Ordering::SeqCst) || delay.is_zero() {
                             break;
                         }
                         tokio::time::sleep(delay).await;
-                        current_updates =
-                            Some(Self::new_updates_receiver(&session, api_id, &client).await);
+                        current_updates = Some(telegram.replace_client_with_new_pool().await);
                         continue;
                     }
                 };
 
-                let _ = tx.send(BackendEvent::Connected);
+                telegram.connection_lost.store(false, Ordering::SeqCst);
+                reconnect_attempt = 0;
+                let _ = telegram.tx.send(BackendEvent::Connected);
+                telegram.clear_status();
 
                 info!("Telegram update stream started");
 
                 let mut own_chat = self_user_id(&current_client).await;
-                let mut sync_interval =
-                    tokio::time::interval(std::time::Duration::from_secs(sync_secs));
+                let mut sync_interval = tokio::time::interval(std::time::Duration::from_secs(
+                    telegram.sync_update_state_secs,
+                ));
                 let mut stream_reason = None;
 
                 loop {
-                    if shutdown.load(Ordering::SeqCst) {
+                    if telegram.shutdown.load(Ordering::SeqCst) {
                         if let Err(e) = stream.sync_update_state().await {
                             error!("Failed to sync update state before shutdown: {e}");
                         }
@@ -405,11 +414,11 @@ impl TelegramMessenger {
                                         );
 
                                         let last_message_ts = msg.date().timestamp();
-                                        let _ = tx.send(BackendEvent::MessageReceived(message.clone()));
+                                        let _ = telegram.tx.send(BackendEvent::MessageReceived(message.clone()));
 
-                                        *cached_chats.lock().await = None;
+                                        *telegram.cached_chats.lock().await = None;
 
-                                        let _ = tx.send(BackendEvent::ChatUpdated(Chat {
+                                        let _ = telegram.tx.send(BackendEvent::ChatUpdated(Chat {
                                             id: chat_id,
                                             contact_name: pretty_peer_name(&msg, &sender),
                                             last_message_ts: Some(last_message_ts),
@@ -441,9 +450,9 @@ impl TelegramMessenger {
                                             false,
                                         );
 
-                                        let _ = tx.send(BackendEvent::MessageUpdated(message));
+                                        let _ = telegram.tx.send(BackendEvent::MessageUpdated(message));
 
-                                        *cached_chats.lock().await = None;
+                                        *telegram.cached_chats.lock().await = None;
 
                                         debug!(
                                             chat_id = ?chat_id,
@@ -464,9 +473,9 @@ impl TelegramMessenger {
                                         }
 
                                         debug!(chat = ?chat, ids = message_ids.len(), "MessageDeleted");
-                                        let _ = tx.send(BackendEvent::MessageDeleted { chat, message_ids });
+                                        let _ = telegram.tx.send(BackendEvent::MessageDeleted { chat, message_ids });
 
-                                        *cached_chats.lock().await = None;
+                                        *telegram.cached_chats.lock().await = None;
                                     }
                                     Update::Raw(raw) => {
                                         if let tl::enums::Update::UserStatus(ref u) = *raw {
@@ -477,7 +486,7 @@ impl TelegramMessenger {
                                                 status = ?status,
                                                 "UserStatus update"
                                             );
-                                            let _ = tx.send(BackendEvent::ChatUpdated(Chat {
+                                            let _ = telegram.tx.send(BackendEvent::ChatUpdated(Chat {
                                                 id: chat_id,
                                                 contact_name: String::new(),
                                                 last_message_ts: None,
@@ -502,13 +511,13 @@ impl TelegramMessenger {
                                                 max_id = u.max_id,
                                                 "ReadHistoryInbox"
                                             );
-                                            let _ = tx.send(BackendEvent::UnreadUpdated {
+                                            let _ = telegram.tx.send(BackendEvent::UnreadUpdated {
                                                 chat: chat_id,
                                                 unread: u.still_unread_count > 0,
                                                 unread_count: u.still_unread_count,
                                             });
 
-                                            *cached_chats.lock().await = None;
+                                            *telegram.cached_chats.lock().await = None;
                                         } else if let tl::enums::Update::ReadChannelInbox(ref u) = *raw {
                                             let chat_id = ChatId::Telegram(u.channel_id);
                                             debug!(
@@ -517,13 +526,13 @@ impl TelegramMessenger {
                                                 max_id = u.max_id,
                                                 "ReadChannelInbox"
                                             );
-                                            let _ = tx.send(BackendEvent::UnreadUpdated {
+                                            let _ = telegram.tx.send(BackendEvent::UnreadUpdated {
                                                 chat: chat_id,
                                                 unread: u.still_unread_count > 0,
                                                 unread_count: u.still_unread_count,
                                             });
 
-                                            *cached_chats.lock().await = None;
+                                            *telegram.cached_chats.lock().await = None;
                                         } else {
                                             debug!("Telegram update (unhandled): {raw:?}");
                                         }
@@ -536,7 +545,7 @@ impl TelegramMessenger {
                                     if let Err(sync_err) = stream.sync_update_state().await {
                                         error!("Failed to sync update state before reconnect: {sync_err}");
                                     }
-                                    let _ = tx.send(BackendEvent::Disconnected(reason));
+                                    let _ = telegram.tx.send(BackendEvent::Disconnected(reason));
                                     break;
                                 }
                             }
@@ -544,7 +553,7 @@ impl TelegramMessenger {
                     }
                 }
 
-                if shutdown.load(Ordering::SeqCst) {
+                if telegram.shutdown.load(Ordering::SeqCst) {
                     break;
                 }
 
@@ -552,11 +561,17 @@ impl TelegramMessenger {
                     break;
                 };
 
-                let delay = Self::reconnect_delay(
-                    &reason,
-                    reconnect_attempt,
-                    !current_client.is_authorized().await.unwrap_or(false),
-                );
+                let Some(delay) = telegram
+                    .handle_stream_failure(
+                        &reason,
+                        reconnect_attempt,
+                        !current_client.is_authorized().await.unwrap_or(false),
+                        MAX_RECONNECT_ATTEMPTS,
+                    )
+                    .await
+                else {
+                    break;
+                };
 
                 reconnect_attempt += 1;
 
@@ -566,13 +581,66 @@ impl TelegramMessenger {
 
                 tokio::time::sleep(delay).await;
 
-                if shutdown.load(Ordering::SeqCst) {
+                if telegram.shutdown.load(Ordering::SeqCst) {
                     break;
                 }
 
-                current_updates = Some(Self::new_updates_receiver(&session, api_id, &client).await);
+                current_updates = Some(telegram.replace_client_with_new_pool().await);
             }
         });
+    }
+
+    /// React to an update-stream failure.
+    ///
+    /// Returns `Some(delay)` when the listener should sleep and then retry with a
+    /// fresh client pool, and `None` when the listener is done: shutdown /
+    /// irrecoverable, a session that is no longer valid, or the bounded reconnect
+    /// window was exhausted (the TUI shows a "connection lost" state and the user
+    /// can press the retry key to [`TelegramMessenger::reconnect`]).
+    async fn handle_stream_failure(
+        &self,
+        reason: &str,
+        reconnect_attempt: u32,
+        unauthenticated: bool,
+        max_attempts: u32,
+    ) -> Option<Duration> {
+        if Self::is_session_invalid(reason, unauthenticated) {
+            self.connection_lost.store(true, Ordering::SeqCst);
+            let _ = self.tx.send(BackendEvent::AuthInvalid(reason.to_string()));
+            return None;
+        }
+
+        if reconnect_attempt >= max_attempts {
+            self.connection_lost.store(true, Ordering::SeqCst);
+            let _ = self
+                .tx
+                .send(BackendEvent::Status("Telegram connection lost".to_string()));
+            return None;
+        }
+
+        self.connection_lost.store(false, Ordering::SeqCst);
+        let delay = Self::reconnect_delay(reason, reconnect_attempt, unauthenticated);
+        if delay.is_zero() {
+            return None;
+        }
+        let _ = self.tx.send(BackendEvent::Status(format!(
+            "Telegram disconnected — reconnecting in {}s",
+            delay.as_secs()
+        )));
+        Some(delay)
+    }
+
+    fn is_session_invalid(reason: &str, unauthenticated: bool) -> bool {
+        let lowercase = reason.to_ascii_lowercase();
+        lowercase.contains("not authenticated")
+            || lowercase.contains("session_password_needed")
+            || lowercase.contains("session_revoked")
+            || lowercase.contains("session_invalid")
+            || lowercase.contains("auth_key_unregistered")
+            || lowercase.contains("auth_key_invalid")
+            || lowercase.contains("invalid session")
+            || lowercase.contains("invalid auth")
+            || unauthenticated
     }
 
     fn reconnect_delay(reason: &str, attempt: u32, unauthenticated: bool) -> Duration {
@@ -589,34 +657,12 @@ impl TelegramMessenger {
             return Duration::from_secs(30);
         }
 
-        if lowercase.contains("not authenticated")
-            || lowercase.contains("session_password_needed")
-            || lowercase.contains("session_revoked")
-            || lowercase.contains("session_invalid")
-            || lowercase.contains("auth_key_unregistered")
-            || lowercase.contains("auth_key_invalid")
-            || lowercase.contains("invalid session")
-            || lowercase.contains("invalid auth")
-            || unauthenticated
-        {
+        if Self::is_session_invalid(reason, unauthenticated) {
             return Duration::from_secs(30);
         }
 
         let backoff = 1u32 << attempt.min(5);
         Duration::from_secs(backoff.min(30) as u64)
-    }
-
-    async fn new_updates_receiver(
-        session: &Arc<SqliteSession>,
-        api_id: u32,
-        client: &Arc<RwLock<Client>>,
-    ) -> mpsc::UnboundedReceiver<UpdatesLike> {
-        let pool = SenderPool::new(Arc::clone(session), api_id as i32);
-        let runner = pool.runner;
-        tokio::spawn(async move { runner.run().await });
-        let next_client = Client::new(pool.handle);
-        *client.write().await = next_client;
-        pool.updates
     }
 
     // BUG: this is not auto updating, add to tokio refresh maybe?
@@ -723,12 +769,29 @@ impl TelegramMessenger {
         Ok(chats)
     }
 
-    fn report_status(&self, status: String) {
-        let _ = self.tx.send(BackendEvent::Status(status));
-    }
-
     fn clear_status(&self) {
         let _ = self.tx.send(BackendEvent::Status(String::new()));
+    }
+
+    /// Sleep for `wait`, checking the cancellation flag so an in-flight refresh
+    /// aborts promptly when the user presses the cancel key. Returns
+    /// `Err(FloodWait(remaining))` on cancellation so the caller defers the
+    /// retry to the next chat-list sync tick.
+    async fn sleep_with_cancel(&self, wait: Duration) -> Result<(), BackendError> {
+        let start = Instant::now();
+        loop {
+            if self.cancel_refresh.load(Ordering::SeqCst) {
+                let remaining = wait.saturating_sub(start.elapsed()).as_secs().max(1);
+                warn!(remaining, "Telegram refresh cancelled by user");
+                return Err(BackendError::FloodWait(remaining));
+            }
+
+            if start.elapsed() >= wait {
+                return Ok(());
+            }
+
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     }
 }
 
@@ -804,8 +867,27 @@ impl Messenger for TelegramMessenger {
             .unwrap_or(false)
     }
 
+    async fn cancel_chat_refresh(&self) {
+        self.cancel_refresh.store(true, Ordering::SeqCst);
+    }
+
+    async fn reconnect(&self) -> Result<(), BackendError> {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if !self.connection_lost.swap(false, Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.clear_status();
+        let updates = self.replace_client_with_new_pool().await;
+        self.spawn_update_listener(updates);
+        Ok(())
+    }
+
     async fn chats(&self) -> Result<Vec<Chat>, BackendError> {
         const MAX_REFRESH_WAIT: u64 = 120;
+
+        self.cancel_refresh.store(false, Ordering::SeqCst);
 
         loop {
             let refresh = self.chat_refresh.lock().await;
@@ -834,11 +916,10 @@ impl Messenger for TelegramMessenger {
             if let Some(until) = cooldown {
                 let wait = until.saturating_duration_since(Instant::now());
                 drop(refresh);
-                self.report_status(format!(
-                    "Telegram rate limited; retrying in {}s",
-                    wait.as_secs().max(1)
-                ));
-                tokio::time::sleep(wait).await;
+                let _ = self.tx.send(BackendEvent::RateLimited {
+                    retry_after_secs: wait.as_secs().max(1),
+                });
+                self.sleep_with_cancel(wait).await?;
                 continue;
             }
 
@@ -853,17 +934,19 @@ impl Messenger for TelegramMessenger {
                     let until = Instant::now() + std::time::Duration::from_secs(seconds);
                     *self.flood_wait_until.lock().await = Some(until);
                     drop(refresh);
-                    self.report_status(format!(
-                        "Telegram rate limited; retrying in {}s",
-                        seconds.max(1)
-                    ));
-                    tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+                    let _ = self.tx.send(BackendEvent::RateLimited {
+                        retry_after_secs: seconds.max(1),
+                    });
+                    self.sleep_with_cancel(std::time::Duration::from_secs(seconds))
+                        .await?;
                 }
                 Err(BackendError::FloodWait(seconds)) => {
                     drop(refresh);
-                    self.report_status(format!(
-                        "Telegram rate limited; retry deferred for {seconds}s"
-                    ));
+                    let until = Instant::now() + std::time::Duration::from_secs(seconds);
+                    *self.flood_wait_until.lock().await = Some(until);
+                    let _ = self.tx.send(BackendEvent::RateLimited {
+                        retry_after_secs: seconds.max(1),
+                    });
                     return Err(BackendError::FloodWait(seconds));
                 }
                 Err(error) => {

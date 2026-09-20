@@ -271,9 +271,7 @@ mod tests {
         let text: String = line.spans.iter().map(|s| s.to_string()).collect();
         assert!(text.contains("ab"));
         assert!(
-            line.spans
-                .iter()
-                .all(|s| s.style.bg != Some(Color::Yellow)),
+            line.spans.iter().all(|s| s.style.bg != Some(Color::Yellow)),
             "no cursor cell while not typing"
         );
     }
