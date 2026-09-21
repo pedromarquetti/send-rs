@@ -20,7 +20,7 @@ use crate::tui::chat::chat_widget::ChatWidget;
 use crate::tui::loading::{LoadingSpinner, LoadingWidget};
 use crate::tui::popup::PopupKind;
 use crate::tui::settings::Settings;
-use crate::tui::state::{AppState, Focus, Screen};
+use crate::tui::state::{AppState, Focus, Mode, Screen};
 use crate::tui::status_bar::StatusBarWidget;
 
 mod chat;
@@ -559,6 +559,10 @@ impl App {
             return;
         }
 
+        // Keep the input mode in sync with which pane is focused, so
+        // app-level bindings can be gated on whether a text box has focus.
+        self.state.update_mode();
+
         if self.state.pop_up.is_some() {
             self.handle_popup_key(key).await;
             return;
@@ -611,15 +615,18 @@ impl App {
     async fn handle_main_key(&mut self, key: KeyEvent) {
         let km = self.state.keymap.clone();
         let searching = self.state.chat_list_search_active() || self.state.message_search_active();
-        let typing_search =
-            self.state.chat_list_search_typing() || self.state.message_search_typing();
+
+        // App-level bindings are inert while a text box has focus; only the
+        // explicitly captured keys (esc/ctrl+c/enter, tab in the write box)
+        // are handled, everything else reaches the text widget.
+        let insert = self.state.mode == Mode::Insert;
 
         // Esc while a flood-wait countdown is active cancels the in-flight
         // refresh and defers it to the next chat-list sync tick, instead of
         // cycling focus like a regular dismiss.
-        if key == km.dismiss
+        if !insert
+            && key == km.dismiss
             && !searching
-            && !typing_search
             && self.state.rate_limit.is_some()
             && self.state.cancel_rate_limit_wait().await
         {
@@ -629,7 +636,7 @@ impl App {
         // Manually force a reconnection after a provider entered the
         // "connection lost" state. No-op for providers without a persistent
         // transport or when no reconnect is pending.
-        if key == km.retry_connection && !typing_search {
+        if !insert && key == km.retry_connection {
             if let Some(messenger) = self.state.provider_to_messenger(Provider::Telegram)
                 && let Err(e) = messenger.reconnect().await
             {
@@ -640,7 +647,7 @@ impl App {
 
         // While an active chat-list search is showing, Esc is handled inside the
         // ChatList branch (cancel the search) instead of cycling focus.
-        if key == km.dismiss && !searching {
+        if !insert && key == km.dismiss && !searching {
             if self.state.focus == Focus::Chat && self.state.chat_state.open_chat.is_none() {
                 self.cancel_chat_load();
                 self.state.focus = Focus::ChatList;
@@ -650,18 +657,19 @@ impl App {
             return;
         }
 
-        if key == km.open_settings && self.state.focus != Focus::Write && !typing_search {
+        if !insert && key == km.open_settings {
             self.state.screen = Screen::Settings;
             return;
         }
 
-        if key == km.pane_next && !typing_search {
+        // Tab exits the write box even while typing (insert mode).
+        if key == km.pane_next && (!insert || self.state.focus == Focus::Write) {
             self.state.cycle_focus();
             return;
         }
 
         // Jump from chat list to Write Box in selected chat
-        if key == km.focus_write && self.state.focus != Focus::Write && !typing_search {
+        if !insert && key == km.focus_write {
             match &self.state.chat_state.open_chat {
                 Some(_) => {
                     self.state.focus = Focus::Write;
@@ -682,7 +690,7 @@ impl App {
 
         match self.state.focus {
             Focus::ChatList => {
-                if typing_search {
+                if self.state.chat_list_search_typing() {
                     if key == km.dismiss {
                         self.state.chat_state.clear_search();
                     } else if key == km.select {
@@ -818,6 +826,14 @@ impl App {
                 }
             }
             Focus::Write => {
+                // Esc leaves the write box (saving the draft); the global
+                // dismiss binding is gated off while a text box has focus, so
+                // it is captured here instead.
+                if key == km.dismiss {
+                    self.state.cycle_focus();
+                    return;
+                }
+
                 if key.kind != KeyEventKind::Press {
                     // Paste-sourced keys are never send/newline actions.
                     self.state.write.input(key);

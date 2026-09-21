@@ -11,6 +11,9 @@
     - [Telegram Setup](#telegram-setup)
     - [WhatsApp Setup](#whatsapp-setup)
   - [Controls / Key Bindings](#controls-key-bindings)
+  - [Limitations](#limitations)
+    - [Telegram (grammers / Telegram protocol)](#telegram-grammers-telegram-protocol)
+    - [WhatsApp (whatsapp-rust / WhatsApp Web protocol)](#whatsapp-whatsapp-rust-whatsapp-web-protocol)
   - [Built with](#built-with)
   - [Inspirations](#inspirations)
 
@@ -35,11 +38,11 @@ the future?) in one TUI app!
 - [ ] Message actions (reply, edit, delete) for whatsapp
 - [x] Telegram integration
 - [x] Message actions (reply, edit, delete) for telegram
-- [ ] Support for notifications
 - [x] **Telegram** - Support for endless chat scroll.
 - [x] **WhatsApp** - Support for endless chat scroll.
 - [ ] Image rendering
 - [ ] Audio playback
+- [ ] Support for notifications
 - [x] Ordered chat list - All chats, ordered by pinned/most recent.
 - [ ] Dedicated chatlist for each provider
 - [x] Chat List/Message search.
@@ -76,6 +79,7 @@ focus_write = "i"
 scroll_to_bottom = "G"
 send = "enter"
 newline = "shift+enter"
+retry_connection = "r"
 
 [providers.telegram]
 enabled = true
@@ -173,8 +177,43 @@ WhatsApp has no credentials — pairing happens through a QR code:
 | `Enter`     | Write message | Send message (configurable)                                                                                                                                             |
 | `Alt+Enter` | Write message | Insert newline. `Shift+Enter` also works but only on terminals that report modifier keys on Enter (kitty, foot, WezTerm, Alacritty; not GNOME Terminal or a plain TTY). |
 | `Enter`     | Settings      | Select items (use j/k for scrolling)                                                                                                                                    |
+| `r`         | Normal mode   | Force a reconnect when a provider is stuck in the "connection lost" state (e.g. after consecutive Telegram-stream failures)                                             |
 
 > All keys except `PgUp/PgDn` are configurable in the config file.
+
+## Limitations
+
+Only limitations imposed by the underlying libraries and their protocols —
+things senders cannot implement regardless of effort. Features that the
+libraries already support but senders has not wired up yet are not listed here.
+
+### Telegram (grammers / Telegram protocol)
+
+- **Chat list has no push updates.** The protocol delivers no update for a chat
+  being added, removed, pinned or reordered; new chats appear only implicitly
+  when they send a message. grammers' friendly update stream keeps these as raw,
+  undocumented TL updates, so keeping the list in sync means re-listing dialogs
+  (`iter_dialogs`), which senders does on a timer.
+- **No account creation.** grammers' sign-in reports `SignUpRequired`: Telegram
+  accounts can only be registered from official Telegram apps, never from a
+  third-party client.
+- **Rate limits and slow mode are server-enforced.** Flood-wait and slow-mode
+  durations are fixed by Telegram; grammers only auto-sleeps short bounded
+  flood-waits, so longer waits surface as errors the client can only wait out.
+
+### WhatsApp (whatsapp-rust / WhatsApp Web protocol)
+
+- **No server-side history for chats and groups.** Past messages arrive only as
+  history-sync blobs uploaded by the linked phone; requesting older messages
+  asks the phone and returns nothing while it is offline. Only newsletters are
+  served history from the server.
+- **No server "list chats" API.** There is no endpoint that returns the chat
+  list; it must be reconstructed locally from history-sync blobs and push
+  events.
+- **No account creation.** Pairing can only link an already-existing WhatsApp
+  account (QR code, pair code or passkey).
+- **Queued offline sending is not possible.** Outbound messages require a live
+  WebSocket connection.
 
 ## Built with
 

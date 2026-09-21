@@ -910,12 +910,20 @@ impl Messenger for TelegramMessenger {
     }
 
     async fn reconnect(&self) -> Result<(), BackendError> {
+        let _ = self
+            .tx
+            .send(BackendEvent::Status(String::from("reconnecting...")));
+
+        info!("reconnecting Telegram...");
+
         if self.shutdown.load(Ordering::SeqCst) || !self.enabled.load(Ordering::SeqCst) {
             return Ok(());
         }
+
         if !self.connection_lost.swap(false, Ordering::SeqCst) {
             return Ok(());
         }
+
         self.clear_status();
         let updates = self.replace_client_with_new_pool().await;
         self.spawn_update_listener(updates);

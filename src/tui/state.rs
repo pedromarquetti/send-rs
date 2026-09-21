@@ -37,8 +37,16 @@ pub enum Screen {
     Login,
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+pub enum Mode {
+    Insert,
+    #[default]
+    Normal,
+}
+
 /// Common application state shared across pages.
 pub struct AppState {
+    pub mode: Mode,
     pub config: Config,
     pub keymap: Keymap,
     pub messengers: Vec<MessengerKind>,
@@ -120,6 +128,7 @@ impl AppState {
         login_input.set_wrap_mode(WrapMode::WordOrGlyph);
 
         let mut app = Self {
+            mode: Mode::Normal,
             config,
             keymap,
             messengers,
@@ -182,6 +191,28 @@ impl AppState {
     /// True while the message search input is focused and being typed in.
     pub fn message_search_typing(&self) -> bool {
         self.focus == Focus::Chat && self.chat_state.message_search.is_inserting()
+    }
+
+    /// True while any text input is focused and should eat key presses:
+    /// the write box, either search input while live-typing, or the login
+    /// input. Drives [`AppState::mode`] so app-level key bindings stay inert
+    /// while the user is typing (except the explicitly captured keys).
+    pub fn is_typing(&self) -> bool {
+        matches!(self.screen, Screen::Login)
+            || (self.screen == Screen::Main
+                && (self.focus == Focus::Write
+                    || self.chat_list_search_typing()
+                    || self.message_search_typing()))
+    }
+
+    /// Recompute [`AppState::mode`] from the current focus/screen state. Called
+    /// on every keypress so it can never go stale across focus switches.
+    pub fn update_mode(&mut self) {
+        self.mode = if self.is_typing() {
+            Mode::Insert
+        } else {
+            Mode::Normal
+        };
     }
 
     /// Apply a previously fetched chat list to the TUI chat state, preserving
@@ -3043,6 +3074,94 @@ mod tests {
         state.focus = Focus::ChatList;
         assert!(!state.message_search_active());
         assert!(!state.message_search_typing());
+    }
+
+    #[tokio::test]
+    async fn is_typing_tracks_write_search_and_login_inputs() {
+        let mut state = app_state().await;
+        state.screen = Screen::Main;
+
+        // No text input focused: Normal.
+        state.focus = Focus::ChatList;
+        assert!(!state.is_typing());
+
+        // Write box focused: Insert.
+        state.focus = Focus::Write;
+        assert!(state.is_typing());
+
+        // Live chat-list search: Insert.
+        state.focus = Focus::ChatList;
+        state.chat_state.begin_search();
+        assert!(state.is_typing());
+
+        // Committed (filter held, not typing): Normal again.
+        state.chat_state.commit_search();
+        assert!(!state.is_typing());
+        state.chat_state.clear_search();
+
+        // Live message search over an open chat: Insert.
+        state.chat_state.open_chat = Some(OpenChat {
+            chat: Chat {
+                id: ChatId::Telegram(1),
+                contact_name: "Bob".into(),
+                ..Default::default()
+            },
+            history: Vec::new(),
+            has_more_history: true,
+        });
+        state.focus = Focus::Chat;
+        state.chat_state.begin_message_search();
+        assert!(state.is_typing());
+
+        // Committed message search: Normal.
+        state.chat_state.commit_message_search();
+        assert!(!state.is_typing());
+
+        // Login screen input: Insert regardless of focus.
+        state.screen = Screen::Login;
+        state.login_state = Some(LoginState {
+            provider: Provider::Telegram,
+            step: 0,
+            error: None,
+            login_input: TextArea::default(),
+            submitting: false,
+        });
+        assert!(state.is_typing());
+
+        // Settings screen has no text input: Normal.
+        state.screen = Screen::Settings;
+        assert!(!state.is_typing());
+    }
+
+    #[tokio::test]
+    async fn update_mode_reflects_text_input_focus() {
+        let mut state = app_state().await;
+        state.update_mode();
+        assert_eq!(state.mode, Mode::Normal);
+
+        state.focus = Focus::Write;
+        state.update_mode();
+        assert_eq!(state.mode, Mode::Insert);
+
+        state.focus = Focus::ChatList;
+        state.chat_state.begin_search();
+        state.update_mode();
+        assert_eq!(state.mode, Mode::Insert);
+
+        state.chat_state.commit_search();
+        state.update_mode();
+        assert_eq!(state.mode, Mode::Normal);
+
+        state.screen = Screen::Login;
+        state.login_state = Some(LoginState {
+            provider: Provider::Telegram,
+            step: 0,
+            error: None,
+            login_input: TextArea::default(),
+            submitting: false,
+        });
+        state.update_mode();
+        assert_eq!(state.mode, Mode::Insert);
     }
 
     #[tokio::test]
