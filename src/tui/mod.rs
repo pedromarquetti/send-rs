@@ -6,6 +6,7 @@ use ratatui::crossterm::event::{
 use ratatui::layout::{Constraint, Layout};
 use ratatui::widgets::{StatefulWidget, Widget};
 use ratatui::{DefaultTerminal, Frame};
+use ratatui_image::picker::{Picker, ProtocolType};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
@@ -132,6 +133,29 @@ async fn run_app(
     open_settings: bool,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
+
+    // Query the terminal's image protocol once, before the input reader starts
+    // competing for stdin. Any failure degrades to halfblocks instead of
+    // aborting the app.
+    let mut picker = match Picker::from_query_stdio() {
+        Ok(picker) => picker,
+        Err(err) => {
+            warn!(%err, "failed to query terminal image protocol; using halfblocks");
+            Picker::halfblocks()
+        }
+    };
+
+    // ratatui-image can misdetect iTerm2 (ratatui/ratatui-image#158); pin the
+    // native protocol when running inside it.
+    let is_iterm2 = std::env::var("TERM_PROGRAM").is_ok_and(|v| v == "iTerm.app")
+        || std::env::var("LC_TERMINAL").is_ok_and(|v| v == "iTerm2");
+
+    if is_iterm2 && picker.protocol_type() != ProtocolType::Iterm2 {
+        picker.set_protocol_type(ProtocolType::Iterm2);
+    }
+
+    info!(protocol = ?picker.protocol_type(), "terminal image protocol selected");
+
     spawn_terminal_reader(tx.clone());
     spawn_signal_listener(tx.clone());
 
@@ -168,7 +192,16 @@ async fn run_app(
         });
     }
 
-    let mut app = App::new(config, keymap, messengers, open_settings, tx.clone()).await;
+    let mut app = App::new(
+        config,
+        keymap,
+        messengers,
+        open_settings,
+        picker,
+        tx.clone(),
+    )
+    .await;
+
     info!("TUI started");
 
     let telegram_needs_login = if app.state.config.providers.telegram.enabled {
@@ -442,6 +475,8 @@ fn spawn_terminal_reader(tx: mpsc::UnboundedSender<UiEvent>) {
 struct App {
     state: AppState,
     loading_spinner: LoadingSpinner,
+    #[expect(dead_code, reason = "used by the image popup once it lands")]
+    picker: Picker,
     tx: mpsc::UnboundedSender<UiEvent>,
     chat_load_task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -452,11 +487,13 @@ impl App {
         keymap: Keymap,
         messengers: Vec<MessengerKind>,
         open_settings: bool,
+        picker: Picker,
         tx: mpsc::UnboundedSender<UiEvent>,
     ) -> Self {
         Self {
             state: AppState::new(config, keymap, messengers, open_settings).await,
             loading_spinner: LoadingSpinner::new(),
+            picker,
             tx,
             chat_load_task: None,
         }

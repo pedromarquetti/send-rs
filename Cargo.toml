@@ -7,6 +7,18 @@ edition = "2024"
 anyhow = "1"
 async-trait = "0.1"
 ratatui = "0.30"
+
+# Image rendering in popups. 
+# no `chafa-dyn`/libchafa system dependency, halfblocks stays the fallback.
+ratatui-image = { version = "11", default-features = false, features = [
+  "crossterm",
+] }
+image = { version = "0.25.10", default-features = false, features = [
+  "jpeg",
+  "png",
+  "webp",
+] }
+
 thiserror = "2"
 tokio = { version = "1", features = [
   "rt-multi-thread",
