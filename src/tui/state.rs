@@ -1460,8 +1460,13 @@ pub async fn fetch_all_chats(
 mod tests {
     use super::*;
     use crate::backend::mock::MockMessenger;
-    use crate::backend::{Message, MessageId, Messenger};
+    use crate::backend::{MediaKind, Message, MessageId, MessageMedia, Messenger};
+    use crate::tui::image::ImageWidgetState;
+    use crate::tui::popup::{ImagePopup, PopUp};
+    use ratatui::buffer::Buffer;
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
+    use ratatui::layout::Rect;
+    use ratatui::widgets::StatefulWidget;
     use tokio::sync::broadcast;
 
     /// Test helper: synchronously open the chat at the given *visible*
@@ -3366,5 +3371,86 @@ mod tests {
             }
             other => panic!("expected Error popup, got {other:?}"),
         }
+    }
+
+    fn image_message() -> Message {
+        Message {
+            message_id: "img-1".into(),
+            chat: ChatId::Myself,
+            sender: "Maria".into(),
+            author_id: None,
+            text: String::new(),
+            timestamp: 100,
+            from_me: false,
+            msg_actions: Vec::new(),
+            media: Some(MessageMedia {
+                kind: MediaKind::Image,
+                caption: Some("sunset".into()),
+                file_name: Some("sunset.png".into()),
+            }),
+            reply_to_id: None,
+            reply_ctx: None,
+            pending: false,
+            failed: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn image_popup_is_created_and_holds_its_message() {
+        let mut state = app_state().await;
+        let (wake, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let msg = image_message();
+        state.create_popup(PopupKind::Image(ImagePopup {
+            msg: msg.clone(),
+            view: ImageWidgetState::new(wake),
+        }));
+        let popup = state.pop_up.as_ref().expect("popup should be open");
+        match &popup.popup_type {
+            PopupKind::Image(ImagePopup { msg, .. }) => {
+                assert_eq!(msg.message_id, MessageId::from("img-1"));
+                assert_eq!(msg.chat, ChatId::Myself);
+            }
+            other => panic!("expected Image popup, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn image_popup_renders_without_panicking() {
+        let (wake, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut popup = PopupState {
+            popup_type: PopupKind::Image(ImagePopup {
+                msg: image_message(),
+                view: ImageWidgetState::new(wake),
+            }),
+            prev_focus: Focus::Chat,
+            scroll_idx: 0,
+        };
+        if let PopupKind::Image(image_popup) = &mut popup.popup_type {
+            image_popup.view.set_image(
+                &ratatui_image::picker::Picker::halfblocks(),
+                ::image::DynamicImage::ImageRgb8(::image::RgbImage::from_fn(2, 2, |x, y| {
+                    let on = (x + y) % 2 == 0;
+                    ::image::Rgb([
+                        if on { 220 } else { 0 },
+                        if x == 0 { 120 } else { 40 },
+                        if y == 0 { 200 } else { 30 },
+                    ])
+                })),
+            );
+        }
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        (&mut PopUp::new()).render(area, &mut buf, &mut popup);
+    }
+
+    #[tokio::test]
+    async fn media_bytes_defaults_to_none_via_delegate() {
+        let mock = MockMessenger::new("Telegram");
+        let messenger = MessengerKind::Stub(Box::new(mock));
+        let result = messenger
+            .media_bytes(&ChatId::Myself, &MessageId::from("1"))
+            .await;
+        assert!(result.is_ok());
+        assert!(matches!(result, Ok(None)));
     }
 }

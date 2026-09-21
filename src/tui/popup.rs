@@ -4,16 +4,31 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 use crate::backend::{Message, MessageAction};
 use crate::helpers::{calc_height, popup_area, wrap_text};
 use crate::tui::chat::chat_widget::format_timestamp;
+use crate::tui::image::{ImageWidget, ImageWidgetState};
 use crate::tui::state::PopupState;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum PopupKind {
     Info(String),
     Error(String),
     Warn(String),
     Message(Message),
+    Image(ImagePopup),
     Question(String),
+}
+
+pub struct ImagePopup {
+    pub msg: Message,
+    pub view: ImageWidgetState,
+}
+
+impl std::fmt::Debug for ImagePopup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImagePopup")
+            .field("msg", &self.msg)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for PopupKind {
@@ -62,7 +77,7 @@ impl StatefulWidget for &mut PopUp {
         let width = 80.min(area.width.saturating_sub(4));
         let content_width = width.saturating_sub(2) as usize;
 
-        match &state.popup_type {
+        match &mut state.popup_type {
             PopupKind::Question(data) => {
                 let total_lines = data.lines().count();
                 let popup_height = (total_lines as u16 + 3)
@@ -198,22 +213,7 @@ impl StatefulWidget for &mut PopUp {
                     }
                 }
 
-                let options_spans: Vec<Span> = msg
-                    .msg_actions
-                    .iter()
-                    .enumerate()
-                    .map(|(i, opt)| {
-                        let label = match opt {
-                            MessageAction::Reply => format!("[{}] Reply", i + 1),
-                            MessageAction::Edit => format!("[{}] Edit", i + 1),
-                            MessageAction::Delete => format!("[{}] Delete", i + 1),
-                            MessageAction::Retry => format!("[{}] Retry", i + 1),
-                        };
-                        Span::styled(format!("  {label}"), Style::default().fg(Color::White))
-                    })
-                    .collect();
-
-                let options_line = Line::from(options_spans);
+                let options_line = message_actions_line(msg);
 
                 let total_lines = content_lines.len();
                 let popup_height = (total_lines as u16 + 3)
@@ -248,6 +248,78 @@ impl StatefulWidget for &mut PopUp {
                 let options_paragraph = Paragraph::new(options_line);
                 options_paragraph.render(split[2], buf);
             }
+
+            PopupKind::Image(ImagePopup { msg, view }) => {
+                let max_width = area.width.saturating_sub(2);
+                let width = ((area.width as u32 * 9 / 10) as u16)
+                    .clamp(30.min(max_width), max_width.max(30));
+                let max_height = area.height.saturating_sub(1);
+                let height = ((area.height as u32 * 9 / 10) as u16)
+                    .clamp(5.min(max_height), max_height.max(5));
+                let popup_area = popup_area(area, width, height);
+
+                Clear.render(popup_area, buf);
+
+                let block = Block::bordered()
+                    .title(format!(" {} {} ", msg.sender, format_timestamp(msg.timestamp)))
+                    .border_style(Style::default().fg(Color::Cyan).bg(Color::Black));
+
+                Widget::render(&block, popup_area, buf);
+
+                let inner = popup_area.inner(Margin {
+                    vertical: 1,
+                    horizontal: 1,
+                });
+
+                let mut caption_lines: Vec<Line> = Vec::new();
+                if let Some(caption) = msg
+                    .media
+                    .as_ref()
+                    .and_then(|media| media.caption.clone())
+                    .filter(|caption| !caption.trim().is_empty())
+                {
+                    for text_line in caption.lines() {
+                        for chunk in wrap_text(text_line, inner.width as usize) {
+                            caption_lines.push(Line::from(Span::raw(chunk)));
+                        }
+                    }
+                }
+
+                let split = Layout::vertical([
+                    Constraint::Fill(1),
+                    Constraint::Length(caption_lines.len() as u16),
+                    Constraint::Length(1),
+                ])
+                .split(inner);
+
+                ImageWidget.render(split[0], buf, view);
+
+                if !caption_lines.is_empty() {
+                    Paragraph::new(caption_lines).render(split[1], buf);
+                }
+
+                Paragraph::new(message_actions_line(msg)).render(split[2], buf);
+            }
         }
     }
+}
+
+/// `[1] Reply [2] Edit ...` action bar shared by the Message and Image popups.
+fn message_actions_line(msg: &Message) -> Line<'static> {
+    let options_spans: Vec<Span> = msg
+        .msg_actions
+        .iter()
+        .enumerate()
+        .map(|(i, action)| {
+            let label = match action {
+                MessageAction::Reply => format!("[{}] Reply", i + 1),
+                MessageAction::Edit => format!("[{}] Edit", i + 1),
+                MessageAction::Delete => format!("[{}] Delete", i + 1),
+                MessageAction::Retry => format!("[{}] Retry", i + 1),
+            };
+            Span::styled(format!("  {label}"), Style::default().fg(Color::White))
+        })
+        .collect();
+
+    Line::from(options_spans)
 }

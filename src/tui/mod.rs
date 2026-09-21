@@ -12,14 +12,16 @@ use tokio::time::{Duration, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 
 use crate::backend::{
-    self, AuthSteps, BackendEvent, Chat, ChatId, MessageAction, MessengerKind, Provider,
+    self, AuthSteps, BackendError, BackendEvent, Chat, ChatId, MediaKind, Message, MessageAction,
+    MessageId, MessengerKind, Provider,
 };
 use crate::config::{Config, Keymap};
 use crate::helpers::available_message_actions;
 use crate::tui::chat::chat_list::ChatList;
 use crate::tui::chat::chat_widget::ChatWidget;
+use crate::tui::image::ImageWidgetState;
 use crate::tui::loading::{LoadingSpinner, LoadingWidget};
-use crate::tui::popup::PopupKind;
+use crate::tui::popup::{ImagePopup, PopupKind};
 use crate::tui::settings::Settings;
 use crate::tui::state::{AppState, Focus, Mode, Screen};
 use crate::tui::status_bar::StatusBarWidget;
@@ -43,20 +45,28 @@ enum UiEvent {
     /// Wake signal: a background image (re)encode finished; redraw to apply it.
     Redraw,
     HistoryRefresh(ChatId, Vec<backend::Message>),
-    HistoryRefreshResult(ChatId, Result<Vec<backend::Message>, backend::BackendError>),
+    HistoryRefreshResult(ChatId, Result<Vec<backend::Message>, BackendError>),
     /// Result of a backgrounded lazy-history load (scroll-up with the chat at its
     /// topmost message); applied by `AppState::apply_history_page`.
-    HistoryPageResult(ChatId, Result<Vec<backend::Message>, backend::BackendError>),
+    HistoryPageResult(ChatId, Result<Vec<backend::Message>, BackendError>),
     ChatLoaded {
         chat: Chat,
         generation: u64,
-        result: Result<Vec<backend::Message>, backend::BackendError>,
+        result: Result<Vec<backend::Message>, BackendError>,
         status: Option<String>,
     },
-    ChatList(Provider, Result<Vec<Chat>, backend::BackendError>),
+    ChatList(Provider, Result<Vec<Chat>, BackendError>),
     ChatsLoaded {
         chats: Vec<Chat>,
-        errors: Vec<backend::BackendError>,
+        errors: Vec<BackendError>,
+    },
+    /// Result of a backgrounded `Messenger::media_bytes` fetch for the image
+    /// popup; applied by `App::apply_image_media` (a no-op if the popup for
+    /// `message_id` is no longer open).
+    ImageMedia {
+        chat: ChatId,
+        message_id: MessageId,
+        result: Result<Option<Vec<u8>>, BackendError>,
     },
 }
 
@@ -438,6 +448,11 @@ async fn run_app(
                         );
                         app.state.apply_fetched(chats, errors);
                     }
+                    UiEvent::ImageMedia {
+                        chat,
+                        message_id,
+                        result,
+                    } => app.apply_image_media(chat, message_id, result).await,
                 }
                 if !app.state.running {
                     break;
@@ -479,7 +494,6 @@ fn spawn_terminal_reader(tx: mpsc::UnboundedSender<UiEvent>) {
 struct App {
     state: AppState,
     loading_spinner: LoadingSpinner,
-    #[expect(dead_code, reason = "used by the image popup once it lands")]
     picker: Picker,
     tx: mpsc::UnboundedSender<UiEvent>,
     chat_load_task: Option<tokio::task::JoinHandle<()>>,
@@ -576,6 +590,70 @@ impl App {
             let result = messenger.history_page(&task_chat, offset_id, 25).await;
             let _ = tx.send(UiEvent::HistoryPageResult(task_chat, result));
         }));
+    }
+
+    fn open_image_popup(&mut self, msg: Message) {
+        debug!("Opening image for {:?}", msg.message_id);
+        let Some(messenger) = self.state.chat_owner(&msg.chat).cloned() else {
+            return;
+        };
+
+        let chat = msg.chat.clone();
+        let message_id = msg.message_id.clone();
+
+        self.state.create_popup(PopupKind::Image(ImagePopup {
+            msg,
+            view: ImageWidgetState::new(self.tx.clone()),
+        }));
+
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = messenger.media_bytes(&chat, &message_id).await;
+            let _ = tx.send(UiEvent::ImageMedia {
+                chat,
+                message_id,
+                result,
+            });
+        });
+    }
+
+    async fn apply_image_media(
+        &mut self,
+        chat: ChatId,
+        message_id: MessageId,
+        result: Result<Option<Vec<u8>>, BackendError>,
+    ) {
+        let Some(popup) = self.state.pop_up.as_mut() else {
+            return;
+        };
+
+        let PopupKind::Image(image_popup) = &mut popup.popup_type else {
+            return;
+        };
+
+        // Only apply if the popup still shows the same message.
+        if image_popup.msg.chat != chat || image_popup.msg.message_id != message_id {
+            return;
+        }
+
+        let view = &mut image_popup.view;
+
+        match result {
+            Ok(Some(bytes)) => {
+                // Decode off the async runtime; image decoding is CPU-bound.
+                let decoded =
+                    tokio::task::spawn_blocking(move || ::image::load_from_memory(&bytes)).await;
+
+                match decoded {
+                    Ok(Ok(image)) => view.set_image(&self.picker, image),
+                    Ok(Err(e)) => view.set_error(format!("Failed to decode image: {e}")),
+                    Err(e) => view.set_error(format!("Image decode task failed: {e}")),
+                }
+            }
+
+            Ok(None) => view.set_error("Media not available".to_string()),
+            Err(e) => view.set_error(format!("Failed to load image: {e}")),
+        }
     }
 
     async fn shutdown(&mut self) {
@@ -861,9 +939,19 @@ impl App {
                             }
                         }
                     }
+
                     // Offer actions appropriate to the message's state.
                     msg.msg_actions = available_message_actions(&msg);
-                    self.state.create_popup(PopupKind::Message(msg));
+
+                    if msg
+                        .media
+                        .as_ref()
+                        .is_some_and(|m| m.kind == MediaKind::Image)
+                    {
+                        self.open_image_popup(msg);
+                    } else {
+                        self.state.create_popup(PopupKind::Message(msg));
+                    }
                 }
             }
             Focus::Write => {
@@ -919,7 +1007,8 @@ impl App {
                 self.state.dismiss_popup();
                 self.state.retry_message().await;
                 return;
-            } else if let PopupKind::Message(msg) = &popup.popup_type
+            } else if let PopupKind::Message(msg) | PopupKind::Image(ImagePopup { msg, .. }) =
+                &popup.popup_type
                 && let KeyCode::Char(c) = key.code
                 && let Some(digit) = c.to_digit(10)
             {

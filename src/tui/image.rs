@@ -32,11 +32,7 @@ pub struct ImageWidgetState {
 impl ImageWidgetState {
     /// Spawn the encode worker; `wake` is signalled with `UiEvent::Redraw`
     /// whenever a (re-)encoded frame is ready so the UI repaints promptly.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the image popup once it lands")
-    )]
-    pub fn new(wake: UnboundedSender<UiEvent>) -> Self {
+    pub(super) fn new(wake: UnboundedSender<UiEvent>) -> Self {
         let (request_tx, request_rx) = mpsc::channel::<ResizeRequest>();
         let (result_tx, results) = mpsc::channel();
 
@@ -57,11 +53,7 @@ impl ImageWidgetState {
 
     /// Replace the currently displayed image and re-encode it for the next
     /// terminal resize.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the image popup once it lands")
-    )]
-    pub fn set_image(&mut self, picker: &Picker, image: DynamicImage) {
+    pub(super) fn set_image(&mut self, picker: &Picker, image: DynamicImage) {
         self.protocol
             .replace_protocol(picker.new_resize_protocol(image));
         self.has_image = true;
@@ -69,11 +61,7 @@ impl ImageWidgetState {
     }
 
     /// Show `message` in place of the image (decode/fetch failure, etc.).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the image popup once it lands")
-    )]
-    pub fn set_error(&mut self, message: String) {
+    pub(super) fn set_error(&mut self, message: String) {
         self.protocol.empty_protocol();
         self.has_image = false;
         self.status = message;

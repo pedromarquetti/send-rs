@@ -446,6 +446,15 @@ pub trait Messenger: Send + Sync {
     async fn delete(&self, chat: &ChatId, id: &MessageId) -> Result<(), BackendError>;
     /// Edit an already-sent message, replacing its text.
     async fn edit(&self, chat: &ChatId, id: &MessageId, text: &str) -> Result<(), BackendError>;
+    /// Raw, decrypted media bytes for a message, fetched on demand. Returns
+    /// `Ok(None)` when the message has no fetchable media. Nothing is cached.
+    async fn media_bytes(
+        &self,
+        _chat: &ChatId,
+        _message_id: &MessageId,
+    ) -> Result<Option<Vec<u8>>, BackendError> {
+        Ok(None)
+    }
     /// Messenger provider >>> Client message handling
     fn subscribe(&self) -> broadcast::Receiver<BackendEvent>;
     /// Optional provider-specific status for a chat, such as Telegram online/last-seen information.
@@ -592,6 +601,7 @@ impl MessengerKind {
         , async fn send(&self, chat: &ChatId, text: &str, reply_to: Option<MessageId>) -> Result<Message, BackendError> ;
         , async fn delete(&self, chat: &ChatId, id: &MessageId) -> Result<(), BackendError> ;
         , async fn edit(&self, chat: &ChatId, id: &MessageId, text: &str) -> Result<(), BackendError> ;
+        , async fn media_bytes(&self, chat: &ChatId, message_id: &MessageId) -> Result<Option<Vec<u8>>, BackendError> ;
         , fn subscribe(&self) -> broadcast::Receiver<BackendEvent> ;
         , async fn status(&self, chat: &ChatId) -> Result<Option<String>, BackendError> ;
         , async fn cancel_chat_refresh(&self) -> () ;
