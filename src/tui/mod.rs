@@ -25,6 +25,7 @@ use crate::tui::state::{AppState, Focus, Mode, Screen};
 use crate::tui::status_bar::StatusBarWidget;
 
 mod chat;
+mod image;
 mod loading;
 mod login;
 mod popup;
@@ -39,6 +40,8 @@ enum UiEvent {
     Shutdown,
     Backend(Provider, BackendEvent),
     Resize(u16, u16),
+    /// Wake signal: a background image (re)encode finished; redraw to apply it.
+    Redraw,
     HistoryRefresh(ChatId, Vec<backend::Message>),
     HistoryRefreshResult(ChatId, Result<Vec<backend::Message>, backend::BackendError>),
     /// Result of a backgrounded lazy-history load (scroll-up with the chat at its
@@ -361,6 +364,7 @@ async fn run_app(
                         }
                     }
                     UiEvent::Resize(..) => {}
+                    UiEvent::Redraw => {}
                     UiEvent::HistoryRefresh(chat_id, history) => {
                         debug!(
                             chat = ?chat_id,
