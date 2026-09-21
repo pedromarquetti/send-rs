@@ -16,9 +16,11 @@ use tokio::sync::{RwLock, broadcast};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use whatsapp_rust::Client;
+use whatsapp_rust::download::DownloadParams;
 use whatsapp_rust::prelude::{
     Bot, Event, Jid, MessageBuilderExt, MessageExt, MessageInfo, Server, SqliteStore, wa,
 };
+use whatsapp_rust::wacore::download::MediaType;
 use whatsapp_rust::wacore::store::DevicePropsOverride;
 use whatsapp_rust::wacore::types::message::EditAttribute;
 use whatsapp_rust::wacore_binary::JidExt;
@@ -27,6 +29,35 @@ use whatsapp_rust::waproto::whatsapp::Message as WaMessage;
 use whatsapp_rust::waproto::whatsapp::device_props::HistorySyncConfig;
 
 type SharedState = Arc<RwLock<WhatsAppState>>;
+
+/// CDN fields needed to re-download one media message's bytes on demand,
+/// mirroring whatsapp-rust's `DownloadParams` but kept serde-friendly (its
+/// `MediaType` has no serde impls). Built from an image message's raw fields
+/// and rebuilt into `DownloadParams` (`MediaType::Image`) at fetch time.
+/// Holds no media bytes — only the references that fetch them.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct MediaRef {
+    direct_path: String,
+    media_key: Vec<u8>,
+    file_sha256: Vec<u8>,
+    file_enc_sha256: Vec<u8>,
+    file_length: u64,
+}
+
+/// The persisted CDN reference for a message's image, if it carries one with
+/// every field needed to download+decrypt it later. Messages lacking any of
+/// them (e.g. newsletter media with only a `static_url`) are not stored.
+fn image_media_ref(msg: &WaMessage) -> Option<MediaRef> {
+    let img = msg.get_base_message().image_message.as_option()?;
+
+    Some(MediaRef {
+        direct_path: img.direct_path.as_ref()?.clone(),
+        media_key: img.media_key.as_ref()?.clone(),
+        file_sha256: img.file_sha256.as_ref()?.clone(),
+        file_enc_sha256: img.file_enc_sha256.as_ref()?.clone(),
+        file_length: img.file_length?,
+    })
+}
 
 /// In-memory mirror of the account's conversations and messages, populated from
 /// `Event::HistorySync` and `Event::Messages` delivered by the whatsapp-rust
@@ -43,9 +74,18 @@ struct WhatsAppState {
     /// So basically, Stanza == Message
     by_stanza_id: HashMap<String, (ChatId, MessageId)>,
 
+    /// CDN references for image messages, keyed by stanza id. Persisted with
+    /// the cache so images from earlier sessions still download after a
+    /// restart (the raw `wa::Message` itself is not deserializable). No media
+    /// bytes are ever stored — only the fields that fetch them on demand.
+    ///  TODO: this may contain image hashes, we need to fix file permissions: currently, in
+    /// linux, everyone can read send-rs files!
+    /// BUG: fix file permission for the app
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    media_refs: HashMap<String, MediaRef>,
+
     /// JID -> push name cache populated from HistorySync pushnames.
     pushnames: HashMap<String, String>,
-    // BUG: Verified badge gets removed if new messages are present in business chat
     /// JID string -> display name learned from usync (the peer's username or
     /// verified business name), keyed the way `pushnames` are (peer PN or LID).
     /// Names the phone itself declines to sync still resolve to something
@@ -819,6 +859,10 @@ impl WhatsAppMessenger {
                     state
                         .by_stanza_id
                         .insert(stanza_id.clone(), (chat.clone(), msg.message_id.clone()));
+
+                    if let Some(media_ref) = image_media_ref(&inbound.message) {
+                        state.media_refs.insert(stanza_id.clone(), media_ref);
+                    }
 
                     let is_dup = state
                         .history
@@ -1904,6 +1948,14 @@ async fn handle_history_sync(
                 continue;
             }
 
+            // Keep the message's CDN reference while it may still be opened
+            // with media, so the image popup can re-download it on demand.
+            // Persisted so it survives restarts too; only the fetch fields are
+            // kept, never the media bytes.
+            if let Some(media_ref) = image_media_ref(msg) {
+                state.media_refs.insert(stanza_id.to_string(), media_ref);
+            }
+
             let from_me = key.from_me.unwrap_or(false);
 
             let sender_jid = key
@@ -2493,6 +2545,40 @@ impl Messenger for WhatsAppMessenger {
         Ok(context)
     }
 
+    async fn media_bytes(
+        &self,
+        chat: &ChatId,
+        message_id: &MessageId,
+    ) -> Result<Option<Vec<u8>>, BackendError> {
+        let ChatId::WhatsApp(_) = chat else {
+            return Err(BackendError::Other("not a WhatsApp chat".into()));
+        };
+
+        // The persisted CDN reference covers images from earlier sessions too;
+        // nothing here holds or caches the media bytes themselves.
+        let params = {
+            let state = self.state.read().await;
+            state.media_refs.get(&message_id.0).cloned()
+        };
+        let Some(r) = params else {
+            return Ok(None);
+        };
+
+        let params = DownloadParams::encrypted(
+            r.direct_path,
+            &r.media_key,
+            &r.file_sha256,
+            &r.file_enc_sha256,
+            r.file_length,
+            MediaType::Image,
+        );
+
+        debug!(message_id = ?message_id, "Fetching WA media bytes on demand");
+        let client = self.current_client();
+        let bytes = client.download(&params).await.map_err(BackendError::from)?;
+        Ok((!bytes.is_empty()).then_some(bytes))
+    }
+
     async fn send(
         &self,
         chat: &ChatId,
@@ -2612,6 +2698,7 @@ impl Messenger for WhatsAppMessenger {
                 state
                     .by_stanza_id
                     .retain(|_, (c, mid)| !(*c == *chat && *mid == *id));
+                state.media_refs.retain(|k, _| k != &id.0);
                 state.refresh_last_message_ts(chat);
             }
 
@@ -4040,6 +4127,95 @@ mod tests {
             1,
             "duplicate + empty must collapse to one message"
         );
+    }
+
+    #[tokio::test]
+    async fn history_sync_persists_media_refs_for_on_demand_download() {
+        let (tx, _rx) = broadcast::channel(128);
+        let state: SharedState = Arc::new(RwLock::new(WhatsAppState::default()));
+        let chat_id = "15550000004@s.whatsapp.net";
+
+        let img = wa::HistorySyncMsg {
+            message: MessageField::some(wa::WebMessageInfo {
+                key: MessageField::some(wa::MessageKey {
+                    id: Some("wa-img-1".to_string()),
+                    remote_jid: Some(chat_id.to_string()),
+                    from_me: Some(false),
+                    participant: None,
+                }),
+                message: MessageField::some(wa::Message {
+                    image_message: MessageField::some(wa::message::ImageMessage {
+                        direct_path: Some("/v/t62.7118-24/12345_67890".into()),
+                        media_key: Some(vec![0, 1, 2, 3]),
+                        file_sha256: Some(vec![4, 5, 6, 7]),
+                        file_enc_sha256: Some(vec![8, 9, 10, 11]),
+                        file_length: Some(1024),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                message_timestamp: Some(1000),
+                push_name: Some("Alice".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let hs = wa::HistorySync {
+            conversations: vec![conversation(chat_id, vec![img])],
+            pushnames: vec![],
+            ..Default::default()
+        };
+
+        super::handle_history_sync(&hs, None, &state, &tx, Path::new("/tmp/wa_test_cache.json"))
+            .await;
+
+        let s = state.read().await;
+        let r = s
+            .media_refs
+            .get("wa-img-1")
+            .expect("media ref kept for on-demand download");
+        assert_eq!(r.direct_path, "/v/t62.7118-24/12345_67890");
+        assert_eq!(r.file_length, 1024);
+
+        // The reference must survive a serialize/deserialize round trip so
+        // cached messages keep working after a restart.
+        let encoded = serde_json::to_string(&*s).unwrap();
+        assert!(encoded.contains("media_refs"));
+        let restored: WhatsAppState = serde_json::from_str(&encoded).unwrap();
+        assert!(restored.media_refs.contains_key("wa-img-1"));
+    }
+
+    #[test]
+    fn image_media_ref_extracts_cdn_fields_and_skips_incomplete_images() {
+        let img = wa::Message {
+            image_message: MessageField::some(wa::message::ImageMessage {
+                direct_path: Some("/v/t62.7118-24/12345_67890".into()),
+                media_key: Some(vec![0, 1, 2, 3]),
+                file_sha256: Some(vec![4, 5, 6, 7]),
+                file_enc_sha256: Some(vec![8, 9, 10, 11]),
+                file_length: Some(1024),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let r = image_media_ref(&img).expect("complete image yields a ref");
+        assert_eq!(r.direct_path, "/v/t62.7118-24/12345_67890");
+        assert_eq!(r.media_key, vec![0, 1, 2, 3]);
+        assert_eq!(r.file_length, 1024);
+
+        // A text message has no media.
+        assert!(image_media_ref(&text_message("hello")).is_none());
+
+        // An image missing its direct path cannot be re-downloaded by reference.
+        let no_path = wa::Message {
+            image_message: MessageField::some(wa::message::ImageMessage {
+                media_key: Some(vec![0, 1, 2, 3]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(image_media_ref(&no_path).is_none());
     }
 
     #[test]

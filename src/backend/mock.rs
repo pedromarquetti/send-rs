@@ -322,7 +322,10 @@ impl Messenger for MockMessenger {
                 ::image::ImageFormat::Png,
             )
             .map_err(|e| {
-                BackendError::Other(format!("{} mock failed to encode fixture image: {e}", self.name))
+                BackendError::Other(format!(
+                    "{} mock failed to encode fixture image: {e}",
+                    self.name
+                ))
             })?;
         Ok(Some(bytes))
     }
@@ -717,7 +720,8 @@ mod tests {
             .await
             .unwrap()
             .expect("image message should yield bytes");
-        let decoded = ::image::load_from_memory(&bytes).expect("mock media bytes must be a valid PNG");
+        let decoded =
+            ::image::load_from_memory(&bytes).expect("mock media bytes must be a valid PNG");
         assert_eq!(decoded.width(), FIXTURE_IMAGE_W);
         assert_eq!(decoded.height(), FIXTURE_IMAGE_H);
     }

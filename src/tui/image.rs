@@ -12,8 +12,8 @@ use ratatui_image::thread::{ResizeRequest, ResizeResponse, ThreadProtocol};
 use ratatui_image::{Resize, StatefulImage};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::helpers::wrap_text;
 use super::UiEvent;
+use crate::helpers::wrap_text;
 
 /// Marker widget; all state lives in [`ImageWidgetState`].
 pub struct ImageWidget;
@@ -111,6 +111,7 @@ impl StatefulWidget for ImageWidget {
             width: size.width.min(area.width),
             height: size.height.min(area.height),
         };
+
         StatefulImage::new().render(image_area, buf, &mut state.protocol);
     }
 }
@@ -202,6 +203,4 @@ mod tests {
         ImageWidget.render(buf.area, &mut buf, &mut state);
         assert_eq!(buf.cell((8, 2)).unwrap().symbol(), "d");
     }
-
 }
-

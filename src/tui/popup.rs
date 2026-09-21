@@ -261,7 +261,11 @@ impl StatefulWidget for &mut PopUp {
                 Clear.render(popup_area, buf);
 
                 let block = Block::bordered()
-                    .title(format!(" {} {} ", msg.sender, format_timestamp(msg.timestamp)))
+                    .title(format!(
+                        " {} {} ",
+                        msg.sender,
+                        format_timestamp(msg.timestamp)
+                    ))
                     .border_style(Style::default().fg(Color::Cyan).bg(Color::Black));
 
                 Widget::render(&block, popup_area, buf);

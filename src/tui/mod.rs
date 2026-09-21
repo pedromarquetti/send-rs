@@ -646,13 +646,25 @@ impl App {
 
                 match decoded {
                     Ok(Ok(image)) => view.set_image(&self.picker, image),
-                    Ok(Err(e)) => view.set_error(format!("Failed to decode image: {e}")),
-                    Err(e) => view.set_error(format!("Image decode task failed: {e}")),
+                    Ok(Err(e)) => {
+                        error!("Err Failed to decode image {e}");
+                        view.set_error(format!("Failed to decode image: {e}"))
+                    }
+                    Err(e) => {
+                        error!("Image decode task failed: {e}");
+                        view.set_error(format!("Image decode task failed: {e}"))
+                    }
                 }
             }
 
-            Ok(None) => view.set_error("Media not available".to_string()),
-            Err(e) => view.set_error(format!("Failed to load image: {e}")),
+            Ok(None) => {
+                warn!("Media not available error!");
+                view.set_error("Media not available".to_string())
+            }
+            Err(e) => {
+                error!("Failed to load image: {e}");
+                view.set_error(format!("Failed to load image: {e}"))
+            }
         }
     }
 
