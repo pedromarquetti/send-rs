@@ -13,6 +13,7 @@ use grammers_client::update::Update;
 use grammers_client::{Client, SignInError};
 use grammers_session::updates::UpdatesLike;
 use grammers_tl_types as tl;
+use ratatui::style::Stylize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -113,16 +114,29 @@ fn normalize_telegram_message(
     let from_me = msg.outgoing() || own_chat == Some(chat);
     let sender = telegram_message_sender(msg, from_me);
     let media = telegram_message_media(msg);
-    let text = media
-        .as_ref()
-        .and_then(|media| media.caption.clone())
-        .filter(|caption| !caption.trim().is_empty())
-        .unwrap_or_else(|| {
-            media
-                .as_ref()
-                .map(|media| format!("{}, click to show", media.kind.label()))
-                .unwrap_or_else(|| msg.text().to_string())
-        });
+
+    let text = match &media {
+        Some(media) => match media.caption.clone() {
+            Some(caption) => {
+                format!("{}-> {}", media.kind.label().gray(), caption)
+            }
+            None => {
+                format!("{}, click to show", media.kind.label())
+            }
+        },
+        None => msg.text().to_string(),
+    };
+
+    // let text = media
+    //     .as_ref()
+    //     .and_then(|media| media.caption.clone())
+    //     .filter(|caption| !caption.trim().is_empty())
+    //     .unwrap_or_else(|| {
+    //         media
+    //             .as_ref()
+    //             .map(|media| format!("{}, click to show", media.kind.label()))
+    //             .unwrap_or_else(|| msg.text().to_string())
+    //     });
 
     Message {
         message_id: telegram_message_id(msg),
@@ -1177,6 +1191,46 @@ impl Messenger for TelegramMessenger {
 
         client.edit_message(peer_ref, msg_id, input).await?;
         Ok(())
+    }
+
+    async fn media_bytes(
+        &self,
+        chat: &ChatId,
+        message_id: &MessageId,
+    ) -> Result<Option<Vec<u8>>, BackendError> {
+        let bare_id = match chat {
+            ChatId::Telegram(id) => *id,
+            _ => return Err(BackendError::Other("not a Telegram chat".into())),
+        };
+        let Some(id) = message_id.to_i32() else {
+            return Ok(None);
+        };
+
+        let peer_ref = self
+            .find_dialog_peer_ref(bare_id)
+            .ok_or_else(|| BackendError::Other("chat not found in dialog cache".into()))?;
+
+        debug!(bare_id, message_id = id, "Fetching media bytes on demand");
+        let client = self.current_client().await;
+        let Some(msg) = client
+            .get_messages_by_id(peer_ref, &[id])
+            .await?
+            .into_iter()
+            .flatten()
+            .next()
+        else {
+            return Ok(None);
+        };
+        let Some(media) = msg.media() else {
+            return Ok(None);
+        };
+
+        let mut bytes = Vec::new();
+        let mut download = client.iter_download(&media);
+        while let Some(chunk) = download.next().await? {
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok((!bytes.is_empty()).then_some(bytes))
     }
 
     fn subscribe(&self) -> broadcast::Receiver<BackendEvent> {

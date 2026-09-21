@@ -2174,7 +2174,7 @@ mod tests {
 
         assert_eq!(
             state.chat_state.open_chat.as_ref().unwrap().history.len(),
-            2
+            3
         );
         assert!(!state.chat_state.chats[0].unread);
         assert_eq!(state.chat_state.chats[0].unread_count, 0);
@@ -2200,7 +2200,7 @@ mod tests {
 
         assert_eq!(
             state.chat_state.open_chat.as_ref().unwrap().history.len(),
-            3
+            4
         );
         assert_eq!(state.chat_state.chats[0].last_message_ts, Some(1000));
         assert!(!state.chat_state.chats[0].unread);

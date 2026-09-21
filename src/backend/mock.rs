@@ -1,8 +1,8 @@
 use crate::helpers::now;
 
 use super::{
-    BackendError, BackendEvent, Chat, ChatId, Message, MessageAction, MessageId, Messenger,
-    ReplyContext,
+    BackendError, BackendEvent, Chat, ChatId, MediaKind, Message, MessageAction, MessageId,
+    MessageMedia, Messenger, ReplyContext,
 };
 use anyhow::Result;
 use std::collections::HashMap;
@@ -15,6 +15,9 @@ const FAMILY_ID: ChatId = ChatId::Telegram(102);
 const ALICE_ID: ChatId = ChatId::Telegram(103);
 const ECHO_ID: ChatId = ChatId::Telegram(104);
 const ECHO_SENDER: &str = "Echo Bot";
+
+const FIXTURE_IMAGE_W: u32 = 16;
+const FIXTURE_IMAGE_H: u32 = 16;
 
 #[derive(Clone)]
 pub struct MockMessenger {
@@ -283,6 +286,47 @@ impl Messenger for MockMessenger {
         Ok(())
     }
 
+    async fn media_bytes(
+        &self,
+        chat: &ChatId,
+        message_id: &MessageId,
+    ) -> Result<Option<Vec<u8>>, BackendError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|e| BackendError::Other(format!("{} mock state poisoned: {e}", self.name)))?;
+        let is_image = state.history.get(chat).is_some_and(|messages| {
+            messages
+                .iter()
+                .find(|m| m.message_id == *message_id)
+                .and_then(|m| m.media.as_ref())
+                .is_some_and(|media| media.kind == MediaKind::Image)
+        });
+        drop(state);
+        if !is_image {
+            return Ok(None);
+        }
+
+        let image = ::image::RgbImage::from_fn(FIXTURE_IMAGE_W, FIXTURE_IMAGE_H, |x, y| {
+            let on = ((x / 2) + (y / 2)) % 2 == 0;
+            if on {
+                ::image::Rgb([70, 150, 220])
+            } else {
+                ::image::Rgb([245, 215, 130])
+            }
+        });
+        let mut bytes = Vec::new();
+        ::image::DynamicImage::ImageRgb8(image)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                ::image::ImageFormat::Png,
+            )
+            .map_err(|e| {
+                BackendError::Other(format!("{} mock failed to encode fixture image: {e}", self.name))
+            })?;
+        Ok(Some(bytes))
+    }
+
     fn subscribe(&self) -> broadcast::Receiver<BackendEvent> {
         self.tx.subscribe()
     }
@@ -417,11 +461,18 @@ fn mock_data(name: &'static str) -> MockData {
                     ),
                 ],
             );
+            let mut photo = message("tg-5", &ALICE_ID, "Alice", "", false);
+            photo.media = Some(MessageMedia {
+                kind: MediaKind::Image,
+                caption: Some("sunset over the lake".into()),
+                file_name: Some("sunset.png".into()),
+            });
             history.insert(
                 ALICE_ID.clone(),
                 vec![
                     message("tg-3", &ALICE_ID, "Alice", "Are you coming tonight?", false),
                     message("tg-4", &ALICE_ID, "You", "ok, see you", true),
+                    photo,
                 ],
             );
             MockData {
@@ -655,6 +706,38 @@ mod tests {
         assert!(
             history.iter().any(|m| m.sender == "Telegram Mock"),
             "expected a persisted incoming message"
+        );
+    }
+
+    #[tokio::test]
+    async fn media_bytes_returns_png_for_image_message() {
+        let mock = MockMessenger::new("Telegram");
+        let bytes = mock
+            .media_bytes(&ALICE_ID, &MessageId::from("tg-5"))
+            .await
+            .unwrap()
+            .expect("image message should yield bytes");
+        let decoded = ::image::load_from_memory(&bytes).expect("mock media bytes must be a valid PNG");
+        assert_eq!(decoded.width(), FIXTURE_IMAGE_W);
+        assert_eq!(decoded.height(), FIXTURE_IMAGE_H);
+    }
+
+    #[tokio::test]
+    async fn media_bytes_returns_none_for_non_image_or_unknown_message() {
+        let mock = MockMessenger::new("Telegram");
+        assert!(
+            mock.media_bytes(&ALICE_ID, &MessageId::from("tg-3"))
+                .await
+                .unwrap()
+                .is_none(),
+            "text message must yield no media"
+        );
+        assert!(
+            mock.media_bytes(&ALICE_ID, &MessageId::from("nope"))
+                .await
+                .unwrap()
+                .is_none(),
+            "unknown message id must yield no media"
         );
     }
 }

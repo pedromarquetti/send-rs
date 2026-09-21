@@ -2,8 +2,9 @@ use std::sync::mpsc::{self, Receiver};
 
 use image::DynamicImage;
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Style};
+use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, StatefulWidget, Widget};
 use ratatui_image::errors::Errors;
 use ratatui_image::picker::Picker;
@@ -11,6 +12,7 @@ use ratatui_image::thread::{ResizeRequest, ResizeResponse, ThreadProtocol};
 use ratatui_image::{Resize, StatefulImage};
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::helpers::wrap_text;
 use super::UiEvent;
 
 /// Marker widget; all state lives in [`ImageWidgetState`].
@@ -77,9 +79,25 @@ impl StatefulWidget for ImageWidget {
         }
 
         if !state.has_image {
-            Paragraph::new(state.status.as_str())
+            let text_width = area.width.saturating_sub(2) as usize;
+            let mut lines: Vec<Line> = wrap_text(&state.status, text_width)
+                .into_iter()
+                .map(Line::from)
+                .collect();
+            let top_pad = (area.height as usize).saturating_sub(lines.len()) / 2;
+            let mut padded = vec![Line::from(""); top_pad];
+
+            padded.append(&mut lines);
+
+            while padded.len() < area.height as usize {
+                padded.push(Line::from(""));
+            }
+
+            Paragraph::new(padded)
+                .alignment(Alignment::Center)
                 .style(Style::default().fg(Color::DarkGray))
                 .render(area, buf);
+
             return;
         }
 
@@ -109,11 +127,13 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_renders_status_text() {
+    fn placeholder_renders_status_text_centered() {
         let mut state = state();
         let mut buf = Buffer::empty(Rect::new(0, 0, 20, 5));
         ImageWidget.render(buf.area, &mut buf, &mut state);
-        assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "L");
+        // 1 line in a 5-row area starting at row 2, centered horizontally.
+        assert_eq!(buf.cell((3, 2)).unwrap().symbol(), "L");
+        assert_eq!(buf.cell((0, 0)).unwrap().symbol(), " ");
     }
 
     #[test]
@@ -125,7 +145,7 @@ mod tests {
         state.set_error("Media not available".to_string());
         let mut buf = Buffer::empty(Rect::new(0, 0, 20, 5));
         ImageWidget.render(buf.area, &mut buf, &mut state);
-        assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "M");
+        assert_eq!(buf.cell((6, 1)).unwrap().symbol(), "M");
     }
 
     #[test]
@@ -176,10 +196,12 @@ mod tests {
         };
         let mut buf = Buffer::empty(Rect::new(0, 0, 20, 5));
         ImageWidget.render(buf.area, &mut buf, &mut err_state);
-        assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "n");
+        assert_eq!(buf.cell((8, 2)).unwrap().symbol(), "n");
         state.set_error("down".to_string());
         let mut buf = Buffer::empty(Rect::new(0, 0, 20, 5));
         ImageWidget.render(buf.area, &mut buf, &mut state);
-        assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "d");
+        assert_eq!(buf.cell((8, 2)).unwrap().symbol(), "d");
     }
+
 }
+
