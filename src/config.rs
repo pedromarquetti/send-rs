@@ -139,12 +139,32 @@ pub struct Keymap {
     pub retry_connection: KeyEvent,
 }
 
+/// Tests must never read or write a real user's config. Under `#[cfg(test)]`
+/// every config path resolves to a single throwaway directory under the
+/// system temp dir instead of `$XDG_CONFIG_HOME/senders`.
+#[cfg(test)]
+static TEST_CONFIG_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
 impl Config {
     pub fn user_config_dir() -> Result<PathBuf> {
-        dirs::config_dir()
-            .or_else(dirs::home_dir)
-            .map(|base| base.join("senders"))
-            .ok_or_else(|| anyhow::anyhow!("could not determine a config directory"))
+        #[cfg(test)]
+        {
+            if let Some(dir) = TEST_CONFIG_DIR.get() {
+                return Ok(dir.clone());
+            }
+            let dir = std::env::temp_dir().join(format!("senders-test-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = TEST_CONFIG_DIR.set(dir.clone());
+            Ok(dir)
+        }
+
+        #[cfg(not(test))]
+        {
+            dirs::config_dir()
+                .or_else(dirs::home_dir)
+                .map(|base| base.join("senders"))
+                .ok_or_else(|| anyhow::anyhow!("could not determine a config directory"))
+        }
     }
 
     pub fn config_file_path() -> Result<PathBuf> {
@@ -369,5 +389,34 @@ mod tests {
         let config: Config = toml::from_str(raw).unwrap();
         assert_eq!(config.keys.search_text, "s");
         assert_eq!(config.keys.retry_connection, "r");
+    }
+
+    #[test]
+    fn test_config_io_uses_a_temp_dir() {
+        // Under `#[cfg(test)]` every config path must resolve to a throwaway
+        // temp directory, never a real user's config dir.
+        let dir = Config::user_config_dir().unwrap();
+        assert_eq!(
+            dir.parent(),
+            Some(std::env::temp_dir().as_path()),
+            "test config dir must live in the system temp dir, got: {}",
+            dir.display()
+        );
+        assert_eq!(
+            Config::config_file_path().unwrap().parent(),
+            Some(dir.as_path())
+        );
+
+        // And saves/loads round-trip through that temp dir (no real config
+        // file was touched to write either of these).
+        let reported = Config::config_file_path().unwrap();
+        let cfg = Config {
+            max_write_lines: 3,
+            ..Config::default()
+        };
+        cfg.save_config().unwrap();
+        let loaded = Config::load().unwrap().unwrap();
+        assert_eq!(loaded.max_write_lines, 3);
+        assert_eq!(reported, Config::config_file_path().unwrap());
     }
 }

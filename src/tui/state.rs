@@ -2977,15 +2977,8 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_login_disables_whatsapp_when_pairing() {
-        // Write config to a temp dir to avoid touching the real user config.
-        let tmp =
-            std::path::PathBuf::from(format!("/tmp/senders-test-cancel-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let old = std::env::var_os("XDG_CONFIG_HOME");
-        // SAFETY: test runs single-threaded within this process;
-        // no concurrent reads/writes of XDG_CONFIG_HOME.
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", &tmp) }
-
+        // Config I/O is redirected to a temp dir under `cfg!(test)` (see
+        // `Config::user_config_dir`), so the real user config is never touched.
         let mut config = Config::default();
         config.providers.whatsapp = true;
         let keymap = config.keys.parse().unwrap();
@@ -3024,16 +3017,6 @@ mod tests {
             !saved.providers.whatsapp,
             "saved config should have whatsapp disabled"
         );
-
-        // Restore XDG_CONFIG_HOME.
-        // SAFETY: see above.
-        unsafe {
-            match old {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[tokio::test]
