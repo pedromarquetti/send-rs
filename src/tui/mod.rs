@@ -21,7 +21,7 @@ use crate::tui::chat::chat_list::ChatList;
 use crate::tui::chat::chat_widget::ChatWidget;
 use crate::tui::image::ImageWidgetState;
 use crate::tui::loading::{LoadingSpinner, LoadingWidget};
-use crate::tui::player::{Engine, PlaybackState, Player};
+use crate::tui::player::{PlaybackState, Player, RodioEngine};
 use crate::tui::popup::{ImagePopup, PopupKind};
 use crate::tui::settings::Settings;
 use crate::tui::state::{AppState, Focus, Mode, Screen};
@@ -522,7 +522,7 @@ impl App {
             state: AppState::new(config, keymap, messengers, open_settings).await,
             loading_spinner: LoadingSpinner::new(),
             picker,
-            player: Player::new(Box::new(Engine::default()), tx.clone()),
+            player: Player::new(Box::new(RodioEngine::default()), tx.clone()),
             tx,
             chat_load_task: None,
         }

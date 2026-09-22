@@ -4,6 +4,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::error;
 
+mod engine;
+
+pub use engine::RodioEngine;
+
 use super::UiEvent;
 use crate::backend::{ChatId, MessageId};
 
@@ -63,6 +67,8 @@ impl PlaybackState {
 }
 
 /// A pluggable audio engine, owned and driven by the player worker thread.
+/// The concrete [`RodioEngine`] plays decoded bytes; a `StubEngine` drives the
+/// UI-level tests.
 pub trait MediaEngine: Send {
     /// Load `bytes` for playback. Returns the duration in seconds (`0.0` when
     /// unknown) or an error description; on error the engine must leave its
@@ -75,49 +81,9 @@ pub trait MediaEngine: Send {
     fn stop(&mut self);
     fn position(&self) -> f64;
     fn duration(&self) -> f64;
-    fn status(&self) -> PlayState;
-}
-
-///  Every load fails, keeping the player plumbing inert and the popup on an error.
-pub struct Engine {
-    status: PlayState,
-}
-
-impl Default for Engine {
-    fn default() -> Self {
-        Self {
-            status: PlayState::Stopped,
-        }
-    }
-}
-
-impl MediaEngine for Engine {
-    fn load(&mut self, _bytes: &[u8]) -> Result<f64, String> {
-        self.status = PlayState::Error;
-        Err("Audio playback engine is not available yet".to_string())
-    }
-
-    fn play(&mut self) {}
-
-    fn pause(&mut self) {}
-
-    fn seek(&mut self, _position_secs: f64) {}
-
-    fn stop(&mut self) {
-        self.status = PlayState::Stopped;
-    }
-
-    fn position(&self) -> f64 {
-        0.0
-    }
-
-    fn duration(&self) -> f64 {
-        0.0
-    }
-
-    fn status(&self) -> PlayState {
-        self.status
-    }
+    /// Poll the engine. `&mut self` so engines can transition on EOF while
+    /// sampling (e.g. a sink that has emptied out).
+    fn status(&mut self) -> PlayState;
 }
 
 /// Commands the UI sends to the player worker.
@@ -229,7 +195,9 @@ impl Worker {
             }
             PlayerCommand::Stop => self.engine.stop(),
         }
-        self.report(self.engine.status());
+
+        let status = self.engine.status();
+        self.report(status);
     }
 
     /// Periodic refresh path: re-report while playing so the progress bar
@@ -347,7 +315,7 @@ mod tests {
             self.0.lock().unwrap().duration
         }
 
-        fn status(&self) -> PlayState {
+        fn status(&mut self) -> PlayState {
             self.0.lock().unwrap().status
         }
     }

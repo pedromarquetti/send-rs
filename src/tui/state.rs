@@ -1480,7 +1480,7 @@ mod tests {
     use crate::backend::mock::MockMessenger;
     use crate::backend::{MediaKind, Message, MessageId, MessageMedia, Messenger};
     use crate::tui::image::ImageWidgetState;
-    use crate::tui::player::{PlayKey, PlaybackState, PlayState};
+    use crate::tui::player::{PlayKey, PlayState, PlaybackState};
     use crate::tui::popup::{ImagePopup, PopUp};
     use ratatui::buffer::Buffer;
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
