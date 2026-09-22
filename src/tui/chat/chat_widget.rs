@@ -326,8 +326,9 @@ fn message_lines(
         .fg(Color::DarkGray)
         .add_modifier(Modifier::ITALIC);
 
-    // Physical body lines without the header; the media label is appended to
-    // the last caption chunk so it stays attached to the caption text.
+    // Physical body lines without the header. Media messages lead with the
+    // media-type label ("Image:") on its own line; the caption follows below.
+    // Plain text messages render the body text directly.
     let body_lines: Vec<Line> = match &message.media {
         Some(media) => {
             let caption = media
@@ -338,27 +339,17 @@ fn message_lines(
 
             match caption {
                 Some(caption) => {
+                    // Media message: the media-type label leads on its own
+                    // line ("Image:"); the caption follows below, wrapped to
+                    // the full body width.
                     let mut lines: Vec<Line> = Vec::new();
+                    lines.push(Line::from(Span::styled(
+                        format!("{}:", media.kind.label()),
+                        media_style,
+                    )));
 
-                    // Keep the media label attached to the caption text instead
-                    // of giving it a line of its own.
-                    let label = Span::styled(media.kind.label(), media_style);
-                    match lines.last_mut() {
-                        Some(last) => {
-                            last.push_span(label);
-                            last.push_span(Span::raw(":  ").style(media_style));
-                        }
-                        None => lines.push(Line::from(vec![label, Span::raw(":  ")])),
-                    }
-
-                    for (index, text_line) in caption.lines().enumerate() {
-                        let line_avail = if index == 0 && text_avail > 0 {
-                            text_avail
-                        } else {
-                            available.max(1)
-                        };
-
-                        for chunk in wrap_text(text_line, line_avail) {
+                    for text_line in caption.lines() {
+                        for chunk in wrap_text(text_line, available.max(1)) {
                             any_truncated |= chunk.ends_with('…');
                             lines.push(Line::from(body_spans(&chunk, needle, body_style)));
                         }
@@ -568,18 +559,23 @@ mod tests {
     }
 
     #[test]
-    fn message_lines_media_with_caption_shows_caption_plus_italic_media_label() {
+    fn message_lines_media_with_caption_puts_label_on_its_own_line() {
         let msg = media_message(MediaKind::Image, Some("sunset over the lake"));
         let lines = message_lines(&msg, 80, None, None);
-        assert_eq!(lines.len(), 1);
-        let text = lines[0].to_string();
+        assert_eq!(lines.len(), 2, "media label line + caption line");
+        let label_line = lines[0].to_string();
         assert!(
-            text.contains("sunset over the lake:  Image"),
-            "caption body should end in the media label, got: {text}"
+            label_line.contains("Alice 31/12/1969 21:00  Image:"),
+            "the media-type label leads the first line, got: {label_line}"
         );
         assert!(
-            !text.contains("ignored by the media render path"),
-            "chat view renders `media`, not `message.text`, got: {text}"
+            !label_line.contains("sunset"),
+            "the caption must not share the media label line, got: {label_line}"
+        );
+        let caption_line = lines[1].to_string();
+        assert!(
+            !caption_line.contains("ignored by the media render path"),
+            "chat view renders `media`, not `message.text`, got: {caption_line}"
         );
 
         let italic: Vec<String> = lines[0]
@@ -588,9 +584,9 @@ mod tests {
             .filter(|s| s.style.add_modifier.contains(Modifier::ITALIC))
             .map(|s| s.to_string())
             .collect();
-        assert_eq!(italic, ["Image"]);
+        assert_eq!(italic, ["Image:"], "colon stays attached to the label");
 
-        let caption_span = lines[0]
+        let caption_span = lines[1]
             .spans
             .iter()
             .find(|s| s.to_string().contains("sunset"))
@@ -598,6 +594,25 @@ mod tests {
         assert!(
             !caption_span.style.add_modifier.contains(Modifier::ITALIC),
             "caption keeps the plain body style"
+        );
+    }
+
+    #[test]
+    fn message_lines_media_caption_wraps_beneath_the_label() {
+        let msg = media_message(
+            MediaKind::Image,
+            Some("a long caption that wraps across several lines at this narrow width"),
+        );
+        let lines = message_lines(&msg, 20, None, None);
+        assert!(
+            lines.len() >= 3,
+            "label line + wrapped caption lines, got {}",
+            lines.len()
+        );
+        assert!(lines[0].to_string().contains("Image:"));
+        assert!(
+            lines[1..].iter().all(|l| !l.to_string().contains("Image:")),
+            "caption lines must not repeat the media label"
         );
     }
 

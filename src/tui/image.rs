@@ -167,15 +167,15 @@ mod tests {
 
         let mut encoded = false;
         for _ in 0..100 {
-            for result in state.results.try_iter() {
-                if let Ok(completed) = result {
-                    state.protocol.update_resized_protocol(completed);
-                    encoded = true;
-                }
+            for completed in state.results.try_iter().flatten() {
+                state.protocol.update_resized_protocol(completed);
+                encoded = true;
             }
+
             if encoded {
                 break;
             }
+
             std::thread::sleep(Duration::from_millis(2));
         }
         assert!(encoded, "encode worker never produced a frame");
