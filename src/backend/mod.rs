@@ -246,7 +246,8 @@ pub struct ReplyContext {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageAction {
-    //TODO: implement "copy" -> the user should be able to easily copy message contents
+    // TODO: implement "forward" -> forward messages to other users
+    // TODO: implement "copy" -> the user should be able to easily copy message contents
     Reply,
     Edit,
     Delete,

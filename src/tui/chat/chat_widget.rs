@@ -135,19 +135,20 @@ impl StatefulWidget for ChatWidget<'_> {
 
             // Render each message once; the ListItem line count IS the item
             // height, so the scrollbar and the list always agree.
-            let rendered: Vec<Vec<Line<'static>>> = history
-                .iter()
-                .map(|msg| message_lines(msg, content.width, max_lines, needle))
-                .collect();
-
-            let item_heights: Vec<usize> = rendered.iter().map(Vec::len).collect();
-
-            let total_lines: usize = item_heights.iter().sum();
-
             let visible = inner.height as usize;
             state.visible_page = visible;
 
-            let items: Vec<ListItem> = rendered.into_iter().map(ListItem::new).collect();
+            let mut item_heights: Vec<usize> = Vec::with_capacity(history.len());
+            let mut total_lines = 0usize;
+            let items: Vec<ListItem> = history
+                .iter()
+                .map(|msg| {
+                    let lines = message_lines(msg, content.width, max_lines, needle);
+                    item_heights.push(lines.len());
+                    total_lines += lines.len();
+                    ListItem::new(lines)
+                })
+                .collect();
 
             let highlight = if self.focus == Focus::Chat {
                 match tag {
@@ -327,7 +328,7 @@ fn message_lines(
 
     // Physical body lines without the header; the media label is appended to
     // the last caption chunk so it stays attached to the caption text.
-    let body_lines = match &message.media {
+    let body_lines: Vec<Line> = match &message.media {
         Some(media) => {
             let caption = media
                 .caption
@@ -337,8 +338,18 @@ fn message_lines(
 
             match caption {
                 Some(caption) => {
-                    let mut lines: Vec<Vec<Span>> = Vec::new();
-                    lines.push(vec![Span::styled(media.kind.label(), media_style)]);
+                    let mut lines: Vec<Line> = Vec::new();
+
+                    // Keep the media label attached to the caption text instead
+                    // of giving it a line of its own.
+                    let label = Span::styled(media.kind.label(), media_style);
+                    match lines.last_mut() {
+                        Some(last) => {
+                            last.push_span(label);
+                            last.push_span(Span::raw(":  ").style(media_style));
+                        }
+                        None => lines.push(Line::from(vec![label, Span::raw(":  ")])),
+                    }
 
                     for (index, text_line) in caption.lines().enumerate() {
                         let line_avail = if index == 0 && text_avail > 0 {
@@ -349,20 +360,20 @@ fn message_lines(
 
                         for chunk in wrap_text(text_line, line_avail) {
                             any_truncated |= chunk.ends_with('…');
-                            lines.push(body_spans(&chunk, needle, body_style));
+                            lines.push(Line::from(body_spans(&chunk, needle, body_style)));
                         }
                     }
 
                     lines
                 }
-                None => vec![vec![Span::styled(
+                None => vec![Line::from(vec![Span::styled(
                     format!("{}, click to show", media.kind.label()),
                     media_style,
-                )]],
+                )])],
             }
         }
         None => {
-            let mut lines: Vec<Vec<Span>> = Vec::new();
+            let mut lines: Vec<Line> = Vec::new();
             let mut text_lines = message.text.lines();
 
             if let Some(first) = text_lines.next() {
@@ -373,28 +384,27 @@ fn message_lines(
                 };
                 any_truncated |= first_chunks.iter().any(|c| c.ends_with('…'));
                 for chunk in first_chunks {
-                    lines.push(body_spans(&chunk, needle, body_style));
+                    lines.push(Line::from(body_spans(&chunk, needle, body_style)));
                 }
             }
 
             for line in text_lines {
                 for chunk in wrap_text(line, available) {
                     any_truncated |= chunk.ends_with('…');
-                    lines.push(body_spans(&chunk, needle, body_style));
+                    lines.push(Line::from(body_spans(&chunk, needle, body_style)));
                 }
             }
             lines
         }
     };
 
-    if let Some((first, rest)) = body_lines.split_first() {
+    let mut body_lines = body_lines.into_iter();
+    if let Some(first) = body_lines.next() {
         let mut spans = vec![Span::styled(head, header_style), Span::raw("  ")];
-        spans.extend(first.to_vec());
+        spans.extend(first);
         result.push(Line::from(spans));
 
-        for line in rest {
-            result.push(Line::from(line.to_vec()));
-        }
+        result.extend(body_lines);
     } else {
         result.push(Line::from(vec![
             Span::styled(head, header_style),
