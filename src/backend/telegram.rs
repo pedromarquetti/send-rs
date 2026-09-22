@@ -118,7 +118,7 @@ fn normalize_telegram_message(
     let text = match &media {
         Some(media) => match media.caption.clone() {
             Some(caption) => {
-                format!("{}-> {}", media.kind.label().gray(), caption)
+                format!("{}: {}", media.kind.label(), caption)
             }
             None => {
                 format!("{}, click to show", media.kind.label())

@@ -338,23 +338,21 @@ fn message_lines(
             match caption {
                 Some(caption) => {
                     let mut lines: Vec<Vec<Span>> = Vec::new();
+                    lines.push(vec![Span::styled(media.kind.label(), media_style)]);
+
                     for (index, text_line) in caption.lines().enumerate() {
                         let line_avail = if index == 0 && text_avail > 0 {
                             text_avail
                         } else {
                             available.max(1)
                         };
+
                         for chunk in wrap_text(text_line, line_avail) {
                             any_truncated |= chunk.ends_with('…');
                             lines.push(body_spans(&chunk, needle, body_style));
                         }
                     }
-                    if let Some(last) = lines.last_mut() {
-                        last.extend([
-                            Span::raw(":  "),
-                            Span::styled(media.kind.label(), media_style),
-                        ]);
-                    }
+
                     lines
                 }
                 None => vec![vec![Span::styled(

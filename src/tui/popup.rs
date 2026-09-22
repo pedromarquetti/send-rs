@@ -145,24 +145,28 @@ impl StatefulWidget for &mut PopUp {
 
                 if let Some(media) = &msg.media {
                     let media_label = format!("  {}: click to show", media.kind.label());
+
                     content_lines.push(Line::from(Span::styled(
                         media_label,
                         Style::default()
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
                     )));
+
                     content_lines.push(Line::from(Span::styled(
                         "  Terminal media preview is not implemented yet ",
                         Style::default()
                             .fg(Color::DarkGray)
                             .add_modifier(Modifier::ITALIC),
                     )));
+
                     if let Some(caption) = media
                         .caption
                         .as_ref()
                         .filter(|caption| !caption.trim().is_empty())
                     {
                         content_lines.push(Line::from(Span::raw("")));
+
                         for text_line in caption.lines() {
                             let chunks = wrap_text(text_line, content_width);
                             for chunk in chunks {
@@ -180,10 +184,12 @@ impl StatefulWidget for &mut PopUp {
                             .fg(Color::DarkGray)
                             .add_modifier(Modifier::BOLD),
                     )));
+
                     content_lines.push(Line::from(Span::styled(
                         format!("    {} {}", reply.sender, format_timestamp(reply.timestamp)),
                         Style::default().fg(Color::DarkGray),
                     )));
+
                     for text_line in reply.text.lines() {
                         let chunks = wrap_text(text_line, content_width);
                         for chunk in chunks {
