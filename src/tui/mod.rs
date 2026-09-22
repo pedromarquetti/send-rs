@@ -21,6 +21,7 @@ use crate::tui::chat::chat_list::ChatList;
 use crate::tui::chat::chat_widget::ChatWidget;
 use crate::tui::image::ImageWidgetState;
 use crate::tui::loading::{LoadingSpinner, LoadingWidget};
+use crate::tui::player::{Engine, PlaybackState, Player};
 use crate::tui::popup::{ImagePopup, PopupKind};
 use crate::tui::settings::Settings;
 use crate::tui::state::{AppState, Focus, Mode, Screen};
@@ -30,6 +31,7 @@ mod chat;
 mod image;
 mod loading;
 mod login;
+mod player;
 mod popup;
 mod search;
 mod settings;
@@ -68,6 +70,10 @@ enum UiEvent {
         message_id: MessageId,
         result: Result<Option<Vec<u8>>, BackendError>,
     },
+    /// Snapshot of the audio session from the player worker; applied by
+    /// `AppState::apply_playback_state` (a no-op if no session is active for
+    /// that message).
+    PlaybackState(PlaybackState),
 }
 
 pub async fn run(
@@ -453,6 +459,9 @@ async fn run_app(
                         message_id,
                         result,
                     } => app.apply_image_media(chat, message_id, result).await,
+                    UiEvent::PlaybackState(playback) => {
+                        app.state.apply_playback_state(playback);
+                    }
                 }
                 if !app.state.running {
                     break;
@@ -495,6 +504,7 @@ struct App {
     state: AppState,
     loading_spinner: LoadingSpinner,
     picker: Picker,
+    player: Player,
     tx: mpsc::UnboundedSender<UiEvent>,
     chat_load_task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -512,6 +522,7 @@ impl App {
             state: AppState::new(config, keymap, messengers, open_settings).await,
             loading_spinner: LoadingSpinner::new(),
             picker,
+            player: Player::new(Box::new(Engine::default()), tx.clone()),
             tx,
             chat_load_task: None,
         }
@@ -670,6 +681,7 @@ impl App {
 
     async fn shutdown(&mut self) {
         self.cancel_chat_load();
+        self.player.stop();
 
         for messenger in &mut self.state.messengers {
             if let Err(err) = messenger.disconnect().await {

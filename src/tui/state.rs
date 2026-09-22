@@ -11,6 +11,7 @@ use crate::backend::{
 };
 use crate::config::{Config, Keymap};
 use crate::tui::chat::{ChatState, OpenChat};
+use crate::tui::player::PlaybackState;
 use crate::tui::popup::PopupKind;
 use tracing::{debug, error, info, warn};
 
@@ -88,6 +89,9 @@ pub struct AppState {
     /// Providers whose transport has successfully connected at least once.
     /// Drives the persistent disconnected indicator in the status bar.
     pub provider_connected: HashSet<Provider>,
+
+    /// Latest player report for the active audio session (`None` = no session).
+    pub playback: Option<PlaybackState>,
 }
 
 pub struct LoginState {
@@ -154,6 +158,7 @@ impl AppState {
             retry_draft: None,
             rate_limit: None,
             provider_connected: HashSet::new(),
+            playback: None,
         };
 
         if let Ok(chat_cache) = Config::load_chats() {
@@ -347,6 +352,19 @@ impl AppState {
     pub fn dismiss_popup(&mut self) {
         if let Some(popup) = self.pop_up.take() {
             self.focus = popup.prev_focus;
+        }
+    }
+
+    /// Apply a player report for the audio session. Reports are dropped unless
+    /// a session for the same message is active, so events racing with a
+    /// dismissed popup can never resurrect stale playback state.
+    pub fn apply_playback_state(&mut self, incoming: PlaybackState) {
+        if self
+            .playback
+            .as_ref()
+            .is_some_and(|current| current.source == incoming.source)
+        {
+            self.playback = Some(incoming);
         }
     }
 
@@ -1462,6 +1480,7 @@ mod tests {
     use crate::backend::mock::MockMessenger;
     use crate::backend::{MediaKind, Message, MessageId, MessageMedia, Messenger};
     use crate::tui::image::ImageWidgetState;
+    use crate::tui::player::{PlayKey, PlaybackState, PlayState};
     use crate::tui::popup::{ImagePopup, PopUp};
     use ratatui::buffer::Buffer;
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
@@ -3452,5 +3471,43 @@ mod tests {
             .await;
         assert!(result.is_ok());
         assert!(matches!(result, Ok(None)));
+    }
+
+    #[tokio::test]
+    async fn apply_playback_state_guards_against_stale_reports() {
+        let mut state = app_state().await;
+        let source = PlayKey {
+            chat: ChatId::Telegram(1),
+            message_id: MessageId::from("42"),
+        };
+        let report = |status| PlaybackState {
+            source: source.clone(),
+            status,
+            position: 1.0,
+            duration: 5.0,
+            updated_at: Instant::now(),
+        };
+
+        // No active session: reports are dropped.
+        state.apply_playback_state(report(PlayState::Playing));
+        assert!(state.playback.is_none());
+
+        // An active session for the same message accepts newer reports.
+        state.playback = Some(report(PlayState::Paused));
+        state.apply_playback_state(report(PlayState::Playing));
+        assert_eq!(state.playback.as_ref().unwrap().status, PlayState::Playing);
+
+        // Stale reports from a different message are dropped, not resurrected.
+        state.apply_playback_state(PlaybackState {
+            source: PlayKey {
+                chat: ChatId::Telegram(2),
+                message_id: MessageId::from("43"),
+            },
+            status: PlayState::Playing,
+            position: 1.0,
+            duration: 5.0,
+            updated_at: Instant::now(),
+        });
+        assert_eq!(state.playback.as_ref().unwrap().status, PlayState::Playing);
     }
 }

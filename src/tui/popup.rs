@@ -256,6 +256,8 @@ impl StatefulWidget for &mut PopUp {
             }
 
             PopupKind::Image(ImagePopup { msg, view }) => {
+                // TODO: refactor this: long captions do not show properly and should
+                // be wrapped to a new line
                 let max_width = area.width.saturating_sub(2);
                 let width = ((area.width as u32 * 9 / 10) as u16)
                     .clamp(30.min(max_width), max_width.max(30));
