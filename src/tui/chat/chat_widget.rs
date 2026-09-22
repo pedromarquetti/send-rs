@@ -140,6 +140,12 @@ impl StatefulWidget for ChatWidget<'_> {
 
             let mut item_heights: Vec<usize> = Vec::with_capacity(history.len());
             let mut total_lines = 0usize;
+            //BUG: messages are appearing with split lines:
+            // messages should appear like this
+            //
+            // not 
+            // like
+            // this
             let items: Vec<ListItem> = history
                 .iter()
                 .map(|msg| {
@@ -537,6 +543,8 @@ mod tests {
             kind,
             caption: caption.map(str::to_string),
             file_name: None,
+            duration_secs: None,
+            waveform: None,
         });
         msg
     }

@@ -3353,6 +3353,7 @@ dependencies = [
  "dasp_sample",
  "num-rational",
  "symphonia",
+ "tracing",
 ]
 
 [[package]]
@@ -3517,12 +3518,14 @@ dependencies = [
  "ratatui-image",
  "ratatui-textarea",
  "rodio",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
  "toml 1.1.4+spec-1.1.0",
  "tracing",
+ "tracing-log",
  "tracing-subscriber",
  "whatsapp-rust",
 ]

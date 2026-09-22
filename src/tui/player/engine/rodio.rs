@@ -274,11 +274,15 @@ impl Timing {
 /// The default output device is opened lazily on the first `play` and a fresh
 /// `Sink` is created for every session. Ending a session (EOF, `stop`, or a
 /// new `load` over an old session) drops the sink, which stops audio without
-/// blocking on the end of the cue.
+/// blocking on the end of the cue. The raw session bytes are kept while the
+/// session is loaded so a finished session can be restarted from the beginning
+/// on a fresh `play` (what the user expects the space bar to do at EOF); an
+/// explicit `stop` (Esc) forgets the session instead.
 pub struct RodioEngine {
     stream: Option<OutputStream>,
     sink: Option<Sink>,
     current: Option<Loaded>,
+    bytes: Option<Vec<u8>>,
     timing: Timing,
     status: PlayState,
 }
@@ -289,6 +293,7 @@ impl Default for RodioEngine {
             stream: None,
             sink: None,
             current: None,
+            bytes: None,
             timing: Timing::default(),
             status: PlayState::Stopped,
         }
@@ -307,11 +312,15 @@ impl RodioEngine {
     }
 
     fn open_output(&mut self) -> Result<(), String> {
-        let stream = OutputStreamBuilder::open_default_stream()
+        let mut stream = OutputStreamBuilder::open_default_stream()
             .map_err(|err| format!("cannot open the audio output device: {err}"))?;
+        // rodio logs a "Dropping OutputStream" notice, but only as noise; the
+        // engine controls the whole lifecycle. Suppress it.
+        stream.log_on_drop(false);
         let sink = Sink::connect_new(stream.mixer());
         self.stream = Some(stream);
         self.sink = Some(sink);
+
         Ok(())
     }
 }
@@ -323,13 +332,19 @@ impl MediaEngine for RodioEngine {
             Err(err) => {
                 self.sink.take();
                 self.current = None;
+                self.bytes = None;
                 self.timing.stop();
                 self.status = PlayState::Error;
                 return Err(err);
             }
         };
 
+        debug!(
+            duration = decoded.duration.map(|d| d.as_secs_f64()).unwrap_or(0.0),
+            "audio loaded"
+        );
         self.sink.take();
+        self.bytes = Some(bytes.to_vec());
         self.current = Some(Loaded {
             source: Some(decoded.source),
             duration: decoded.duration,
@@ -341,6 +356,16 @@ impl MediaEngine for RodioEngine {
     }
 
     fn play(&mut self) {
+        // A session that reached EOF dropped its `current` source. The space
+        // bar after the end is a request to play the session again from the
+        // start, so re-decode the retained bytes and continue below.
+        if self.current.is_none()
+            && let Some(bytes) = self.bytes.clone()
+        {
+            debug!("restarting finished session from the beginning");
+            let _ = self.load(&bytes);
+        }
+
         let pending = match self.current.as_mut() {
             None => {
                 self.status = PlayState::Stopped;
@@ -382,6 +407,7 @@ impl MediaEngine for RodioEngine {
 
         self.timing.play();
         self.status = PlayState::Playing;
+        debug!("audio playing");
     }
 
     fn pause(&mut self) {
@@ -420,9 +446,14 @@ impl MediaEngine for RodioEngine {
     }
 
     fn stop(&mut self) {
+        if self.status == PlayState::Playing || self.sink.is_some() {
+            debug!("stopping audio session");
+        }
+
         self.sink.take();
         self.stream.take();
         self.current = None;
+        self.bytes = None;
         self.timing.stop();
         self.status = PlayState::Stopped;
     }
@@ -440,10 +471,17 @@ impl MediaEngine for RodioEngine {
     }
 
     fn status(&mut self) -> PlayState {
+        // EOF: the sink consumed its last sample. The session is finished but
+        // its bytes are retained so a later `play` can restart it.
         if self.status == PlayState::Playing
             && let Some(sink) = &self.sink
             && sink.empty()
         {
+            debug!(
+                position = self.position(),
+                duration = self.duration(),
+                "audio reached end of stream"
+            );
             self.timing.pause(self.duration());
             self.sink.take();
             self.current = None;
@@ -653,5 +691,59 @@ mod tests {
 
         done.store(true, Ordering::Relaxed);
         drain.join().unwrap();
+    }
+
+    #[test]
+    fn play_after_eof_restarts_from_the_beginning() {
+        let (mut engine, done, drain) = engine_harness();
+
+        engine.load(VOICE_OGG).unwrap();
+        engine.play();
+        wait_until(Duration::from_secs(5), || {
+            engine.status() == PlayState::Stopped
+        });
+        let end = engine.position();
+        assert!(
+            (end - 2.0).abs() < 0.1,
+            "expected the end position, got {end}"
+        );
+
+        // Space after the end restarts the finished session at zero.
+        engine.play();
+        assert_eq!(engine.status(), PlayState::Playing);
+        wait_until(Duration::from_secs(3), || {
+            let position = engine.position();
+            position > 0.0 && position < 0.5
+        });
+
+        done.store(true, Ordering::Relaxed);
+        drain.join().unwrap();
+    }
+
+    #[test]
+    fn stop_forgets_session_so_play_does_not_restart() {
+        let (mut engine, done, drain) = engine_harness();
+
+        engine.load(VOICE_OGG).unwrap();
+        engine.stop();
+        assert_eq!(engine.status(), PlayState::Stopped);
+
+        engine.play();
+        assert_eq!(
+            engine.status(),
+            PlayState::Stopped,
+            "an explicitly stopped session must not come back on play"
+        );
+
+        done.store(true, Ordering::Relaxed);
+        drain.join().unwrap();
+    }
+
+    #[test]
+    fn play_without_loaded_media_stays_stopped() {
+        let mut engine = RodioEngine::default();
+        engine.play();
+        assert_eq!(engine.status(), PlayState::Stopped);
+        assert_eq!(engine.position(), 0.0);
     }
 }

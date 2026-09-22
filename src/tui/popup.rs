@@ -40,6 +40,11 @@ impl std::fmt::Debug for ImagePopup {
 pub struct AudioPopup {
     pub msg: Message,
     pub playback: Option<PlaybackState>,
+    /// A human-readable, non-fatal error (e.g. a failed on-demand media
+    /// download) rendered in the popup's bottom border instead of a bare ⚠.
+    /// Only surfaces errors this process produced itself — native alsa-lib
+    /// diagnostics never reach here (they go to the log via stderr redirect).
+    pub error_note: Option<String>,
 }
 
 impl std::fmt::Debug for AudioPopup {
@@ -47,6 +52,7 @@ impl std::fmt::Debug for AudioPopup {
         f.debug_struct("AudioPopup")
             .field("msg", &self.msg)
             .field("playback", &self.playback)
+            .field("error_note", &self.error_note)
             .finish()
     }
 }
@@ -58,12 +64,15 @@ impl Default for PopupKind {
 }
 
 #[derive(Default)]
-pub struct PopUp {}
+pub struct PopUp {
+    curr_messenger: &'static str,
+}
 
 impl PopUp {
-    pub fn new() -> Self {
-        Self {}
+    pub fn new(curr_messenger: &'static str) -> Self {
+        Self { curr_messenger }
     }
+
     pub fn handle_data_render(&self, data: &String, area: Rect, buf: &mut Buffer, block: Block) {
         let width = 80.min(area.width.saturating_sub(4));
         let content_width = width.saturating_sub(2) as usize;
@@ -97,6 +106,12 @@ impl StatefulWidget for &mut PopUp {
         let width = 80.min(area.width.saturating_sub(4));
         let content_width = width.saturating_sub(2) as usize;
 
+        let border_style = match self.curr_messenger {
+            "TG" => Style::default().fg(Color::Blue),
+            "WA" => Style::default().fg(Color::Green),
+            _ => Style::default(),
+        };
+
         match &mut state.popup_type {
             PopupKind::Question(data) => {
                 let total_lines = data.lines().count();
@@ -109,7 +124,7 @@ impl StatefulWidget for &mut PopUp {
 
                 let block = Block::bordered()
                     .title(" ? ")
-                    .border_style(Style::default().fg(Color::Red).bg(Color::Black));
+                    .border_style(Style::default().fg(Color::Gray).bg(Color::Black));
 
                 let options: Vec<Span> = vec![Span::from(" [1] Yes "), Span::from(" [2] No ")];
 
@@ -129,7 +144,7 @@ impl StatefulWidget for &mut PopUp {
             PopupKind::Info(data) => {
                 let block = Block::bordered()
                     .title(" Info ")
-                    .border_style(Style::default().fg(Color::Blue).bg(Color::Black));
+                    .border_style(Style::default().fg(Color::LightBlue).bg(Color::Black));
                 self.handle_data_render(data, area, buf, block);
             }
 
@@ -143,7 +158,7 @@ impl StatefulWidget for &mut PopUp {
             PopupKind::Message(msg) => {
                 let block = Block::bordered()
                     .title(" Message ")
-                    .border_style(Style::default().fg(Color::Cyan).bg(Color::Black));
+                    .border_style(border_style);
 
                 let mut content_lines: Vec<Line> = Vec::new();
                 let status = if msg.failed {
@@ -294,7 +309,7 @@ impl StatefulWidget for &mut PopUp {
                         msg.sender,
                         format_timestamp(msg.timestamp)
                     ))
-                    .border_style(Style::default().fg(Color::Cyan).bg(Color::Black));
+                    .border_style(border_style);
 
                 Widget::render(&block, popup_area, buf);
 
@@ -333,14 +348,23 @@ impl StatefulWidget for &mut PopUp {
                 Paragraph::new(message_actions_line(msg)).render(split[2], buf);
             }
 
-            PopupKind::Audio(AudioPopup { msg, playback }) => {
+            PopupKind::Audio(AudioPopup {
+                msg,
+                playback,
+                error_note,
+            }) => {
                 let block = Block::bordered()
                     .title(format!(
                         " {} {} ",
                         msg.sender,
                         format_timestamp(msg.timestamp)
                     ))
-                    .border_style(Style::default().fg(Color::Magenta).bg(Color::Black));
+                    .border_style(border_style);
+
+                let block = match error_note {
+                    Some(note) => block.title_bottom(format!(" ⚠ {note} ")),
+                    None => block,
+                };
 
                 let mut content_lines: Vec<Line> = Vec::new();
 
@@ -366,6 +390,7 @@ impl StatefulWidget for &mut PopUp {
                 };
 
                 let progress = progress_strip(ratio, content_width);
+
                 let duration_label = if duration > 0.0 {
                     format_duration(duration)
                 } else {
@@ -377,15 +402,10 @@ impl StatefulWidget for &mut PopUp {
                         "  {status_icon} Audio · {} / {duration_label}",
                         format_duration(elapsed)
                     ),
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD),
+                    border_style.add_modifier(Modifier::BOLD),
                 )));
 
-                content_lines.push(Line::from(Span::styled(
-                    progress,
-                    Style::default().fg(Color::Magenta),
-                )));
+                content_lines.push(Line::from(Span::styled(progress, border_style)));
 
                 if let Some(caption) = msg
                     .media
@@ -438,6 +458,7 @@ impl StatefulWidget for &mut PopUp {
                     "  space ▸ play/pause   < ▸ -5s   > ▸ +5s   esc ▸ close".to_string(),
                     Style::default().fg(Color::DarkGray),
                 ));
+
                 Paragraph::new(hint).render(split[1], buf);
                 Paragraph::new(options_line).render(split[2], buf);
             }

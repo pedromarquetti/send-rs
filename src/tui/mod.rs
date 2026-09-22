@@ -699,34 +699,54 @@ impl App {
         message_id: MessageId,
         result: Result<Option<Vec<u8>>, BackendError>,
     ) {
-        let popup_msg = match self.state.pop_up.as_ref().map(|p| &p.popup_type) {
-            Some(PopupKind::Audio(AudioPopup { msg, .. })) => msg,
-            _ => return,
+        let same_target = match self.state.pop_up.as_ref().map(|p| &p.popup_type) {
+            Some(PopupKind::Audio(AudioPopup { msg, .. })) => {
+                msg.chat == chat && msg.message_id == message_id
+            }
+            _ => false,
         };
 
-        // Only apply if the popup still shows the same message.
-        if popup_msg.chat != chat || popup_msg.message_id != message_id {
+        if !same_target {
             return;
         }
 
         let source = PlayKey { chat, message_id };
 
-        match result {
+        // Failure reasons differ: `Ok(None)` means the provider has no media
+        // (e.g. WhatsApp still lacks a cached CDN reference), `Err` is a real
+        // download/decrypt failure. Both land in `error_note` so the popup
+        // shows why instead of a bare ⚠.
+        let note = match result {
             Ok(Some(bytes)) => {
+                debug!(chat = ?source.chat, msg = %source.message_id, "Audio media loaded, awaiting play");
+                // Load only; playback starts on the first space press so
+                // opening a popup never surprises the user with sound.
                 self.player.load(source, bytes);
-                self.player.play();
+                return;
             }
-            Ok(None) | Err(_) => {
+            Ok(None) => {
                 warn!(chat = ?source.chat, msg = %source.message_id, "No audio media available");
-                self.state.playback = Some(PlaybackState {
-                    source,
-                    status: PlayState::Error,
-                    position: 0.0,
-                    duration: 0.0,
-                    updated_at: Instant::now(),
-                });
+                "audio not available yet — waiting on WhatsApp history re-sync".to_string()
             }
+            Err(e) => {
+                error!(chat = ?source.chat, msg = %source.message_id, error = %e, "Audio media download failed");
+                format!("download failed: {e}")
+            }
+        };
+
+        if let Some(popup) = self.state.pop_up.as_mut()
+            && let PopupKind::Audio(audio) = &mut popup.popup_type
+        {
+            audio.error_note = Some(note);
         }
+
+        self.state.playback = Some(PlaybackState {
+            source,
+            status: PlayState::Error,
+            position: 0.0,
+            duration: 0.0,
+            updated_at: Instant::now(),
+        });
     }
 
     fn open_audio_popup(&mut self, msg: Message) {
@@ -739,7 +759,15 @@ impl App {
         let message_id = msg.message_id.clone();
 
         // Seed the session so early worker reports are accepted by
-        // `apply_playback_state`'s same-source guard.
+        // `apply_playback_state`'s same-source guard. The provider-reported
+        // duration (Telegram/WhatsApp audio metadata) is shown until the first
+        // decode reports the real playback length.
+        let known_duration = msg
+            .media
+            .as_ref()
+            .and_then(|m| m.duration_secs)
+            .unwrap_or(0) as f64;
+
         self.state.playback = Some(PlaybackState {
             source: PlayKey {
                 chat: chat.clone(),
@@ -747,13 +775,14 @@ impl App {
             },
             status: PlayState::Loading,
             position: 0.0,
-            duration: 0.0,
+            duration: known_duration,
             updated_at: Instant::now(),
         });
 
         self.state.create_popup(PopupKind::Audio(AudioPopup {
             msg,
             playback: None,
+            error_note: None,
         }));
 
         let tx = self.tx.clone();
@@ -777,12 +806,16 @@ impl App {
             .pop_up
             .as_ref()
             .is_some_and(|p| matches!(p.popup_type, PopupKind::Audio(_)));
-        // `AppState::dismiss_popup` clears the stored playback snapshot.
+
         if was_audio {
-            self.player.pause();
+            debug!("audio popup dismissed, stopping playback");
+        }
+
+        // `AppState::dismiss_popup` clears the stored playback snapshot.
+        self.state.dismiss_popup();
+        if was_audio {
             self.player.stop();
         }
-        self.state.dismiss_popup();
     }
 
     async fn shutdown(&mut self) {
@@ -1276,8 +1309,9 @@ impl App {
             if let PopupKind::Audio(audio) = &mut state.popup_type {
                 audio.playback = self.state.playback.clone();
             }
+            let tag = self.state.chat_state.get_tag();
 
-            popup::PopUp::new().render(frame.area(), frame.buffer_mut(), state);
+            popup::PopUp::new(tag.unwrap_or("")).render(frame.area(), frame.buffer_mut(), state);
         }
     }
 
@@ -1370,6 +1404,8 @@ mod tests {
     use crate::tui::chat::OpenChat;
     use ratatui::crossterm::event::KeyCode;
 
+    const TONE_WAV: &[u8] = include_bytes!("player/engine/fixtures/tone.wav");
+
     async fn test_app() -> App {
         let config = Config::default();
         let keymap = config.keys.parse().unwrap();
@@ -1399,6 +1435,8 @@ mod tests {
                 kind: MediaKind::Audio,
                 caption: Some("voice note".into()),
                 file_name: Some("voice.ogg".into()),
+                duration_secs: Some(2),
+                waveform: None,
             }),
             reply_to_id: None,
             reply_ctx: None,
@@ -1432,6 +1470,7 @@ mod tests {
         app.state.create_popup(PopupKind::Audio(AudioPopup {
             msg: audio_demo_message(),
             playback: None,
+            error_note: None,
         }));
 
         app.handle_popup_key(KeyEvent::from(KeyCode::Char('1')))
@@ -1461,6 +1500,7 @@ mod tests {
         app.state.create_popup(PopupKind::Audio(AudioPopup {
             msg: audio_demo_message(),
             playback: None,
+            error_note: None,
         }));
 
         assert!(
@@ -1474,5 +1514,81 @@ mod tests {
         app.handle_popup_key(KeyEvent::from(KeyCode::Esc)).await;
         assert!(app.state.pop_up.is_none());
         assert!(app.state.playback.is_none());
+    }
+
+    #[tokio::test]
+    async fn opening_audio_does_not_autoplay() {
+        let config = Config::default();
+        let keymap = config.keys.parse().unwrap();
+        let mock = Box::new(MockMessenger::new("Telegram"));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            config,
+            keymap,
+            vec![MessengerKind::Stub(mock)],
+            false,
+            ratatui_image::picker::Picker::halfblocks(),
+            tx,
+        )
+        .await;
+        app.state.chat_state.open_chat = Some(OpenChat {
+            chat: audio_chat(),
+            history: vec![audio_demo_message()],
+            has_more_history: false,
+        });
+        app.state.create_popup(PopupKind::Audio(AudioPopup {
+            msg: audio_demo_message(),
+            playback: None,
+            error_note: None,
+        }));
+
+        // Mirrors `open_audio_popup`: the same-source session is seeded so the
+        // worker's reports are accepted (see `apply_playback_state` guard).
+        let seeded_source = PlayKey {
+            chat: ChatId::Myself,
+            message_id: MessageId::from("audio-1"),
+        };
+        app.state.playback = Some(PlaybackState {
+            source: seeded_source,
+            status: PlayState::Loading,
+            position: 0.0,
+            duration: 0.0,
+            updated_at: Instant::now(),
+        });
+
+        // Feeding the downloaded bytes must load the session only; playback
+        // starts on the first space press, never on open.
+        app.apply_audio_media(
+            ChatId::Myself,
+            MessageId::from("audio-1"),
+            Ok(Some(TONE_WAV.to_vec())),
+        )
+        .await;
+
+        let mut saw_loading = false;
+        loop {
+            match rx.recv().await.unwrap() {
+                UiEvent::PlaybackState(state) => {
+                    app.state.apply_playback_state(state.clone());
+                    if state.status == PlayState::Loading {
+                        saw_loading = true;
+                        continue;
+                    }
+                    assert_eq!(
+                        state.status,
+                        PlayState::Paused,
+                        "load must leave media paused, not playing"
+                    );
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        assert!(saw_loading);
+
+        let playback = app.state.playback.as_ref().unwrap();
+        assert_eq!(playback.status, PlayState::Paused);
+        assert!(playback.position.abs() < 0.001, "must sit at the start");
+        assert!((playback.duration - 1.0).abs() < 0.05);
     }
 }

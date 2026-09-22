@@ -56,8 +56,18 @@ ratatui-textarea = "0.9.2"
 chrono = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono"] }
+# fix for an ALSA error i was having: 
+# 'ALSA lib pcm.c:8787:(snd_pcm_recover) [error.pcm] underrun occurred' was appearing in progress bar
+tracing-log = "0.2"
 
-rodio = "0.21.1"
+rodio = { version = "0.21.1", features = ["tracing"] }
 # rodio 0.21.1 is pinned because 0.22 renamed Sink
 # to Player; opus-pure decodes Opus voice notes (Opus-in-Ogg) with no C deps.
+# rodio's `tracing` feature routes its stream-drop/error notices through
+# `tracing` (→ sender.log) instead of `eprintln!` into the TUI's alternate
+# screen. `rustix::stdio::dup2_stderr` (safe) redirects the process stderr to
+# the same log file so alsa-lib's own diagnostics (underruns while seeking)
+# never corrupt the terminal either; the crate was already in the tree as a
+# transitive dependency, so `features = ["stdio"]` adds no new download.
+rustix = { version = "1.1", features = ["stdio"] }
 opus-pure = "0.2.1"

@@ -3446,6 +3446,8 @@ mod tests {
                 kind: MediaKind::Image,
                 caption: Some("sunset".into()),
                 file_name: Some("sunset.png".into()),
+                duration_secs: None,
+                waveform: None,
             }),
             reply_to_id: None,
             reply_ctx: None,
@@ -3499,7 +3501,8 @@ mod tests {
         }
         let area = Rect::new(0, 0, 80, 24);
         let mut buf = Buffer::empty(area);
-        (&mut PopUp::new()).render(area, &mut buf, &mut popup);
+        let tag = app_state().await.chat_state.get_tag().unwrap_or("");
+        (&mut PopUp::new(tag)).render(area, &mut buf, &mut popup);
     }
 
     #[tokio::test]
@@ -3558,6 +3561,8 @@ mod tests {
             kind: MediaKind::Audio,
             caption: Some("voice note".into()),
             file_name: Some("voice.ogg".into()),
+            duration_secs: Some(2),
+            waveform: None,
         });
         msg.msg_actions = vec![MessageAction::Reply, MessageAction::Delete];
         msg
@@ -3575,6 +3580,7 @@ mod tests {
         state.create_popup(PopupKind::Audio(AudioPopup {
             msg: audio_message(),
             playback: None,
+            error_note: None,
         }));
         assert_eq!(
             state.audio_controls(&key(KeyCode::Char(' ')), &km),
@@ -3606,6 +3612,7 @@ mod tests {
         state.create_popup(PopupKind::Audio(AudioPopup {
             msg: audio_message(),
             playback: None,
+            error_note: None,
         }));
         state.playback = Some(PlaybackState {
             source: PlayKey {
@@ -3632,6 +3639,7 @@ mod tests {
         let mut popup = PopupState {
             popup_type: PopupKind::Audio(AudioPopup {
                 msg: audio_message(),
+                error_note: None,
                 playback: Some(PlaybackState {
                     source: PlayKey {
                         chat: ChatId::Myself,
@@ -3649,12 +3657,63 @@ mod tests {
 
         let area = Rect::new(0, 0, 80, 24);
         let mut buf = Buffer::empty(area);
-        (&mut PopUp::new()).render(area, &mut buf, &mut popup);
+        let tag = app_state().await.chat_state.get_tag().unwrap_or("");
+        (&mut PopUp::new(tag)).render(area, &mut buf, &mut popup);
 
         let rendered: String = buf.content.iter().map(|c| c.symbol()).collect();
         assert!(rendered.contains("Audio"), "audio label missing");
         assert!(rendered.contains("00:12"), "elapsed time missing");
         assert!(rendered.contains("00:15"), "duration missing");
         assert!(rendered.contains("Reply"), "action bar missing");
+    }
+
+    #[tokio::test]
+    async fn audio_popup_renders_error_note_in_bottom_border() {
+        let mut popup = PopupState {
+            popup_type: PopupKind::Audio(AudioPopup {
+                msg: audio_message(),
+                error_note: Some("download failed: WA not found".into()),
+                playback: Some(PlaybackState {
+                    source: PlayKey {
+                        chat: ChatId::Myself,
+                        message_id: MessageId::from("audio-1"),
+                    },
+                    status: PlayState::Error,
+                    position: 0.0,
+                    duration: 0.0,
+                    updated_at: Instant::now(),
+                }),
+            }),
+            prev_focus: Focus::Chat,
+            scroll_idx: 0,
+        };
+
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        let tag = app_state().await.chat_state.get_tag().unwrap_or("");
+        (&mut PopUp::new(tag)).render(area, &mut buf, &mut popup);
+
+        let rendered: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(
+            rendered.contains("download failed: WA not found"),
+            "error note must appear in the popup"
+        );
+
+        // A healthy popup renders no warning line.
+        let mut popup = PopupState {
+            popup_type: PopupKind::Audio(AudioPopup {
+                msg: audio_message(),
+                error_note: None,
+                playback: None,
+            }),
+            prev_focus: Focus::Chat,
+            scroll_idx: 0,
+        };
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        let tag = app_state().await.chat_state.get_tag().unwrap_or("");
+        (&mut PopUp::new(tag)).render(area, &mut buf, &mut popup);
+        let rendered: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(!rendered.contains("⚠"), "no error note without a failure");
     }
 }

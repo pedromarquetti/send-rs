@@ -471,12 +471,16 @@ fn mock_data(name: &'static str) -> MockData {
                 kind: MediaKind::Image,
                 caption: Some("sunset over the lake".into()),
                 file_name: Some("sunset.png".into()),
+                duration_secs: None,
+                waveform: None,
             });
             let mut voice = message("tg-6", &ALICE_ID, "Alice", "", false);
             voice.media = Some(MessageMedia {
                 kind: MediaKind::Audio,
                 caption: Some("voice note".into()),
                 file_name: Some("voice.ogg".into()),
+                duration_secs: Some(2),
+                waveform: None,
             });
             history.insert(
                 ALICE_ID.clone(),

@@ -32,6 +32,17 @@ async fn main() -> Result<()> {
         .append(true)
         .open(&log_path)?;
 
+    // this is a fix for an audio playback integration i was having:
+    // text was being written to the TUI instead of being logged/displayed properly
+    // TODO: do a recheck if this is needed
+    let stderr_redirected = rustix::stdio::dup2_stderr(&log_file).is_ok();
+    if !stderr_redirected {
+        eprintln!(
+            "warning: could not redirect stderr to {}",
+            log_path.display()
+        );
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -42,6 +53,15 @@ async fn main() -> Result<()> {
         ))
         .with_writer(std::sync::Mutex::new(log_file))
         .init();
+
+    // cpal (and other audio deps) emit through the `log` facade rather than
+    // `tracing`; bridge it so their records land in sender.log too.
+    let _ = tracing_log::LogTracer::init();
+
+    info!(
+        stderr_redirected,
+        "stderr redirected to the log file so audio diagnostics stay out of the TUI"
+    );
 
     let first_boot = !config::Config::exists();
     let config = config::Config::load()?.unwrap_or_default();

@@ -26,22 +26,39 @@ use whatsapp_rust::wacore::types::message::EditAttribute;
 use whatsapp_rust::wacore_binary::JidExt;
 use whatsapp_rust::waproto::whatsapp::HistorySync;
 use whatsapp_rust::waproto::whatsapp::Message as WaMessage;
-use whatsapp_rust::waproto::whatsapp::device_props::HistorySyncConfig;
+use whatsapp_rust::waproto::whatsapp::device_props::{HistorySyncConfig, PlatformType};
 
 type SharedState = Arc<RwLock<WhatsAppState>>;
 
 /// CDN fields needed to re-download one media message's bytes on demand,
 /// mirroring whatsapp-rust's `DownloadParams` but kept serde-friendly (its
-/// `MediaType` has no serde impls). Built from an image message's raw fields
-/// and rebuilt into `DownloadParams` (`MediaType::Image`) at fetch time.
-/// Holds no media bytes — only the references that fetch them.
+/// `MediaType` has no serde impls). Built from an image/audio message's raw
+/// fields and rebuilt into `DownloadParams` (`MediaType::{Image, Audio}`) at
+/// fetch time. Holds no media bytes — only the references that fetch them.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 struct MediaRef {
+    /// Which provider-neutral media kind the CDN fields hold, so `media_bytes`
+    /// rebuilds the right `MediaType`. Old caches only ever stored images.
+    kind: MediaKind,
     direct_path: String,
     media_key: Vec<u8>,
     file_sha256: Vec<u8>,
     file_enc_sha256: Vec<u8>,
     file_length: u64,
+}
+
+impl Default for MediaRef {
+    fn default() -> Self {
+        Self {
+            kind: MediaKind::Image,
+            file_length: Default::default(),
+            file_enc_sha256: Default::default(),
+            media_key: Default::default(),
+            direct_path: Default::default(),
+            file_sha256: Default::default(),
+        }
+    }
 }
 
 /// The persisted CDN reference for a message's image, if it carries one with
@@ -51,12 +68,34 @@ fn image_media_ref(msg: &WaMessage) -> Option<MediaRef> {
     let img = msg.get_base_message().image_message.as_option()?;
 
     Some(MediaRef {
+        kind: MediaKind::Image,
         direct_path: img.direct_path.as_ref()?.clone(),
         media_key: img.media_key.as_ref()?.clone(),
         file_sha256: img.file_sha256.as_ref()?.clone(),
         file_enc_sha256: img.file_enc_sha256.as_ref()?.clone(),
         file_length: img.file_length?,
     })
+}
+
+/// The persisted CDN reference for an audio/voice message, if it carries every
+/// field needed to download+decrypt it later.
+fn audio_media_ref(msg: &WaMessage) -> Option<MediaRef> {
+    let audio = msg.get_base_message().audio_message.as_option()?;
+
+    Some(MediaRef {
+        kind: MediaKind::Audio,
+        direct_path: audio.direct_path.as_ref()?.clone(),
+        media_key: audio.media_key.as_ref()?.clone(),
+        file_sha256: audio.file_sha256.as_ref()?.clone(),
+        file_enc_sha256: audio.file_enc_sha256.as_ref()?.clone(),
+        file_length: audio.file_length?,
+    })
+}
+
+/// CDN reference for a message's on-demand media (image or audio), whichever
+/// it carries, or `None` when there is none or it is incomplete.
+fn wa_media_ref(msg: &WaMessage) -> Option<MediaRef> {
+    image_media_ref(msg).or_else(|| audio_media_ref(msg))
 }
 
 /// In-memory mirror of the account's conversations and messages, populated from
@@ -282,10 +321,16 @@ fn handle_wa_media(msg: &WaMessage) -> Option<MessageMedia> {
         .as_option()
         .and_then(|d| d.file_name.clone());
 
+    // Voice notes/audio report their playback length; the TUI shows it before
+    // the first decode.
+    let duration_secs = base.audio_message.as_option().and_then(|a| a.seconds);
+
     Some(MessageMedia {
         kind,
         caption,
         file_name,
+        duration_secs,
+        waveform: None,
     })
 }
 
@@ -602,9 +647,20 @@ impl WhatsAppMessenger {
             .with_backend(store)
             .with_device_props(
                 DevicePropsOverride::new()
-                    .with_os("Sende-rs")
+                    .with_os("Send-rs")
+                    // Rebuild wacore's "win_hybrid" row (`require_full_sync`
+                    // + full_sync_days_limit + on_demand_ready): advertising
+                    // `requireFullSync` makes the server push the full recent
+                    // history to this device, which is the only way messages
+                    // received while sendrs was closed are ever re-delivered
+                    // (with their CDN media fields, so voice notes and images
+                    // can be played/downloaded after the fact).
+                    .with_platform_type(PlatformType::UWP)
+                    .with_require_full_sync(true)
                     .with_history_sync_config(HistorySyncConfig {
-                        // enabling on-demand history fetch
+                        // Enable on-demand history fetch and ask for the full
+                        // 365-day backfill window the win_hybrid row uses.
+                        full_sync_days_limit: Some(365),
                         on_demand_ready: Some(true),
                         complete_on_demand_ready: Some(true),
                         ..whatsapp_rust::wacore::store::device::default_history_sync_config()
@@ -702,35 +758,17 @@ impl WhatsAppMessenger {
         let cache_path = cache_path.to_path_buf();
 
         tokio::spawn(async move {
-            match client.request_syncd_snapshot_recovery("regular_high").await {
-                Ok(response) => debug!("WA snapshot recovery accepted: {response}"),
-                Err(e) => warn!("WA snapshot recovery failed: {e}"),
-            }
-
             // Backfill names for chats already cached (or seeded from the TUI)
             // right away; this also republishes the list so stale names get
             // replaced without waiting for a sync.
             enrich_chat_names(&client, &state, &cache_path, &tx_for_enrich).await;
-
-            // whatsapp-rust occasionally fails to decompress the snapshot PDO
-            // ("data error") and never delivers the conversation list. Retry in
-            // place until a history sync actually arrives, bounded, so a cold
-            // start still recovers its history/pushnames. The chat list by
-            // itself is not proof of delivery: it is seeded from the cache, so
-            // a non-empty `chats` cannot gate the retry.
-            for attempt in 0..2u32 {
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                if state.read().await.sync_seen_at.is_some() {
-                    break;
-                }
-                warn!(
-                    "WA no history sync after recovery (attempt {}); re-requesting snapshot",
-                    attempt + 1
-                );
-                if let Err(e) = client.request_syncd_snapshot_recovery("regular_high").await {
-                    warn!("WA snapshot re-request failed: {e}");
-                }
-            }
+            // Note: no `request_syncd_snapshot_recovery` here. That call asks
+            // the primary to re-send the *app-state* `regular_high` collection
+            // (contact/chats metadata), not conversation history, and every
+            // response in practice failed to decompress ("data error"). A full
+            // history backfill (which re-delivers conversations received while
+            // we were closed, CDN media fields included) is negotiated via the
+            // `require_full_sync` device prop instead.
         });
 
         let _ = tx.send(BackendEvent::Connected);
@@ -860,7 +898,7 @@ impl WhatsAppMessenger {
                         .by_stanza_id
                         .insert(stanza_id.clone(), (chat.clone(), msg.message_id.clone()));
 
-                    if let Some(media_ref) = image_media_ref(&inbound.message) {
+                    if let Some(media_ref) = wa_media_ref(&inbound.message) {
                         state.media_refs.insert(stanza_id.clone(), media_ref);
                     }
 
@@ -1936,6 +1974,17 @@ async fn handle_history_sync(
                 continue;
             }
 
+            // Keep the message's CDN reference while it may still be opened
+            // with media, so the image/audio popup can re-download it on
+            // demand. Persisted so it survives restarts too; only the fetch
+            // fields are kept, never the media bytes. Captured BEFORE the
+            // `already` skip below: caches written before audio refs existed
+            // hold none, and a message already in `state.history` would
+            // otherwise be skipped forever and stay unfetchable.
+            if let Some(media_ref) = wa_media_ref(msg) {
+                state.media_refs.insert(stanza_id.to_string(), media_ref);
+            }
+
             let already = state
                 .history
                 .get(&chat)
@@ -1944,14 +1993,6 @@ async fn handle_history_sync(
 
             if already {
                 continue;
-            }
-
-            // Keep the message's CDN reference while it may still be opened
-            // with media, so the image popup can re-download it on demand.
-            // Persisted so it survives restarts too; only the fetch fields are
-            // kept, never the media bytes.
-            if let Some(media_ref) = image_media_ref(msg) {
-                state.media_refs.insert(stanza_id.to_string(), media_ref);
             }
 
             let from_me = key.from_me.unwrap_or(false);
@@ -2552,14 +2593,41 @@ impl Messenger for WhatsAppMessenger {
             return Err(BackendError::Other("not a WhatsApp chat".into()));
         };
 
-        // The persisted CDN reference covers images from earlier sessions too;
-        // nothing here holds or caches the media bytes themselves.
-        let params = {
-            let state = self.state.read().await;
-            state.media_refs.get(&message_id.0).cloned()
-        };
-        let Some(r) = params else {
+        // The persisted CDN reference covers media from earlier sessions too;
+        // nothing here holds or caches the media bytes themselves. A missing
+        // ref means the message predates audio ref capture (no HistorySync has
+        // re-delivered it yet), NOT a download problem.
+        let media_ref = self
+            .state
+            .read()
+            .await
+            .media_refs
+            .get(&message_id.0)
+            .cloned();
+
+        let Some(r) = media_ref else {
+            // A missing ref means the message was received while sendrs was
+            // closed (or predates ref capture) and no HistorySync has
+            // re-delivered it yet — NOT a download problem. `history_sync_seen`
+            // records whether the full-history backfill has fired this session;
+            // it only does once the `require_full_sync` device prop is honoured.
+            let history_sync_seen = self.state.read().await.sync_seen_at.is_some();
+
+            debug!(
+                message_id = %message_id.0,
+                history_sync_seen,
+                "no WA media ref cached for message"
+            );
             return Ok(None);
+        };
+
+        // The reference records which media kind it came from so the right
+        // `MediaType` decrypts the stream (audio and image use different keys).
+        let media_type = match r.kind {
+            MediaKind::Image => MediaType::Image,
+            MediaKind::Audio => MediaType::Audio,
+            // No other kind is ever stored in `media_refs`.
+            _ => return Ok(None),
         };
 
         let params = DownloadParams::encrypted(
@@ -2568,12 +2636,13 @@ impl Messenger for WhatsAppMessenger {
             &r.file_sha256,
             &r.file_enc_sha256,
             r.file_length,
-            MediaType::Image,
+            media_type,
         );
 
         debug!(message_id = ?message_id, "Fetching WA media bytes on demand");
         let client = self.current_client();
         let bytes = client.download(&params).await.map_err(BackendError::from)?;
+
         Ok((!bytes.is_empty()).then_some(bytes))
     }
 
@@ -4184,6 +4253,93 @@ mod tests {
         assert!(restored.media_refs.contains_key("wa-img-1"));
     }
 
+    #[tokio::test]
+    async fn cached_voice_note_gains_a_media_ref_on_resync() {
+        let (tx, _rx) = broadcast::channel(128);
+        let state: SharedState = Arc::new(RwLock::new(WhatsAppState::default()));
+        let chat_id = "15550000008@s.whatsapp.net";
+
+        // Simulate a cache written before audio refs existed: the voice note
+        // is already in `state.history` (restored from disk) with no
+        // `media_refs` entry. The app used to `continue` past the capture for
+        // such messages, so they stayed unfetchable (the ⚠ popup state).
+        let cached = Message {
+            message_id: MessageId("wa-cached-audio".into()),
+            chat: ChatId::WhatsApp(chat_id.to_string()),
+            sender: "Alice".into(),
+            author_id: None,
+            text: String::new(),
+            timestamp: 1000,
+            from_me: false,
+            msg_actions: Vec::new(),
+            media: Some(MessageMedia {
+                kind: MediaKind::Audio,
+                caption: None,
+                file_name: None,
+                duration_secs: Some(12),
+                waveform: None,
+            }),
+            reply_to_id: None,
+            reply_ctx: None,
+            pending: false,
+            failed: false,
+        };
+        state
+            .write()
+            .await
+            .history
+            .insert(ChatId::WhatsApp(chat_id.to_string()), vec![cached]);
+
+        // A later HistorySync re-delivers the same stanza with the full CDN
+        // fields: the ref must be captured even though the message is already
+        // cached.
+        let voice = wa::HistorySyncMsg {
+            message: MessageField::some(wa::WebMessageInfo {
+                key: MessageField::some(wa::MessageKey {
+                    id: Some("wa-cached-audio".to_string()),
+                    remote_jid: Some(chat_id.to_string()),
+                    from_me: Some(false),
+                    participant: None,
+                }),
+                message: MessageField::some(wa::Message {
+                    audio_message: MessageField::some(wa::message::AudioMessage {
+                        direct_path: Some("/v/t62.7118-24/9876_54321/mp3".into()),
+                        media_key: Some(vec![0, 1, 2, 3]),
+                        file_sha256: Some(vec![4, 5, 6, 7]),
+                        file_enc_sha256: Some(vec![8, 9, 10, 11]),
+                        file_length: Some(4096),
+                        seconds: Some(12),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                message_timestamp: Some(1000),
+                push_name: Some("Alice".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let hs = wa::HistorySync {
+            conversations: vec![conversation(chat_id, vec![voice])],
+            pushnames: vec![],
+            ..Default::default()
+        };
+
+        super::handle_history_sync(&hs, None, &state, &tx, Path::new("/tmp/wa_test_cache.json"))
+            .await;
+
+        let s = state.read().await;
+        let r = s
+            .media_refs
+            .get("wa-cached-audio")
+            .expect("resynced cached message gains its audio ref");
+        assert_eq!(r.kind, MediaKind::Audio);
+        assert_eq!(r.direct_path, "/v/t62.7118-24/9876_54321/mp3");
+        assert_eq!(r.file_length, 4096);
+        // The stored message is not duplicated by the resync.
+        assert_eq!(s.history[&ChatId::WhatsApp(chat_id.to_string())].len(), 1);
+    }
+
     #[test]
     fn image_media_ref_extracts_cdn_fields_and_skips_incomplete_images() {
         let img = wa::Message {
@@ -4197,13 +4353,14 @@ mod tests {
             }),
             ..Default::default()
         };
-        let r = image_media_ref(&img).expect("complete image yields a ref");
+        let r = wa_media_ref(&img).expect("complete image yields a ref");
+        assert_eq!(r.kind, MediaKind::Image);
         assert_eq!(r.direct_path, "/v/t62.7118-24/12345_67890");
         assert_eq!(r.media_key, vec![0, 1, 2, 3]);
         assert_eq!(r.file_length, 1024);
 
         // A text message has no media.
-        assert!(image_media_ref(&text_message("hello")).is_none());
+        assert!(wa_media_ref(&text_message("hello")).is_none());
 
         // An image missing its direct path cannot be re-downloaded by reference.
         let no_path = wa::Message {
@@ -4213,7 +4370,60 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(image_media_ref(&no_path).is_none());
+        assert!(wa_media_ref(&no_path).is_none());
+    }
+
+    #[test]
+    fn audio_media_ref_extracts_cdn_fields_for_voice_notes() {
+        let audio = wa::Message {
+            audio_message: MessageField::some(wa::message::AudioMessage {
+                direct_path: Some("/v/t62.7118-24/9876_5432/mp3".into()),
+                media_key: Some(vec![0, 1, 2, 3]),
+                file_sha256: Some(vec![4, 5, 6, 7]),
+                file_enc_sha256: Some(vec![8, 9, 10, 11]),
+                file_length: Some(4096),
+                ptt: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let r = wa_media_ref(&audio).expect("complete audio yields a ref");
+        assert_eq!(r.kind, MediaKind::Audio);
+        assert_eq!(r.direct_path, "/v/t62.7118-24/9876_5432/mp3");
+        assert_eq!(r.media_key, vec![0, 1, 2, 3]);
+        assert_eq!(r.file_length, 4096);
+
+        // An audio message missing its media key cannot be fetched later.
+        let no_key = wa::Message {
+            audio_message: MessageField::some(wa::message::AudioMessage {
+                direct_path: Some("/v/foo".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(wa_media_ref(&no_key).is_none());
+    }
+
+    #[test]
+    fn audio_duration_is_captured_from_voice_note_seconds() {
+        let audio = wa::Message {
+            audio_message: MessageField::some(wa::message::AudioMessage {
+                direct_path: Some("/v/audio".into()),
+                media_key: Some(vec![1, 2, 3]),
+                file_sha256: Some(vec![4, 5, 6]),
+                file_enc_sha256: Some(vec![7, 8, 9]),
+                file_length: Some(2048),
+                seconds: Some(42),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let media = handle_wa_media(&audio).expect("audio yields media");
+        assert_eq!(media.kind, MediaKind::Audio);
+        assert_eq!(media.duration_secs, Some(42));
+
+        // Text messages carry no media at all.
+        assert!(handle_wa_media(&text_message("hello")).is_none());
     }
 
     #[test]

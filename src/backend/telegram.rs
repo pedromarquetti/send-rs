@@ -64,10 +64,25 @@ fn telegram_media_kind(msg: &grammers_client::message::Message) -> Option<MediaK
 fn telegram_message_media(msg: &grammers_client::message::Message) -> Option<MessageMedia> {
     let kind = telegram_media_kind(msg)?;
     let caption = (!msg.text().trim().is_empty()).then(|| msg.text().to_string());
+
+    // Document-backed media carry a file name and (audio/video) a duration;
+    // Photos do not. `doc.duration()` reads the `DocumentAttributeAudio`/
+    // `DocumentAttributeVideo` attributes, so voice notes report their length
+    // before the TUI decodes the file.
+    let (file_name, duration_secs) = match msg.media() {
+        Some(grammers_client::media::Media::Document(doc)) => (
+            doc.name().map(str::to_string),
+            doc.duration().map(|d| d.round() as u32),
+        ),
+        _ => (None, None),
+    };
+
     Some(MessageMedia {
         kind,
         caption,
-        file_name: None,
+        file_name,
+        duration_secs,
+        waveform: None,
     })
 }
 

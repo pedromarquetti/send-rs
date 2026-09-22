@@ -2,7 +2,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::UnboundedSender;
-use tracing::error;
+use tracing::{debug, error};
 
 mod engine;
 
@@ -173,15 +173,23 @@ impl Worker {
     fn handle(&mut self, command: PlayerCommand) {
         match command {
             PlayerCommand::Load { source, bytes } => {
+                debug!(chat = ?source.chat, msg = %source.message_id, "player: load requested");
                 self.source = Some(source);
                 self.report(PlayState::Loading);
 
-                if let Err(err) = self.engine.load(&bytes) {
-                    error!(error = %err, "Failed to load audio");
+                match self.engine.load(&bytes) {
+                    Ok(duration) => debug!(duration, "player: media loaded"),
+                    Err(err) => error!(error = %err, "Failed to load audio"),
                 }
             }
-            PlayerCommand::Play => self.engine.play(),
-            PlayerCommand::Pause => self.engine.pause(),
+            PlayerCommand::Play => {
+                debug!("player: play requested");
+                self.engine.play();
+            }
+            PlayerCommand::Pause => {
+                debug!("player: pause requested");
+                self.engine.pause();
+            }
             PlayerCommand::Seek { delta_secs } => {
                 let position = self.engine.position() + delta_secs;
                 let duration = self.engine.duration();
@@ -191,9 +199,13 @@ impl Worker {
                     position.max(0.0)
                 };
 
+                debug!(delta_secs, target, "player: seek");
                 self.engine.seek(target);
             }
-            PlayerCommand::Stop => self.engine.stop(),
+            PlayerCommand::Stop => {
+                debug!("player: stop requested");
+                self.engine.stop();
+            }
         }
 
         let status = self.engine.status();
@@ -215,6 +227,16 @@ impl Worker {
             return;
         };
 
+        if status != self.prev_status {
+            debug!(
+                chat = ?source.chat,
+                msg = %source.message_id,
+                status = ?status,
+                position = self.engine.position(),
+                duration = self.engine.duration(),
+                "player status changed"
+            );
+        }
         self.prev_status = status;
 
         let state = PlaybackState {
