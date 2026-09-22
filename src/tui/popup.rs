@@ -1,10 +1,12 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Clear, Paragraph};
+use std::time::Instant;
 
 use crate::backend::{Message, MessageAction};
 use crate::helpers::{calc_height, popup_area, wrap_text};
 use crate::tui::chat::chat_widget::format_timestamp;
 use crate::tui::image::{ImageWidget, ImageWidgetState};
+use crate::tui::player::{PlayState, PlaybackState};
 use crate::tui::state::PopupState;
 
 #[derive(Debug)]
@@ -15,6 +17,7 @@ pub enum PopupKind {
     Warn(String),
     Message(Message),
     Image(ImagePopup),
+    Audio(AudioPopup),
     Question(String),
 }
 
@@ -28,6 +31,23 @@ impl std::fmt::Debug for ImagePopup {
         f.debug_struct("ImagePopup")
             .field("msg", &self.msg)
             .finish_non_exhaustive()
+    }
+}
+
+/// Audio playback popup. The live session lives in `AppState::playback`; this
+/// field is a per-frame mirror refreshed at draw time so the widget has
+/// something to render (dropped with the popup on dismiss).
+pub struct AudioPopup {
+    pub msg: Message,
+    pub playback: Option<PlaybackState>,
+}
+
+impl std::fmt::Debug for AudioPopup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AudioPopup")
+            .field("msg", &self.msg)
+            .field("playback", &self.playback)
+            .finish()
     }
 }
 
@@ -312,8 +332,130 @@ impl StatefulWidget for &mut PopUp {
 
                 Paragraph::new(message_actions_line(msg)).render(split[2], buf);
             }
+
+            PopupKind::Audio(AudioPopup { msg, playback }) => {
+                let block = Block::bordered()
+                    .title(format!(
+                        " {} {} ",
+                        msg.sender,
+                        format_timestamp(msg.timestamp)
+                    ))
+                    .border_style(Style::default().fg(Color::Magenta).bg(Color::Black));
+
+                let mut content_lines: Vec<Line> = Vec::new();
+
+                let (status_icon, elapsed, duration, ratio) = match playback {
+                    Some(p) if p.status == PlayState::Error => ("⚠", p.position, p.duration, 0.0),
+                    Some(p) => {
+                        let now = Instant::now();
+                        let pos = p.display_position(now);
+                        let ratio = if p.duration > 0.0 {
+                            (pos / p.duration).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        let icon = match p.status {
+                            PlayState::Playing => "▶",
+                            PlayState::Paused | PlayState::Stopped => "⏸",
+                            PlayState::Loading => "…",
+                            PlayState::Error => "⚠",
+                        };
+                        (icon, pos, p.duration, ratio)
+                    }
+                    None => ("…", 0.0, 0.0, 0.0),
+                };
+
+                let progress = progress_strip(ratio, content_width);
+                let duration_label = if duration > 0.0 {
+                    format_duration(duration)
+                } else {
+                    "--:--".to_string()
+                };
+
+                content_lines.push(Line::from(Span::styled(
+                    format!(
+                        "  {status_icon} Audio · {} / {duration_label}",
+                        format_duration(elapsed)
+                    ),
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                )));
+
+                content_lines.push(Line::from(Span::styled(
+                    progress,
+                    Style::default().fg(Color::Magenta),
+                )));
+
+                if let Some(caption) = msg
+                    .media
+                    .as_ref()
+                    .and_then(|media| media.caption.clone())
+                    .filter(|caption| !caption.trim().is_empty())
+                {
+                    content_lines.push(Line::from(Span::raw("")));
+
+                    for text_line in caption.lines() {
+                        for chunk in wrap_text(text_line, content_width) {
+                            content_lines.push(Line::from(Span::raw(chunk)));
+                        }
+                    }
+                }
+
+                let options_line = message_actions_line(msg);
+
+                let total_lines = content_lines.len();
+                let popup_height = (total_lines as u16 + 4)
+                    .min(area.height.saturating_sub(4))
+                    .max(6);
+                let popup_area = popup_area(area, width, popup_height);
+
+                Clear.render(popup_area, buf);
+
+                let inner = popup_area.inner(Margin {
+                    vertical: 1,
+                    horizontal: 1,
+                });
+
+                let split = Layout::vertical([
+                    Constraint::Fill(1),
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                ])
+                .split(inner);
+
+                let viewport_height = split[0].height as usize;
+                state.scroll_idx = state
+                    .scroll_idx
+                    .min(total_lines.saturating_sub(viewport_height));
+
+                let paragraph = Paragraph::new(content_lines)
+                    .scroll((state.scroll_idx as u16, 0))
+                    .block(block);
+                paragraph.render(popup_area, buf);
+
+                let hint = Line::from(Span::styled(
+                    "  space ▸ play/pause   < ▸ -5s   > ▸ +5s   esc ▸ close".to_string(),
+                    Style::default().fg(Color::DarkGray),
+                ));
+                Paragraph::new(hint).render(split[1], buf);
+                Paragraph::new(options_line).render(split[2], buf);
+            }
         }
     }
+}
+
+fn format_duration(secs: f64) -> String {
+    let total = secs.max(0.0) as u64;
+    format!("{:02}:{:02}", total / 60, total % 60)
+}
+
+/// One-row progress strip, e.g. `███████░░░` with the label on the right.
+fn progress_strip(ratio: f64, width: usize) -> String {
+    let bar_width = width.saturating_sub(1);
+    let filled = (bar_width as f64 * ratio).round() as usize;
+    let empty = bar_width.saturating_sub(filled);
+    format!("  {}{}", "█".repeat(filled), "░".repeat(empty))
 }
 
 /// `[1] Reply [2] Edit ...` action bar shared by the Message and Image popups.

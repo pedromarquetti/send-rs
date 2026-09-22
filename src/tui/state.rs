@@ -1,4 +1,5 @@
 use anyhow::Result;
+use ratatui::crossterm::event::KeyEvent;
 use ratatui::style::{Color, Style};
 use ratatui::widgets::ListState;
 use ratatui_textarea::{TextArea, WrapMode};
@@ -111,6 +112,15 @@ pub struct PopupState {
     pub popup_type: PopupKind,
     prev_focus: Focus,
     pub scroll_idx: usize,
+}
+
+/// A control decided from a key press on the audio popup. The TUI maps it to
+/// `Player` commands; it is a plain value so the mapping is unit-testable
+/// without a player worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioAction {
+    PlayPause,
+    Seek { delta_secs: i32 },
 }
 
 impl AppState {
@@ -353,6 +363,11 @@ impl AppState {
         if let Some(popup) = self.pop_up.take() {
             self.focus = popup.prev_focus;
         }
+
+        // Closing any popup ends the audio session: no position is retained,
+        // so reopening starts from a fresh fetch + fresh engine load. Clearing
+        // here also makes `apply_playback_state`'s guard drop any late reports.
+        self.playback = None;
     }
 
     /// Apply a player report for the audio session. Reports are dropped unless
@@ -365,6 +380,30 @@ impl AppState {
             .is_some_and(|current| current.source == incoming.source)
         {
             self.playback = Some(incoming);
+        }
+    }
+
+    /// Map a key to an audio-popup control. Returns `None` when the popup on
+    /// screen is not an Audio popup or the key is not bound. `seek_back` /
+    /// `seek_forward` are compared by `KeyCode` only: terminals disagree on
+    /// whether `<`/`>` arrive with a shift modifier.
+    pub fn audio_controls(&self, key: &KeyEvent, keymap: &Keymap) -> Option<AudioAction> {
+        let audio_open = self
+            .pop_up
+            .as_ref()
+            .is_some_and(|p| matches!(p.popup_type, PopupKind::Audio(_)));
+        if !audio_open {
+            return None;
+        }
+
+        if *key == keymap.play_pause {
+            Some(AudioAction::PlayPause)
+        } else if key.code == keymap.seek_back.code {
+            Some(AudioAction::Seek { delta_secs: -5 })
+        } else if key.code == keymap.seek_forward.code {
+            Some(AudioAction::Seek { delta_secs: 5 })
+        } else {
+            None
         }
     }
 
@@ -1478,10 +1517,11 @@ pub async fn fetch_all_chats(
 mod tests {
     use super::*;
     use crate::backend::mock::MockMessenger;
-    use crate::backend::{MediaKind, Message, MessageId, MessageMedia, Messenger};
+    use crate::backend::{MediaKind, Message, MessageAction, MessageId, MessageMedia, Messenger};
+    use crate::config::KeymapConfig;
     use crate::tui::image::ImageWidgetState;
     use crate::tui::player::{PlayKey, PlayState, PlaybackState};
-    use crate::tui::popup::{ImagePopup, PopUp};
+    use crate::tui::popup::{AudioPopup, ImagePopup, PopUp};
     use ratatui::buffer::Buffer;
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
     use ratatui::layout::Rect;
@@ -2193,7 +2233,7 @@ mod tests {
 
         assert_eq!(
             state.chat_state.open_chat.as_ref().unwrap().history.len(),
-            3
+            4
         );
         assert!(!state.chat_state.chats[0].unread);
         assert_eq!(state.chat_state.chats[0].unread_count, 0);
@@ -2219,7 +2259,7 @@ mod tests {
 
         assert_eq!(
             state.chat_state.open_chat.as_ref().unwrap().history.len(),
-            4
+            5
         );
         assert_eq!(state.chat_state.chats[0].last_message_ts, Some(1000));
         assert!(!state.chat_state.chats[0].unread);
@@ -3509,5 +3549,112 @@ mod tests {
             updated_at: Instant::now(),
         });
         assert_eq!(state.playback.as_ref().unwrap().status, PlayState::Playing);
+    }
+
+    fn audio_message() -> Message {
+        let mut msg = image_message();
+        msg.message_id = MessageId::from("audio-1");
+        msg.media = Some(MessageMedia {
+            kind: MediaKind::Audio,
+            caption: Some("voice note".into()),
+            file_name: Some("voice.ogg".into()),
+        });
+        msg.msg_actions = vec![MessageAction::Reply, MessageAction::Delete];
+        msg
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::from(code)
+    }
+
+    #[tokio::test]
+    async fn audio_controls_are_scoped_to_the_audio_popup() {
+        let mut state = app_state().await;
+        let km = KeymapConfig::default().parse().unwrap();
+
+        state.create_popup(PopupKind::Audio(AudioPopup {
+            msg: audio_message(),
+            playback: None,
+        }));
+        assert_eq!(
+            state.audio_controls(&key(KeyCode::Char(' ')), &km),
+            Some(AudioAction::PlayPause)
+        );
+        assert_eq!(
+            state.audio_controls(&key(KeyCode::Char('<')), &km),
+            Some(AudioAction::Seek { delta_secs: -5 })
+        );
+        assert_eq!(
+            state.audio_controls(&key(KeyCode::Char('>')), &km),
+            Some(AudioAction::Seek { delta_secs: 5 })
+        );
+        assert_eq!(
+            state.audio_controls(&key(KeyCode::Char('x')), &km),
+            None,
+            "unbound keys map to no action"
+        );
+
+        // Without an Audio popup on screen the same keys must not map.
+        state.dismiss_popup();
+        state.create_popup(PopupKind::Info("hello".into()));
+        assert_eq!(state.audio_controls(&key(KeyCode::Char(' ')), &km), None);
+    }
+
+    #[tokio::test]
+    async fn dismissing_audio_popup_stops_and_clears_session() {
+        let mut state = app_state().await;
+        state.create_popup(PopupKind::Audio(AudioPopup {
+            msg: audio_message(),
+            playback: None,
+        }));
+        state.playback = Some(PlaybackState {
+            source: PlayKey {
+                chat: ChatId::Myself,
+                message_id: MessageId::from("audio-1"),
+            },
+            status: PlayState::Playing,
+            position: 3.0,
+            duration: 10.0,
+            updated_at: Instant::now(),
+        });
+
+        state.dismiss_popup();
+
+        assert!(state.pop_up.is_none());
+        assert!(
+            state.playback.is_none(),
+            "session state must not survive dismissal"
+        );
+    }
+
+    #[tokio::test]
+    async fn audio_popup_renders_progress_and_actions() {
+        let mut popup = PopupState {
+            popup_type: PopupKind::Audio(AudioPopup {
+                msg: audio_message(),
+                playback: Some(PlaybackState {
+                    source: PlayKey {
+                        chat: ChatId::Myself,
+                        message_id: MessageId::from("audio-1"),
+                    },
+                    status: PlayState::Paused,
+                    position: 12.0,
+                    duration: 15.0,
+                    updated_at: Instant::now(),
+                }),
+            }),
+            prev_focus: Focus::Chat,
+            scroll_idx: 0,
+        };
+
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        (&mut PopUp::new()).render(area, &mut buf, &mut popup);
+
+        let rendered: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(rendered.contains("Audio"), "audio label missing");
+        assert!(rendered.contains("00:12"), "elapsed time missing");
+        assert!(rendered.contains("00:15"), "duration missing");
+        assert!(rendered.contains("Reply"), "action bar missing");
     }
 }

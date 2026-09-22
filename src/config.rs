@@ -71,6 +71,9 @@ pub struct KeymapConfig {
     pub send: String,
     pub newline: String,
     pub retry_connection: String,
+    pub play_pause: String,
+    pub seek_back: String,
+    pub seek_forward: String,
 }
 
 impl Default for KeymapConfig {
@@ -90,6 +93,9 @@ impl Default for KeymapConfig {
             send: "enter".into(),
             newline: "shift+enter".into(),
             retry_connection: "r".into(),
+            play_pause: "space".into(),
+            seek_back: "<".into(),
+            seek_forward: ">".into(),
         }
     }
 }
@@ -111,6 +117,9 @@ impl KeymapConfig {
             send: parse_key(&self.send)?,
             newline: parse_key(&self.newline)?,
             retry_connection: parse_key(&self.retry_connection)?,
+            play_pause: parse_key(&self.play_pause)?,
+            seek_back: parse_key(&self.seek_back)?,
+            seek_forward: parse_key(&self.seek_forward)?,
         })
     }
 }
@@ -137,6 +146,12 @@ pub struct Keymap {
     /// Manually force a reconnection after a provider entered the
     /// "connection lost" state.
     pub retry_connection: KeyEvent,
+    /// Toggle play/pause on the audio popup.
+    pub play_pause: KeyEvent,
+    /// Seek backward on the audio popup.
+    pub seek_back: KeyEvent,
+    /// Seek forward on the audio popup.
+    pub seek_forward: KeyEvent,
 }
 
 /// Tests must never read or write a real user's config. Under `#[cfg(test)]`
@@ -343,6 +358,18 @@ mod tests {
             keymap.retry_connection,
             KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)
         );
+        assert_eq!(
+            keymap.play_pause,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)
+        );
+        assert_eq!(
+            keymap.seek_back,
+            KeyEvent::new(KeyCode::Char('<'), KeyModifiers::NONE)
+        );
+        assert_eq!(
+            keymap.seek_forward,
+            KeyEvent::new(KeyCode::Char('>'), KeyModifiers::NONE)
+        );
     }
 
     #[test]
@@ -389,6 +416,9 @@ mod tests {
         let config: Config = toml::from_str(raw).unwrap();
         assert_eq!(config.keys.search_text, "s");
         assert_eq!(config.keys.retry_connection, "r");
+        assert_eq!(config.keys.play_pause, "space");
+        assert_eq!(config.keys.seek_back, "<");
+        assert_eq!(config.keys.seek_forward, ">");
     }
 
     #[test]

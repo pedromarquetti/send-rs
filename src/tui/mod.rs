@@ -7,6 +7,7 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::widgets::{StatefulWidget, Widget};
 use ratatui::{DefaultTerminal, Frame};
 use ratatui_image::picker::{Picker, ProtocolType};
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
@@ -21,10 +22,10 @@ use crate::tui::chat::chat_list::ChatList;
 use crate::tui::chat::chat_widget::ChatWidget;
 use crate::tui::image::ImageWidgetState;
 use crate::tui::loading::{LoadingSpinner, LoadingWidget};
-use crate::tui::player::{PlaybackState, Player, RodioEngine};
-use crate::tui::popup::{ImagePopup, PopupKind};
+use crate::tui::player::{PlayKey, PlayState, PlaybackState, Player, RodioEngine};
+use crate::tui::popup::{AudioPopup, ImagePopup, PopupKind};
 use crate::tui::settings::Settings;
-use crate::tui::state::{AppState, Focus, Mode, Screen};
+use crate::tui::state::{AppState, AudioAction, Focus, Mode, Screen};
 use crate::tui::status_bar::StatusBarWidget;
 
 mod chat;
@@ -66,6 +67,14 @@ enum UiEvent {
     /// popup; applied by `App::apply_image_media` (a no-op if the popup for
     /// `message_id` is no longer open).
     ImageMedia {
+        chat: ChatId,
+        message_id: MessageId,
+        result: Result<Option<Vec<u8>>, BackendError>,
+    },
+    /// Result of a backgrounded `Messenger::media_bytes` fetch for the audio
+    /// popup; bytes are handed to the player worker (guarded by the popup still
+    /// showing that message).
+    AudioMedia {
         chat: ChatId,
         message_id: MessageId,
         result: Result<Option<Vec<u8>>, BackendError>,
@@ -459,6 +468,11 @@ async fn run_app(
                         message_id,
                         result,
                     } => app.apply_image_media(chat, message_id, result).await,
+                    UiEvent::AudioMedia {
+                        chat,
+                        message_id,
+                        result,
+                    } => app.apply_audio_media(chat, message_id, result).await,
                     UiEvent::PlaybackState(playback) => {
                         app.state.apply_playback_state(playback);
                     }
@@ -677,6 +691,98 @@ impl App {
                 view.set_error(format!("Failed to load image: {e}"))
             }
         }
+    }
+
+    async fn apply_audio_media(
+        &mut self,
+        chat: ChatId,
+        message_id: MessageId,
+        result: Result<Option<Vec<u8>>, BackendError>,
+    ) {
+        let popup_msg = match self.state.pop_up.as_ref().map(|p| &p.popup_type) {
+            Some(PopupKind::Audio(AudioPopup { msg, .. })) => msg,
+            _ => return,
+        };
+
+        // Only apply if the popup still shows the same message.
+        if popup_msg.chat != chat || popup_msg.message_id != message_id {
+            return;
+        }
+
+        let source = PlayKey { chat, message_id };
+
+        match result {
+            Ok(Some(bytes)) => {
+                self.player.load(source, bytes);
+                self.player.play();
+            }
+            Ok(None) | Err(_) => {
+                warn!(chat = ?source.chat, msg = %source.message_id, "No audio media available");
+                self.state.playback = Some(PlaybackState {
+                    source,
+                    status: PlayState::Error,
+                    position: 0.0,
+                    duration: 0.0,
+                    updated_at: Instant::now(),
+                });
+            }
+        }
+    }
+
+    fn open_audio_popup(&mut self, msg: Message) {
+        debug!("Opening audio for {:?}", msg.message_id);
+        let Some(messenger) = self.state.chat_owner(&msg.chat).cloned() else {
+            return;
+        };
+
+        let chat = msg.chat.clone();
+        let message_id = msg.message_id.clone();
+
+        // Seed the session so early worker reports are accepted by
+        // `apply_playback_state`'s same-source guard.
+        self.state.playback = Some(PlaybackState {
+            source: PlayKey {
+                chat: chat.clone(),
+                message_id: message_id.clone(),
+            },
+            status: PlayState::Loading,
+            position: 0.0,
+            duration: 0.0,
+            updated_at: Instant::now(),
+        });
+
+        self.state.create_popup(PopupKind::Audio(AudioPopup {
+            msg,
+            playback: None,
+        }));
+
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = messenger.media_bytes(&chat, &message_id).await;
+
+            let _ = tx.send(UiEvent::AudioMedia {
+                chat,
+                message_id,
+                result,
+            });
+        });
+    }
+
+    /// Dismiss the current popup, stopping an active audio session. Closing the
+    /// audio popup must silence playback and drop its state so reopening starts
+    /// from a fresh fetch (no position is retained).
+    fn dismiss_popup(&mut self) {
+        let was_audio = self
+            .state
+            .pop_up
+            .as_ref()
+            .is_some_and(|p| matches!(p.popup_type, PopupKind::Audio(_)));
+        // `AppState::dismiss_popup` clears the stored playback snapshot.
+        if was_audio {
+            self.player.pause();
+            self.player.stop();
+        }
+        self.state.dismiss_popup();
     }
 
     async fn shutdown(&mut self) {
@@ -967,14 +1073,10 @@ impl App {
                     // Offer actions appropriate to the message's state.
                     msg.msg_actions = available_message_actions(&msg);
 
-                    if msg
-                        .media
-                        .as_ref()
-                        .is_some_and(|m| m.kind == MediaKind::Image)
-                    {
-                        self.open_image_popup(msg);
-                    } else {
-                        self.state.create_popup(PopupKind::Message(msg));
+                    match msg.media.as_ref().map(|m| m.kind.clone()) {
+                        Some(MediaKind::Image) => self.open_image_popup(msg),
+                        Some(MediaKind::Audio) => self.open_audio_popup(msg),
+                        _ => self.state.create_popup(PopupKind::Message(msg)),
                     }
                 }
             }
@@ -1007,10 +1109,15 @@ impl App {
 
     async fn handle_popup_key(&mut self, key: KeyEvent) {
         if key == self.state.keymap.dismiss {
-            self.state.dismiss_popup();
+            self.dismiss_popup();
         }
 
         let km = self.state.keymap.clone();
+
+        // Playback controls only apply while an audio popup is open. Read here
+        // (before borrowing `pop_up` mutably); after a dismissal `pop_up` is
+        // gone, so the match below returns before the action can leak.
+        let audio_action = self.state.audio_controls(&key, &km);
 
         let popup = match self.state.pop_up.as_mut() {
             Some(p) => p,
@@ -1023,16 +1130,39 @@ impl App {
             popup.scroll_idx = popup.scroll_idx.saturating_add(1);
         }
 
+        if let Some(action) = audio_action {
+            match action {
+                AudioAction::PlayPause => {
+                    let playing = self
+                        .state
+                        .playback
+                        .as_ref()
+                        .is_some_and(|p| p.status == PlayState::Playing);
+                    if playing {
+                        self.player.pause();
+                    } else {
+                        self.player.play();
+                    }
+                }
+                AudioAction::Seek { delta_secs } => {
+                    debug!("Seeking {delta_secs}");
+                    self.player.seek_by(f64::from(delta_secs));
+                }
+            }
+            return;
+        }
+
         let action = {
             if let PopupKind::Error(_) = &popup.popup_type
                 && self.state.retry_draft.is_some()
                 && key == KeyCode::Char('1').into()
             {
-                self.state.dismiss_popup();
+                self.dismiss_popup();
                 self.state.retry_message().await;
                 return;
-            } else if let PopupKind::Message(msg) | PopupKind::Image(ImagePopup { msg, .. }) =
-                &popup.popup_type
+            } else if let PopupKind::Message(msg)
+            | PopupKind::Image(ImagePopup { msg, .. })
+            | PopupKind::Audio(AudioPopup { msg, .. }) = &popup.popup_type
                 && let KeyCode::Char(c) = key.code
                 && let Some(digit) = c.to_digit(10)
             {
@@ -1055,7 +1185,7 @@ impl App {
         };
 
         if let Some((action, msg_id)) = action {
-            self.state.dismiss_popup();
+            self.dismiss_popup();
             match action {
                 MessageAction::Reply => self.state.reply_to_message(&msg_id),
                 MessageAction::Edit => {
@@ -1141,6 +1271,12 @@ impl App {
 
         // add this here to the popup actually clears the content below it
         if let Some(state) = &mut self.state.pop_up {
+            // Keep the audio popup's render mirror in sync with the live
+            // session (authoritative source: `AppState::playback`).
+            if let PopupKind::Audio(audio) = &mut state.popup_type {
+                audio.playback = self.state.playback.clone();
+            }
+
             popup::PopUp::new().render(frame.area(), frame.buffer_mut(), state);
         }
     }
@@ -1223,5 +1359,120 @@ impl App {
                 "TUI render complete"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::MessageMedia;
+    use crate::backend::mock::MockMessenger;
+    use crate::tui::chat::OpenChat;
+    use ratatui::crossterm::event::KeyCode;
+
+    async fn test_app() -> App {
+        let config = Config::default();
+        let keymap = config.keys.parse().unwrap();
+        let mock = Box::new(MockMessenger::new("Telegram"));
+        App::new(
+            config,
+            keymap,
+            vec![MessengerKind::Stub(mock)],
+            false,
+            ratatui_image::picker::Picker::halfblocks(),
+            tokio::sync::mpsc::unbounded_channel().0,
+        )
+        .await
+    }
+
+    fn audio_demo_message() -> Message {
+        Message {
+            message_id: MessageId::from("audio-1"),
+            chat: ChatId::Myself,
+            sender: "Maria".into(),
+            author_id: None,
+            text: String::new(),
+            timestamp: 100,
+            from_me: false,
+            msg_actions: vec![MessageAction::Reply, MessageAction::Delete],
+            media: Some(MessageMedia {
+                kind: MediaKind::Audio,
+                caption: Some("voice note".into()),
+                file_name: Some("voice.ogg".into()),
+            }),
+            reply_to_id: None,
+            reply_ctx: None,
+            pending: false,
+            failed: false,
+        }
+    }
+
+    fn audio_chat() -> Chat {
+        Chat {
+            id: ChatId::Myself,
+            contact_name: "Maria".into(),
+            last_message_ts: Some(100),
+            status: None,
+            fixed: false,
+            scroll: 0,
+            unread: false,
+            unread_count: 0,
+            verified: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn audio_popup_digit_routes_to_message_action() {
+        let mut app = test_app().await;
+        app.state.chat_state.open_chat = Some(OpenChat {
+            chat: audio_chat(),
+            history: vec![audio_demo_message()],
+            has_more_history: false,
+        });
+        app.state.create_popup(PopupKind::Audio(AudioPopup {
+            msg: audio_demo_message(),
+            playback: None,
+        }));
+
+        app.handle_popup_key(KeyEvent::from(KeyCode::Char('1')))
+            .await;
+
+        // Digit 1 = Reply: the popup is dismissed and the write box enters
+        // reply mode for the audio message.
+        assert!(app.state.pop_up.is_none());
+        assert_eq!(app.state.focus, Focus::Write);
+        let reply = app
+            .state
+            .chat_state
+            .pending_reply
+            .as_ref()
+            .expect("reply should be armed");
+        assert_eq!(reply.message_id, MessageId::from("audio-1"));
+    }
+
+    #[tokio::test]
+    async fn dismissing_audio_popup_is_clean() {
+        let mut app = test_app().await;
+        app.state.chat_state.open_chat = Some(OpenChat {
+            chat: audio_chat(),
+            history: vec![audio_demo_message()],
+            has_more_history: false,
+        });
+        app.state.create_popup(PopupKind::Audio(AudioPopup {
+            msg: audio_demo_message(),
+            playback: None,
+        }));
+
+        assert!(
+            app.state
+                .pop_up
+                .as_ref()
+                .is_some_and(|p| matches!(p.popup_type, PopupKind::Audio(_)))
+        );
+
+        // Esc dismissal closes the popup and leaves no session behind.
+        app.handle_popup_key(KeyEvent::from(KeyCode::Esc)).await;
+        assert!(app.state.pop_up.is_none());
+        assert!(app.state.playback.is_none());
     }
 }

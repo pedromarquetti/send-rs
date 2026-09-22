@@ -295,16 +295,18 @@ impl Messenger for MockMessenger {
             .state
             .lock()
             .map_err(|e| BackendError::Other(format!("{} mock state poisoned: {e}", self.name)))?;
-        let is_image = state.history.get(chat).is_some_and(|messages| {
+        let kind = state.history.get(chat).and_then(|messages| {
             messages
                 .iter()
                 .find(|m| m.message_id == *message_id)
                 .and_then(|m| m.media.as_ref())
-                .is_some_and(|media| media.kind == MediaKind::Image)
+                .map(|media| media.kind.clone())
         });
         drop(state);
-        if !is_image {
-            return Ok(None);
+        match kind {
+            Some(MediaKind::Image) => {}
+            Some(MediaKind::Audio) => return Ok(Some(fixture_wav_bytes())),
+            _ => return Ok(None),
         }
 
         let image = ::image::RgbImage::from_fn(FIXTURE_IMAGE_W, FIXTURE_IMAGE_H, |x, y| {
@@ -470,12 +472,19 @@ fn mock_data(name: &'static str) -> MockData {
                 caption: Some("sunset over the lake".into()),
                 file_name: Some("sunset.png".into()),
             });
+            let mut voice = message("tg-6", &ALICE_ID, "Alice", "", false);
+            voice.media = Some(MessageMedia {
+                kind: MediaKind::Audio,
+                caption: Some("voice note".into()),
+                file_name: Some("voice.ogg".into()),
+            });
             history.insert(
                 ALICE_ID.clone(),
                 vec![
                     message("tg-3", &ALICE_ID, "Alice", "Are you coming tonight?", false),
                     message("tg-4", &ALICE_ID, "You", "ok, see you", true),
                     photo,
+                    voice,
                 ],
             );
             MockData {
@@ -611,6 +620,38 @@ fn message(id: &str, chat: &ChatId, sender: &str, text: &str, from_me: bool) -> 
     }
 }
 
+/// A tiny 440 Hz sine WAV (8 kHz, mono, 16-bit PCM) so the mock backend can
+/// feed the audio player pipeline an actually decodable voice-note stand-in.
+fn fixture_wav_bytes() -> Vec<u8> {
+    let sample_rate: u32 = 8000;
+    let channels: u16 = 1;
+    let bits: u16 = 16;
+    let byte_rate = sample_rate * 2;
+    let sample_count = sample_rate as usize;
+    let data_len = sample_count * 2;
+
+    let mut bytes = Vec::with_capacity(44 + data_len);
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&(36 + data_len as u32).to_le_bytes());
+    bytes.extend_from_slice(b"WAVE");
+    bytes.extend_from_slice(b"fmt ");
+    bytes.extend_from_slice(&16u32.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&channels.to_le_bytes());
+    bytes.extend_from_slice(&sample_rate.to_le_bytes());
+    bytes.extend_from_slice(&byte_rate.to_le_bytes());
+    bytes.extend_from_slice(&(channels * bits / 8).to_le_bytes());
+    bytes.extend_from_slice(&bits.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&(data_len as u32).to_le_bytes());
+    for i in 0..sample_count {
+        let t = i as f64 / f64::from(sample_rate);
+        let sample = (t * 440.0 * std::f64::consts::TAU).sin() * 0.3;
+        bytes.extend_from_slice(&((sample * f64::from(i16::MAX)) as i16).to_le_bytes());
+    }
+    bytes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -724,6 +765,23 @@ mod tests {
             ::image::load_from_memory(&bytes).expect("mock media bytes must be a valid PNG");
         assert_eq!(decoded.width(), FIXTURE_IMAGE_W);
         assert_eq!(decoded.height(), FIXTURE_IMAGE_H);
+    }
+
+    #[tokio::test]
+    async fn media_bytes_returns_wav_for_audio_message() {
+        let mock = MockMessenger::new("Telegram");
+        let bytes = mock
+            .media_bytes(&ALICE_ID, &MessageId::from("tg-6"))
+            .await
+            .unwrap()
+            .expect("audio message should yield bytes");
+        assert_eq!(
+            &bytes[..4],
+            b"RIFF",
+            "fixture bytes must be a WAV container"
+        );
+        assert!(bytes.len() > 44);
+        assert_eq!(bytes, fixture_wav_bytes());
     }
 
     #[tokio::test]
