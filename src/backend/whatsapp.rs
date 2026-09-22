@@ -1084,8 +1084,6 @@ impl WhatsAppMessenger {
                 let _ = tx.send(BackendEvent::ChatList(snapshot));
             }
             Event::Presence(u) => {
-                // BUG: new Presence event is sending the chat to the top of the
-                // chat_list, this should not happen!
                 // TODO: Consider simplifying this:
                 // if unavailable {
                 // todo!();

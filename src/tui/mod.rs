@@ -1092,8 +1092,6 @@ impl App {
                         let masked = steps.get(step) == Some(&AuthSteps::Password);
 
                         if let Some(ls) = self.state.login_state.as_mut() {
-                            // BUG: this is not working: pressing enter to go to next
-                            // step is not triggering a loading widget
                             if ls.submitting {
                                 let step_label =
                                     steps.get(step).map(|s| s.to_string()).unwrap_or_default();

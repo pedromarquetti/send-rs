@@ -313,43 +313,95 @@ fn message_lines(
     // and append `…`. Merely soft-wrapping a multi-word line is not truncation:
     // the full text is still in the list, so no hint line is warranted.
     let mut any_truncated = false;
-    let mut text_lines = message.text.lines();
+    let available = width.saturating_sub(2) as usize;
+    // The first body chunk shares the header line, so it wraps one `header`
+    // width shorter than the continuation lines.
+    let text_avail = available.saturating_sub(header_width + 2);
 
-    match text_lines.next() {
-        Some(first) => {
-            let available = width.saturating_sub(2) as usize;
-            let text_avail = available.saturating_sub(header_width + 2);
-            let first_chunks = if text_avail > 0 {
-                wrap_text(first, text_avail)
-            } else {
-                wrap_text(first, available.max(1))
-            };
+    // Media messages render the caption plus the media-type label (or the
+    // "click to show" fallback) instead of `message.text`; the label is gray +
+    // italic while the caption keeps the normal body style.
+    let media_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::ITALIC);
 
-            any_truncated = first_chunks.iter().any(|c| c.ends_with('…'));
-            if let Some((first_chunk, rest)) = first_chunks.split_first() {
-                let mut spans = vec![Span::styled(head.clone(), header_style), Span::raw("  ")];
-                spans.extend(body_spans(first_chunk, needle, body_style));
-                result.push(Line::from(spans));
-                for chunk in rest {
-                    result.push(Line::from(body_spans(chunk, needle, body_style)));
+    // Physical body lines without the header; the media label is appended to
+    // the last caption chunk so it stays attached to the caption text.
+    let body_lines = match &message.media {
+        Some(media) => {
+            let caption = media
+                .caption
+                .as_deref()
+                .map(str::trim)
+                .filter(|c| !c.is_empty());
+
+            match caption {
+                Some(caption) => {
+                    let mut lines: Vec<Vec<Span>> = Vec::new();
+                    for (index, text_line) in caption.lines().enumerate() {
+                        let line_avail = if index == 0 && text_avail > 0 {
+                            text_avail
+                        } else {
+                            available.max(1)
+                        };
+                        for chunk in wrap_text(text_line, line_avail) {
+                            any_truncated |= chunk.ends_with('…');
+                            lines.push(body_spans(&chunk, needle, body_style));
+                        }
+                    }
+                    if let Some(last) = lines.last_mut() {
+                        last.extend([
+                            Span::raw(":  "),
+                            Span::styled(media.kind.label(), media_style),
+                        ]);
+                    }
+                    lines
                 }
+                None => vec![vec![Span::styled(
+                    format!("{}, click to show", media.kind.label()),
+                    media_style,
+                )]],
             }
         }
         None => {
-            result.push(Line::from(vec![
-                Span::styled(head, header_style),
-                Span::raw("  "),
-            ]));
-        }
-    }
+            let mut lines: Vec<Vec<Span>> = Vec::new();
+            let mut text_lines = message.text.lines();
 
-    for line in text_lines {
-        let available = width.saturating_sub(2) as usize;
-        let chunks = wrap_text(line, available);
-        any_truncated |= chunks.iter().any(|c| c.ends_with('…'));
-        for chunk in chunks {
-            result.push(Line::from(body_spans(&chunk, needle, body_style)));
+            if let Some(first) = text_lines.next() {
+                let first_chunks = if text_avail > 0 {
+                    wrap_text(first, text_avail)
+                } else {
+                    wrap_text(first, available.max(1))
+                };
+                any_truncated |= first_chunks.iter().any(|c| c.ends_with('…'));
+                for chunk in first_chunks {
+                    lines.push(body_spans(&chunk, needle, body_style));
+                }
+            }
+
+            for line in text_lines {
+                for chunk in wrap_text(line, available) {
+                    any_truncated |= chunk.ends_with('…');
+                    lines.push(body_spans(&chunk, needle, body_style));
+                }
+            }
+            lines
         }
+    };
+
+    if let Some((first, rest)) = body_lines.split_first() {
+        let mut spans = vec![Span::styled(head, header_style), Span::raw("  ")];
+        spans.extend(first.to_vec());
+        result.push(Line::from(spans));
+
+        for line in rest {
+            result.push(Line::from(line.to_vec()));
+        }
+    } else {
+        result.push(Line::from(vec![
+            Span::styled(head, header_style),
+            Span::raw("  "),
+        ]));
     }
 
     // Check if we need to truncate due to max_lines
@@ -460,7 +512,7 @@ pub(crate) fn format_timestamp(secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::ChatId;
+    use crate::backend::{ChatId, MediaKind, MessageMedia};
 
     fn message(text: &str) -> Message {
         Message {
@@ -480,6 +532,16 @@ mod tests {
         }
     }
 
+    fn media_message(kind: MediaKind, caption: Option<&str>) -> Message {
+        let mut msg = message("ignored by the media render path");
+        msg.media = Some(MessageMedia {
+            kind,
+            caption: caption.map(str::to_string),
+            file_name: None,
+        });
+        msg
+    }
+
     #[test]
     fn message_lines_splits_on_newlines() {
         let lines = message_lines(&message("first\nsecond\nthird"), 80, None, None);
@@ -495,6 +557,60 @@ mod tests {
         let lines = message_lines(&message(""), 80, None, None);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].to_string().contains("Alice"));
+    }
+
+    #[test]
+    fn message_lines_media_with_caption_shows_caption_plus_italic_media_label() {
+        let msg = media_message(MediaKind::Image, Some("sunset over the lake"));
+        let lines = message_lines(&msg, 80, None, None);
+        assert_eq!(lines.len(), 1);
+        let text = lines[0].to_string();
+        assert!(
+            text.contains("sunset over the lake:  Image"),
+            "caption body should end in the media label, got: {text}"
+        );
+        assert!(
+            !text.contains("ignored by the media render path"),
+            "chat view renders `media`, not `message.text`, got: {text}"
+        );
+
+        let italic: Vec<String> = lines[0]
+            .spans
+            .iter()
+            .filter(|s| s.style.add_modifier.contains(Modifier::ITALIC))
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(italic, ["Image"]);
+
+        let caption_span = lines[0]
+            .spans
+            .iter()
+            .find(|s| s.to_string().contains("sunset"))
+            .unwrap();
+        assert!(
+            !caption_span.style.add_modifier.contains(Modifier::ITALIC),
+            "caption keeps the plain body style"
+        );
+    }
+
+    #[test]
+    fn message_lines_media_without_caption_shows_italic_fallback() {
+        let msg = media_message(MediaKind::Image, None);
+        let lines = message_lines(&msg, 80, None, None);
+        assert_eq!(lines.len(), 1);
+        let body = lines[0].spans.last().unwrap();
+        assert_eq!(body.to_string(), "Image, click to show");
+        assert_eq!(body.style.fg, Some(Color::DarkGray));
+        assert!(body.style.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn message_lines_plain_text_is_unaffected_by_media_path() {
+        let msg = message("hello, nothing special");
+        let lines = message_lines(&msg, 80, None, None);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].to_string().contains("hello, nothing special"));
+        assert!(lines[0].spans.last().unwrap().style.add_modifier.is_empty());
     }
 
     #[test]
