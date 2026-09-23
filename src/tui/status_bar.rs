@@ -37,12 +37,19 @@ impl Widget for StatusBarWidget {
             Focus::Popup => "Esc close popup; g scroll to top",
         };
 
-        let line = if let Some(status) = self.status {
-            Span::styled(status, Style::default().fg(Color::Yellow))
+        let mut spans: Vec<Span<'_>> = Vec::new();
+        if let Some(chat) = &self.curr_chat {
+            spans.push(Span::styled(
+                format!("[{chat}] "),
+                Style::default().fg(Color::Cyan).bold(),
+            ));
+        }
+        if let Some(status) = self.status {
+            spans.push(Span::styled(status, Style::default().fg(Color::Yellow)));
         } else {
-            Span::styled(hint, Style::default().fg(Color::DarkGray))
-        };
+            spans.push(Span::styled(hint, Style::default().fg(Color::DarkGray)));
+        }
 
-        Paragraph::new(line).render(area, buf);
+        Paragraph::new(Line::from(spans)).render(area, buf);
     }
 }

@@ -74,8 +74,6 @@ pub struct AppState {
     /// terminal (non-blocking startup).
     pub chats_loaded: bool,
 
-    /// Monotonic counter for generating local/synthetic echo message ids.
-    pub local_seq: u64,
     pub chat_load_generation: u64,
     pub history_refresh_in_flight: bool,
     pub chatlist_sync_in_flight: bool,
@@ -159,7 +157,6 @@ impl AppState {
             running: true,
             login_state: None,
             chats_loaded: false,
-            local_seq: 0,
             chat_load_generation: 0,
             history_refresh_in_flight: false,
             chatlist_sync_in_flight: false,
@@ -813,15 +810,6 @@ impl AppState {
         self.messengers.iter().find(|m| m.provider() == target)
     }
 
-    fn chat_owner_mut(&mut self, chat: &ChatId) -> Option<&mut MessengerKind> {
-        let target = match chat {
-            ChatId::Telegram(_) => Provider::Telegram,
-            ChatId::WhatsApp(_) => Provider::WhatsApp,
-            ChatId::Myself => return None,
-        };
-        self.messengers.iter_mut().find(|m| m.provider() == target)
-    }
-
     pub(crate) fn provider_to_messenger(&self, provider: Provider) -> Option<&MessengerKind> {
         self.messengers.iter().find(|m| m.provider() == provider)
     }
@@ -941,7 +929,7 @@ impl AppState {
                     m
                 }
                 #[cfg(test)]
-                MessengerKind::Stub(_) => m,
+                MessengerKind::Stub(_, _) => m,
             },
             None => {
                 self.create_popup(PopupKind::Error(format!(
@@ -1529,6 +1517,20 @@ mod tests {
     use ratatui::widgets::StatefulWidget;
     use tokio::sync::broadcast;
 
+    impl AppState {
+        /// Gets a mutable handle on the messenger that owns `chat`. Test-only
+        /// (the production flow drives finality/status directly through
+        /// `BackendEvent`s).
+        fn chat_owner_mut(&mut self, chat: &ChatId) -> Option<&mut MessengerKind> {
+            let target = match chat {
+                ChatId::Telegram(_) => Provider::Telegram,
+                ChatId::WhatsApp(_) => Provider::WhatsApp,
+                ChatId::Myself => return None,
+            };
+            self.messengers.iter_mut().find(|m| m.provider() == target)
+        }
+    }
+
     /// Test helper: synchronously open the chat at the given *visible*
     /// chat-list index, loading history through the messenger directly. Mirrors
     /// the async open flow the production event loop drives via
@@ -1629,7 +1631,7 @@ mod tests {
         let keymap = config.keys.parse().unwrap();
         let mock = MockMessenger::new("Telegram");
         mock.spawn_incoming_messages();
-        let messengers = vec![MessengerKind::Stub(Box::new(mock))];
+        let messengers = vec![MessengerKind::Stub(Provider::Telegram, Box::new(mock))];
         let mut app = AppState::new(config, keymap, messengers, false).await;
         // Mirror non-blocking startup: independently fetch and apply chats.
         let (chats, _) = fetch_all_chats(&app.messengers, &app.config.providers).await;
@@ -1657,8 +1659,8 @@ mod tests {
         let wa = MockMessenger::new("WhatsApp");
         wa.spawn_incoming_messages();
         let messengers = vec![
-            MessengerKind::Stub(Box::new(tg)),
-            MessengerKind::Stub(Box::new(wa)),
+            MessengerKind::Stub(Provider::Telegram, Box::new(tg)),
+            MessengerKind::Stub(Provider::WhatsApp, Box::new(wa)),
         ];
         let mut app = AppState::new(config, keymap, messengers, false).await;
         fetch_and_apply(&mut app).await;
@@ -2652,7 +2654,6 @@ mod tests {
     // -- StubMessenger for error propagation tests --
 
     struct StubMessenger {
-        platform: &'static str,
         chats_result: std::sync::Mutex<Option<Result<Vec<Chat>, BackendError>>>,
         send_result: std::sync::Mutex<Option<Result<(), BackendError>>>,
         history_result: std::sync::Mutex<Option<Result<Vec<Message>, BackendError>>>,
@@ -2662,10 +2663,9 @@ mod tests {
     }
 
     impl StubMessenger {
-        fn new(platform: &'static str) -> Self {
+        fn new() -> Self {
             let (tx, _) = broadcast::channel(16);
             Self {
-                platform,
                 chats_result: std::sync::Mutex::new(None),
                 send_result: std::sync::Mutex::new(None),
                 history_result: std::sync::Mutex::new(None),
@@ -2703,10 +2703,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Messenger for StubMessenger {
-        fn platform(&self) -> &'static str {
-            self.platform
-        }
-
         async fn is_authenticated(&self) -> bool {
             true
         }
@@ -2791,14 +2787,6 @@ mod tests {
         async fn disconnect(&mut self) -> Result<(), BackendError> {
             Ok(())
         }
-
-        async fn login(&mut self) -> Result<(), BackendError> {
-            Ok(())
-        }
-
-        async fn logout(&mut self) -> Result<(), BackendError> {
-            Ok(())
-        }
     }
 
     // -- Error propagation tests --
@@ -2806,15 +2794,15 @@ mod tests {
     #[tokio::test]
     async fn messenger_chats_failure_is_nonfatal() {
         let good = MockMessenger::new("Telegram");
-        let bad = StubMessenger::new("WhatsApp")
-            .with_chats_error(BackendError::Other("connection refused".into()));
+        let bad =
+            StubMessenger::new().with_chats_error(BackendError::Other("connection refused".into()));
         let mut config = Config::default();
         config.providers.telegram.enabled = true;
         config.providers.whatsapp = true;
         let keymap = config.keys.parse().unwrap();
         let messengers = vec![
-            MessengerKind::Stub(Box::new(good)),
-            MessengerKind::Stub(Box::new(bad)),
+            MessengerKind::Stub(Provider::Telegram, Box::new(good)),
+            MessengerKind::Stub(Provider::WhatsApp, Box::new(bad)),
         ];
         let mut state = AppState::new(config, keymap, messengers, false).await;
         fetch_and_apply(&mut state).await;
@@ -2837,7 +2825,7 @@ mod tests {
             contact_name: "Test".into(),
             ..Default::default()
         };
-        let stub = StubMessenger::new("Telegram")
+        let stub = StubMessenger::new()
             .with_chats(vec![chat])
             .with_send_error(BackendError::Other("rate limited".into()));
         let mut config = Config::default();
@@ -2846,7 +2834,7 @@ mod tests {
         let mut state = AppState::new(
             config,
             keymap,
-            vec![MessengerKind::Stub(Box::new(stub))],
+            vec![MessengerKind::Stub(Provider::Telegram, Box::new(stub))],
             false,
         )
         .await;
@@ -2874,7 +2862,7 @@ mod tests {
             contact_name: "Test".into(),
             ..Default::default()
         };
-        let stub = StubMessenger::new("Telegram")
+        let stub = StubMessenger::new()
             .with_chats(vec![chat])
             .with_history_error(BackendError::Other("timeout".into()));
         let mut config = Config::default();
@@ -2883,7 +2871,7 @@ mod tests {
         let mut state = AppState::new(
             config,
             keymap,
-            vec![MessengerKind::Stub(Box::new(stub))],
+            vec![MessengerKind::Stub(Provider::Telegram, Box::new(stub))],
             false,
         )
         .await;
@@ -2910,7 +2898,7 @@ mod tests {
             contact_name: "Test".into(),
             ..Default::default()
         };
-        let stub = StubMessenger::new("Telegram")
+        let stub = StubMessenger::new()
             .with_chats(vec![chat])
             .with_set_read_error(BackendError::Other("permission denied".into()));
         let mut config = Config::default();
@@ -2919,7 +2907,7 @@ mod tests {
         let mut state = AppState::new(
             config,
             keymap,
-            vec![MessengerKind::Stub(Box::new(stub))],
+            vec![MessengerKind::Stub(Provider::Telegram, Box::new(stub))],
             false,
         )
         .await;
@@ -2941,14 +2929,14 @@ mod tests {
 
     #[tokio::test]
     async fn backend_error_event_shows_overlay() {
-        let stub = StubMessenger::new("Telegram");
+        let stub = StubMessenger::new();
         let mut config = Config::default();
         config.providers.telegram.enabled = true;
         let keymap = config.keys.parse().unwrap();
         let mut state = AppState::new(
             config,
             keymap,
-            vec![MessengerKind::Stub(Box::new(stub))],
+            vec![MessengerKind::Stub(Provider::Telegram, Box::new(stub))],
             false,
         )
         .await;
@@ -2977,17 +2965,17 @@ mod tests {
 
     #[tokio::test]
     async fn multiple_messenger_boot_errors_are_combined() {
-        let bad_tg = StubMessenger::new("Telegram")
-            .with_chats_error(BackendError::Other("auth failed".into()));
-        let bad_wa = StubMessenger::new("WhatsApp")
-            .with_chats_error(BackendError::Other("connection refused".into()));
+        let bad_tg =
+            StubMessenger::new().with_chats_error(BackendError::Other("auth failed".into()));
+        let bad_wa =
+            StubMessenger::new().with_chats_error(BackendError::Other("connection refused".into()));
         let mut config = Config::default();
         config.providers.telegram.enabled = true;
         config.providers.whatsapp = true;
         let keymap = config.keys.parse().unwrap();
         let messengers = vec![
-            MessengerKind::Stub(Box::new(bad_tg)),
-            MessengerKind::Stub(Box::new(bad_wa)),
+            MessengerKind::Stub(Provider::Telegram, Box::new(bad_tg)),
+            MessengerKind::Stub(Provider::WhatsApp, Box::new(bad_wa)),
         ];
         let mut state = AppState::new(config, keymap, messengers, false).await;
         fetch_and_apply(&mut state).await;
@@ -3018,7 +3006,7 @@ mod tests {
         let keymap = config.keys.parse().unwrap();
         let wa = MockMessenger::new("WhatsApp");
         wa.spawn_incoming_messages();
-        let messengers = vec![MessengerKind::Stub(Box::new(wa))];
+        let messengers = vec![MessengerKind::Stub(Provider::WhatsApp, Box::new(wa))];
         let mut state = AppState::new(config, keymap, messengers, false).await;
         state.chats_loaded = true;
 
@@ -3049,7 +3037,7 @@ mod tests {
         let keymap = config.keys.parse().unwrap();
         let wa = MockMessenger::new("WhatsApp");
         wa.spawn_incoming_messages();
-        let messengers = vec![MessengerKind::Stub(Box::new(wa))];
+        let messengers = vec![MessengerKind::Stub(Provider::WhatsApp, Box::new(wa))];
         let mut state = AppState::new(config, keymap, messengers, false).await;
 
         // Simulate an active pairing session: login_state set for WhatsApp.
@@ -3327,7 +3315,7 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limited_event_shows_countdown_and_esc_cancels() {
-        let stub = StubMessenger::new("Telegram");
+        let stub = StubMessenger::new();
         let cancel_calls = stub.cancel_refresh_calls.clone();
         let mut config = Config::default();
         config.providers.telegram.enabled = true;
@@ -3335,7 +3323,7 @@ mod tests {
         let mut state = AppState::new(
             config,
             keymap,
-            vec![MessengerKind::Stub(Box::new(stub))],
+            vec![MessengerKind::Stub(Provider::Telegram, Box::new(stub))],
             false,
         )
         .await;
@@ -3374,7 +3362,7 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limit_wait_is_not_cancelled_when_inactive() {
-        let stub = StubMessenger::new("Telegram");
+        let stub = StubMessenger::new();
         let cancel_calls = stub.cancel_refresh_calls.clone();
         let mut config = Config::default();
         config.providers.telegram.enabled = true;
@@ -3382,7 +3370,7 @@ mod tests {
         let mut state = AppState::new(
             config,
             keymap,
-            vec![MessengerKind::Stub(Box::new(stub))],
+            vec![MessengerKind::Stub(Provider::Telegram, Box::new(stub))],
             false,
         )
         .await;
@@ -3400,7 +3388,7 @@ mod tests {
         let mut state = AppState::new(
             config,
             keymap,
-            vec![MessengerKind::Stub(Box::new(mock))],
+            vec![MessengerKind::Stub(Provider::Telegram, Box::new(mock))],
             false,
         )
         .await;
@@ -3509,7 +3497,7 @@ mod tests {
     #[tokio::test]
     async fn media_bytes_defaults_to_none_via_delegate() {
         let mock = MockMessenger::new("Telegram");
-        let messenger = MessengerKind::Stub(Box::new(mock));
+        let messenger = MessengerKind::Stub(Provider::Telegram, Box::new(mock));
         let result = messenger
             .media_bytes(&ChatId::Myself, &MessageId::from("1"))
             .await;

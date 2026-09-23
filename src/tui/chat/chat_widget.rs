@@ -143,7 +143,7 @@ impl StatefulWidget for ChatWidget<'_> {
             //BUG: messages are appearing with split lines:
             // messages should appear like this
             //
-            // not 
+            // not
             // like
             // this
             let items: Vec<ListItem> = history

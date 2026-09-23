@@ -2,7 +2,7 @@ use crate::helpers::now;
 
 use super::{
     BackendError, BackendEvent, Chat, ChatId, MediaKind, Message, MessageAction, MessageId,
-    MessageMedia, Messenger, ReplyContext,
+    MessageMedia, Messenger, MessengerKind, Provider, ReplyContext,
 };
 use anyhow::Result;
 use std::collections::HashMap;
@@ -110,10 +110,6 @@ impl MockMessenger {
 
 #[async_trait::async_trait]
 impl Messenger for MockMessenger {
-    fn platform(&self) -> &'static str {
-        self.name
-    }
-
     async fn status(&self, _chat: &super::ChatId) -> Result<Option<String>, BackendError> {
         Ok(None)
     }
@@ -342,15 +338,6 @@ impl Messenger for MockMessenger {
             .lock()
             .map_err(|e| BackendError::Other(format!("{} mock state poisoned: {e}", self.name)))?;
         state.connected = false;
-        Ok(())
-    }
-
-    async fn logout(&mut self) -> Result<(), BackendError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|e| BackendError::Other(format!("{} mock state poisoned: {e}", self.name)))?;
-        state.authenticated = false;
         Ok(())
     }
 }
@@ -665,8 +652,12 @@ mod tests {
         let mock = MockMessenger::new("Telegram");
         let chats = mock.chats().await.unwrap();
         assert!(!chats.is_empty());
-        assert_eq!(mock.platform(), "Telegram");
-        assert!(mock.is_authenticated().await);
+        // The messenger kinds routed through `MessengerKind::Stub` carry the
+        // provider explicitly; it is no longer derived from the mock's name.
+        assert_eq!(
+            MessengerKind::Stub(Provider::Telegram, Box::new(mock)).provider(),
+            Provider::Telegram
+        );
     }
 
     #[tokio::test]

@@ -1,3 +1,5 @@
+/// The mock provider is used only by tests: it must not ship in the binary.
+#[cfg(test)]
 pub mod mock;
 pub mod telegram;
 pub mod whatsapp;
@@ -416,7 +418,6 @@ impl From<whatsapp_rust::SendError> for BackendError {
 
 #[async_trait::async_trait]
 pub trait Messenger: Send + Sync {
-    fn platform(&self) -> &'static str;
     async fn is_authenticated(&self) -> bool;
     /// Fetch the chat list.
     async fn chats(&self) -> Result<Vec<Chat>, BackendError>;
@@ -483,15 +484,6 @@ pub trait Messenger: Send + Sync {
     }
     /// Graceful shutdown: flush pending work, close transport, stop background tasks.
     async fn disconnect(&mut self) -> Result<(), BackendError>;
-    /// Start authentication flow. For event-driven providers (WhatsApp) this is a no-op;
-    /// the actual auth happens via BackendEvent callbacks. Text-based providers drive the
-    /// flow through [`Messenger::login_step`] instead, so the default is a successful no-op.
-    async fn login(&mut self) -> Result<(), BackendError> {
-        Ok(())
-    }
-    /// Destroy remote session (sign out / deregister device).
-    async fn logout(&mut self) -> Result<(), BackendError>;
-
     /// Abort an in-progress login flow, discarding any pending tokens/state.
     async fn cancel_login(&mut self) {}
 
@@ -522,7 +514,7 @@ pub enum MessengerKind {
     Telegram(TelegramMessenger),
     WhatsApp(WhatsAppMessenger),
     #[cfg(test)]
-    Stub(Box<dyn Messenger>),
+    Stub(Provider, Box<dyn Messenger>),
 }
 
 impl Clone for MessengerKind {
@@ -531,7 +523,7 @@ impl Clone for MessengerKind {
             Self::Telegram(m) => Self::Telegram(m.clone()),
             Self::WhatsApp(m) => Self::WhatsApp(m.clone()),
             #[cfg(test)]
-            Self::Stub(_) => panic!("MessengerKind::Stub is not cloneable"),
+            Self::Stub(..) => panic!("MessengerKind::Stub is not cloneable"),
         }
     }
 }
@@ -542,7 +534,7 @@ macro_rules! delegate_match {
             Self::Telegram(m) => m.$name($($args),*).await,
             Self::WhatsApp(m) => m.$name($($args),*).await,
             #[cfg(test)]
-            Self::Stub(m) => m.$name($($args),*).await,
+            Self::Stub(_, m) => m.$name($($args),*).await,
         }
     };
     ($self:expr, $name:ident, ($($args:expr),*), sync) => {
@@ -550,7 +542,7 @@ macro_rules! delegate_match {
             Self::Telegram(m) => m.$name($($args),*),
             Self::WhatsApp(m) => m.$name($($args),*),
             #[cfg(test)]
-            Self::Stub(m) => m.$name($($args),*),
+            Self::Stub(_, m) => m.$name($($args),*),
         }
     };
 }
@@ -584,20 +576,12 @@ macro_rules! delegate {
 }
 
 impl MessengerKind {
-    pub fn is_enabled(&self, config: &ProvidersConfig) -> bool {
-        Provider::is_enabled(&self.provider(), config)
-    }
-
     pub fn provider(&self) -> Provider {
         match self {
             Self::Telegram(_) => Provider::Telegram,
             Self::WhatsApp(_) => Provider::WhatsApp,
             #[cfg(test)]
-            Self::Stub(m) => match m.platform() {
-                "Telegram" => Provider::Telegram,
-                "WhatsApp" => Provider::WhatsApp,
-                _ => panic!("unsupported test provider: {}", m.platform()),
-            },
+            Self::Stub(provider, _) => *provider,
         }
     }
 
@@ -617,8 +601,6 @@ impl MessengerKind {
         , async fn cancel_chat_refresh(&self) -> () ;
         , async fn reconnect(&self) -> Result<(), BackendError> ;
         , async fn disconnect(&mut self) -> Result<(), BackendError> ;
-        , async fn login(&mut self) -> Result<(), BackendError> ;
-        , async fn logout(&mut self) -> Result<(), BackendError> ;
         , async fn cancel_login(&mut self) -> () ;
         , fn login_steps(&self) -> Vec<AuthSteps> ;
         , fn login_placeholder(&self, step: usize) -> &'static str ;

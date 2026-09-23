@@ -1813,18 +1813,6 @@ async fn learn_lid_pn(client: &Arc<Client>, sender: &Jid, state: &SharedState) -
     Some(pn_user)
 }
 
-/// Relative "x ago" label for an epoch-seconds timestamp (same shape as the
-/// Telegram backend's `telegram_relative_time`).
-fn relative_time(unix_seconds: i64) -> String {
-    let delta = now().saturating_sub(unix_seconds).max(0);
-    match delta {
-        0..=59 => "just now".to_string(),
-        60..=3599 => format!("{}m ago", delta / 60),
-        3600..=86399 => format!("{}h ago", delta / 3600),
-        _ => format!("{}d ago", delta / 86400),
-    }
-}
-
 async fn handle_history_sync(
     history_sync: &HistorySync,
     client: Option<&Arc<Client>>,
@@ -2318,10 +2306,6 @@ fn history_info(
 
 #[async_trait::async_trait]
 impl Messenger for WhatsAppMessenger {
-    fn platform(&self) -> &'static str {
-        "WhatsApp"
-    }
-
     async fn is_authenticated(&self) -> bool {
         self.client.clone().is_logged_in()
     }
@@ -2845,12 +2829,6 @@ impl Messenger for WhatsAppMessenger {
         Ok(())
     }
 
-    async fn login(&mut self) -> Result<(), BackendError> {
-        // WhatsApp auth is event-driven (QR / pair code via BackendEvent).
-        // The bot is paired over the network; nothing to do here.
-        Ok(())
-    }
-
     fn login_steps(&self) -> Vec<AuthSteps> {
         // A single event-driven QR step. The payload is read live on every
         // frame from `current_qr` so a replaced/refreshed code shows up
@@ -2880,17 +2858,6 @@ impl Messenger for WhatsAppMessenger {
         } else {
             Ok(LoginStepState::NextStep)
         }
-    }
-
-    /// Graceful shutdown only: Senders never logs out of WhatsApp. This closes
-    /// the connection and flushes pending state via `Client::disconnect`, but it
-    /// does NOT unlink the device (`wa.db` is kept), so the next launch stays
-    /// paired and skips the QR flow. A real device logout/unlink is deliberate
-    /// and out of scope — never call `Client::logout()` here.
-    async fn logout(&mut self) -> Result<(), BackendError> {
-        self.check_logged_in().await?;
-        self.current_client().disconnect().await;
-        Ok(())
     }
 }
 

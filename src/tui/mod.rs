@@ -44,10 +44,8 @@ enum UiEvent {
     Paste(String),
     Shutdown,
     Backend(Provider, BackendEvent),
-    Resize(u16, u16),
     /// Wake signal: a background image (re)encode finished; redraw to apply it.
     Redraw,
-    HistoryRefresh(ChatId, Vec<backend::Message>),
     HistoryRefreshResult(ChatId, Result<Vec<backend::Message>, BackendError>),
     /// Result of a backgrounded lazy-history load (scroll-up with the chat at its
     /// topmost message); applied by `AppState::apply_history_page`.
@@ -388,17 +386,7 @@ async fn run_app(
                             });
                         }
                     }
-                    UiEvent::Resize(..) => {}
                     UiEvent::Redraw => {}
-                    UiEvent::HistoryRefresh(chat_id, history) => {
-                        debug!(
-                            chat = ?chat_id,
-                            messages = history.len(),
-                            "HistoryRefresh applied"
-                        );
-                        app.state.update_chat_list_from_poll(&chat_id, &history);
-                        app.state.chat_state.refresh_chat_history(&chat_id, history);
-                    }
                     UiEvent::HistoryRefreshResult(chat_id, result) => {
                         app.state.history_refresh_in_flight = false;
                         if app.state.chat_state.open_chat.as_ref().map(|open| &open.chat.id)
@@ -499,11 +487,6 @@ fn spawn_terminal_reader(tx: mpsc::UnboundedSender<UiEvent>) {
                 }
                 Ok(Event::Paste(text)) => {
                     if tx.send(UiEvent::Paste(text)).is_err() {
-                        break;
-                    }
-                }
-                Ok(Event::Resize(width, height)) => {
-                    if tx.send(UiEvent::Resize(width, height)).is_err() {
                         break;
                     }
                 }
@@ -1419,7 +1402,7 @@ mod tests {
         App::new(
             config,
             keymap,
-            vec![MessengerKind::Stub(mock)],
+            vec![MessengerKind::Stub(Provider::Telegram, mock)],
             false,
             ratatui_image::picker::Picker::halfblocks(),
             tokio::sync::mpsc::unbounded_channel().0,
@@ -1531,7 +1514,7 @@ mod tests {
         let mut app = App::new(
             config,
             keymap,
-            vec![MessengerKind::Stub(mock)],
+            vec![MessengerKind::Stub(Provider::Telegram, mock)],
             false,
             ratatui_image::picker::Picker::halfblocks(),
             tx,

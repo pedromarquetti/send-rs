@@ -23,8 +23,6 @@ use crate::tui::player::{MediaEngine, PlayState};
 /// A fully decoded piece of audio, ready to be played.
 struct Decoded {
     source: Box<dyn Source + Send>,
-    sample_rate: u32,
-    channels: u16,
     duration: Option<Duration>,
 }
 
@@ -196,15 +194,9 @@ impl Source for OpusSource {
 fn decode(bytes: &[u8]) -> Result<Decoded, String> {
     if bytes.starts_with(b"OggS") {
         if let Ok(source) = OpusSource::from_bytes(bytes) {
-            let sample_rate = source.sample_rate();
-            let channels = source.channels();
-            let duration = source.total_duration();
-
             return Ok(Decoded {
+                duration: source.total_duration(),
                 source: Box::new(source),
-                sample_rate,
-                channels,
-                duration,
             });
         }
         debug!("ogg container did not contain opus; trying symphonia decoders");
@@ -214,8 +206,6 @@ fn decode(bytes: &[u8]) -> Result<Decoded, String> {
         .map_err(|err| format!("unsupported or corrupt audio format: {err}"))?;
 
     Ok(Decoded {
-        sample_rate: decoder.sample_rate(),
-        channels: decoder.channels(),
         duration: decoder.total_duration(),
         source: Box::new(decoder),
     })
@@ -306,9 +296,10 @@ impl RodioEngine {
     /// an output device.
     #[cfg(test)]
     fn with_sink(sink: Sink) -> Self {
-        let mut engine = Self::default();
-        engine.sink = Some(sink);
-        engine
+        Self {
+            sink: Some(sink),
+            ..Self::default()
+        }
     }
 
     fn open_output(&mut self) -> Result<(), String> {
@@ -536,8 +527,8 @@ mod tests {
     #[test]
     fn decodes_wav_fixture() {
         let decoded = decode(TONE_WAV).unwrap();
-        assert_eq!(decoded.channels, 1);
-        assert_eq!(decoded.sample_rate, 8000);
+        assert_eq!(decoded.source.channels(), 1);
+        assert_eq!(decoded.source.sample_rate(), 8000);
         let duration = decoded.duration.unwrap();
         assert!(
             (duration.as_secs_f64() - 1.0).abs() < 0.05,
@@ -554,8 +545,8 @@ mod tests {
     #[test]
     fn decodes_opus_fixture() {
         let decoded = decode(VOICE_OGG).unwrap();
-        assert_eq!(decoded.channels, 1);
-        assert_eq!(decoded.sample_rate, GRANULE_RATE);
+        assert_eq!(decoded.source.channels(), 1);
+        assert_eq!(decoded.source.sample_rate(), GRANULE_RATE);
         let duration = decoded.duration.unwrap();
         assert!(
             (duration.as_secs_f64() - 2.0).abs() < 0.1,

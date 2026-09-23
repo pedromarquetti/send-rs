@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use ratatui::crossterm::event::KeyEvent;
 use ratatui::widgets::ListState;
 
-use crate::backend::{Chat, ChatId, Message, MessageAction, MessageId};
+use crate::backend::{Chat, ChatId, Message, MessageId};
 use crate::tui::search::SearchState;
 
 pub mod chat_list;
@@ -338,45 +338,6 @@ impl ChatState {
             }
             open.history.push(message);
             self.refresh_message_search_if_active();
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Replace a message in the open chat's history that matches `old_id`
-    /// (e.g. swap a local pending echo for the confirmed server message).
-    /// Returns `true` if a replacement happened.
-    pub fn replace_message(&mut self, old_id: &MessageId, new: Message) -> bool {
-        if let Some(open) = &mut self.open_chat {
-            if old_id != &new.message_id {
-                open.history
-                    .retain(|msg| msg.message_id != new.message_id || msg.message_id == *old_id);
-            }
-            for msg in &mut open.history {
-                if msg.message_id == *old_id {
-                    *msg = new;
-                    self.refresh_message_search_if_active();
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    /// Flip an outgoing message to `failed` (kept, grayed, retryable).
-    pub fn mark_failed(&mut self, id: &MessageId) -> bool {
-        if let Some(open) = &mut self.open_chat
-            && let Some(msg) = open.history.iter_mut().find(|m| m.message_id == *id)
-        {
-            msg.failed = true;
-            msg.pending = false;
-            if !msg.msg_actions.contains(&MessageAction::Retry) {
-                msg.msg_actions.push(MessageAction::Retry);
-            }
-
-            self.refresh_message_search_if_active();
-
             true
         } else {
             false

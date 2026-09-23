@@ -1,5 +1,5 @@
-// TODO: remove this and fix all clippy warnings
-#![allow(dead_code)]
+// dead_code is only allowed in tests
+#![cfg_attr(test, allow(dead_code))]
 
 mod backend;
 mod config;

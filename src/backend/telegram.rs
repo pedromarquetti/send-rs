@@ -1,4 +1,5 @@
 use crate::backend::AuthSteps;
+use crate::helpers::relative;
 
 use super::{
     BackendError, BackendEvent, Chat, ChatId, LoginStepState, MediaKind, Message, MessageAction,
@@ -196,28 +197,12 @@ fn telegram_status_label(status: &grammers_tl_types::enums::UserStatus) -> Optio
     match status {
         grammers_tl_types::enums::UserStatus::Empty => None,
         grammers_tl_types::enums::UserStatus::Online(_) => Some("online".to_string()),
-        grammers_tl_types::enums::UserStatus::Offline(status) => Some(format!(
-            "last seen {}",
-            telegram_relative_time(status.was_online)
-        )),
+        grammers_tl_types::enums::UserStatus::Offline(status) => {
+            Some(format!("last seen {}", relative(status.was_online)))
+        }
         grammers_tl_types::enums::UserStatus::Recently(_) => Some("recently".to_string()),
         grammers_tl_types::enums::UserStatus::LastWeek(_) => Some("last week".to_string()),
         grammers_tl_types::enums::UserStatus::LastMonth(_) => Some("last month".to_string()),
-    }
-}
-
-fn telegram_relative_time(unix_seconds: i32) -> String {
-    let now = chrono::Utc::now().timestamp();
-    let delta = (now.saturating_sub(unix_seconds as i64)).max(0);
-    match delta {
-        0..=59 => "just now".to_string(),
-        60..=3599 => format!("{}m ago", delta / 60),
-        3600..=86399 => format!("{}h ago", delta / 3600),
-        86400..=604799 => format!("{}d ago", delta / 86400),
-        _ => {
-            let days = delta / 86400;
-            format!("{}d ago", days)
-        }
     }
 }
 
@@ -898,10 +883,6 @@ async fn reply_context(
 
 #[async_trait::async_trait]
 impl Messenger for TelegramMessenger {
-    fn platform(&self) -> &'static str {
-        "Telegram"
-    }
-
     async fn status(&self, chat: &ChatId) -> Result<Option<String>, BackendError> {
         let ChatId::Telegram(bare_id) = chat else {
             return Ok(None);
@@ -1266,16 +1247,6 @@ impl Messenger for TelegramMessenger {
         let _ = self.tx.send(BackendEvent::Disconnected(
             "Telegram disconnected".to_string(),
         ));
-        Ok(())
-    }
-
-    async fn logout(&mut self) -> Result<(), BackendError> {
-        let client = self.current_client().await;
-
-        client
-            .sign_out()
-            .await
-            .map_err(|e| BackendError::Other(format!("sign-out failed: {e}")))?;
         Ok(())
     }
 
