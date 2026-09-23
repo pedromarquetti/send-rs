@@ -716,7 +716,6 @@ impl TelegramMessenger {
         Duration::from_secs(backoff.min(30) as u64)
     }
 
-    // BUG: this is not auto updating, add to tokio refresh maybe?
     async fn status_for_peer_ref(
         &self,
         client: &Client,

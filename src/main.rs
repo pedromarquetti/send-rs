@@ -9,7 +9,7 @@ mod tui;
 
 use anyhow::Result;
 use backend::MessengerKind;
-use tracing::info;
+use tracing::{error, info};
 
 use crate::{
     backend::{telegram::TelegramMessenger, whatsapp::WhatsAppMessenger},
@@ -102,7 +102,7 @@ async fn main() -> Result<()> {
                     messengers.push(MessengerKind::Telegram(tg));
                 }
                 Err(e) => {
-                    tracing::error!("Telegram init failed: {e}");
+                    error!("Telegram init failed: {e}");
                 }
             }
         }
@@ -133,7 +133,7 @@ async fn main() -> Result<()> {
                 messengers.push(MessengerKind::WhatsApp(wa));
             }
             Err(e) => {
-                tracing::error!("WhatsApp init failed: {e}");
+                error!("WhatsApp init failed: {e}");
             }
         }
     }

@@ -81,6 +81,7 @@ enum UiEvent {
     /// `AppState::apply_playback_state` (a no-op if no session is active for
     /// that message).
     PlaybackState(PlaybackState),
+    Resize,
 }
 
 pub async fn run(
@@ -464,6 +465,7 @@ async fn run_app(
                     UiEvent::PlaybackState(playback) => {
                         app.state.apply_playback_state(playback);
                     }
+                    UiEvent::Resize=>{}
                 }
                 if !app.state.running {
                     break;
@@ -480,6 +482,11 @@ fn spawn_terminal_reader(tx: mpsc::UnboundedSender<UiEvent>) {
     std::thread::spawn(move || {
         loop {
             match event::read() {
+                Ok(Event::Resize(..)) => {
+                    if tx.send(UiEvent::Resize).is_err() {
+                        break;
+                    }
+                }
                 Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                     if tx.send(UiEvent::Key(key)).is_err() {
                         break;
