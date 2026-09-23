@@ -78,10 +78,8 @@ async fn main() -> Result<()> {
     // Initialize Telegram only when it is enabled or configured. A configured
     // but disabled account is retained so it can be enabled or authenticated
     // from settings; disabled providers are still excluded from chat loading.
-    // BUG: TELEGRAM: TUI loads chat list but returns error while grammers is not connected:
-    // steps: open app > immediately try to open tg chat > app returns Failed to load chat for
-    // <user> chat not found in dialog cache
-    // The user has to wait some secs before being able to open tg chats
+    // Dialogs are fetched lazily on first chat-list sync; per-chat operations
+    // self-heal against a cold dialog cache.
     let telegram = &config.providers.telegram;
     if telegram.enabled || telegram.has_credentials() {
         if !telegram.has_credentials() {

@@ -25,6 +25,11 @@ use tracing::{debug, error, info, warn};
 
 type CachedChats = Option<(Instant, Vec<Chat>)>;
 
+/// How long a fetched dialog snapshot is considered fresh. Shared by the chat
+/// list refresh (`chats`) and the per-chat peer resolver (`resolve_chat_peer`)
+/// so they agree on when a cache write actually populated the dialog list.
+const DIALOG_CACHE_TTL: Duration = Duration::from_secs(5);
+
 fn message_actions(from_me: bool) -> Vec<MessageAction> {
     let mut actions = vec![MessageAction::Reply];
     if from_me {
@@ -745,6 +750,66 @@ impl TelegramMessenger {
             .map(|d| d.peer_ref())
     }
 
+    /// Resolve the peer for a chat id.
+    ///
+    /// Hits the dialog cache first; on a miss it refreshes the dialog list once
+    /// and retries. The TUI renders chats from the persisted chat-list cache
+    /// before the first dialog fetch completes, so a miss here is usually a
+    /// startup race rather than a genuinely absent dialog.
+    ///
+    /// A refetch is only attempted while the dialog cache is cold (no fetch, or
+    /// one older than [`DIALOG_CACHE_TTL`]); this prevents the chat-poll refresh
+    /// from re-listing dialogs on every tick for a chat that is simply not a
+    /// dialog. The `chat_refresh` mutex serializes the refetch behind any
+    /// in-flight `chats()` fetch (which then populates the cache we re-check),
+    /// so concurrent chat-opens reuse a single dialog listing.
+    ///
+    /// A failed refetch propagates its error (`FloodWait`, not-authenticated,
+    /// connection loss); only a successful fetch that still lacks the peer
+    /// yields the "not found in dialog cache" message.
+    async fn resolve_chat_peer(
+        &self,
+        bare_id: i64,
+    ) -> Result<grammers_client::session::types::PeerRef, BackendError> {
+        if let Some(peer_ref) = self.find_dialog_peer_ref(bare_id) {
+            return Ok(peer_ref);
+        }
+
+        let _refresh = self.chat_refresh.lock().await;
+
+        if let Some(peer_ref) = self.find_dialog_peer_ref(bare_id) {
+            return Ok(peer_ref);
+        }
+
+        let cache = {
+            let cached = self.cached_chats.lock().await;
+            match cached.as_ref() {
+                Some((loaded_at, _)) => loaded_at.elapsed() >= DIALOG_CACHE_TTL,
+                None => true,
+            }
+        };
+
+        if cache {
+            let chats = match self.fetch_chats_once().await {
+                Ok(chats) => chats,
+                Err(error) => return Err(error),
+            };
+
+            // Mirror `chats()` so the dialog cache carries a freshness stamp
+            // even when the refetch came through a per-chat resolver; without
+            // it, every later miss would re-list dialogs again.
+            *self.cached_chats.lock().await = Some((Instant::now(), chats));
+
+            if let Some(peer_ref) = self.find_dialog_peer_ref(bare_id) {
+                return Ok(peer_ref);
+            }
+        }
+
+        Err(BackendError::Other(format!(
+            "chat {bare_id} not found in dialog cache"
+        )))
+    }
+
     async fn fetch_chats_once(&self) -> Result<Vec<Chat>, BackendError> {
         info!("Fetching Telegram dialogs...");
 
@@ -888,19 +953,7 @@ impl Messenger for TelegramMessenger {
         };
 
         let client = self.current_client().await;
-        let peer_ref = self
-            .find_dialog_peer_ref(*bare_id)
-            .or_else(|| {
-                self.cached_dialogs
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .find(|d| d.peer.id().bare_id() == Some(*bare_id))
-                    .map(|d| d.peer_ref())
-            })
-            .ok_or_else(|| {
-                BackendError::Other(format!("chat {bare_id} not found in dialog cache"))
-            })?;
+        let peer_ref = self.resolve_chat_peer(*bare_id).await?;
 
         self.status_for_peer_ref(&client, &peer_ref).await
     }
@@ -948,7 +1001,7 @@ impl Messenger for TelegramMessenger {
             {
                 let cached = self.cached_chats.lock().await;
                 if let Some((loaded_at, chats)) = cached.as_ref()
-                    && loaded_at.elapsed() < std::time::Duration::from_secs(5)
+                    && loaded_at.elapsed() < DIALOG_CACHE_TTL
                 {
                     debug!("Using cached Telegram dialogs");
                     return Ok(chats.clone());
@@ -1016,9 +1069,7 @@ impl Messenger for TelegramMessenger {
             ChatId::Telegram(id) => *id,
             _ => return Ok(()),
         };
-        let peer_ref = self
-            .find_dialog_peer_ref(bare_id)
-            .ok_or_else(|| BackendError::Other("chat not found in dialog cache".into()))?;
+        let peer_ref = self.resolve_chat_peer(bare_id).await?;
         debug!(bare_id, "Marking chat as read");
         let client = self.current_client().await;
         client.mark_as_read(peer_ref).await?;
@@ -1040,9 +1091,7 @@ impl Messenger for TelegramMessenger {
             _ => return Err(BackendError::Other("not a Telegram chat".into())),
         };
 
-        let peer_ref = self
-            .find_dialog_peer_ref(bare_id)
-            .ok_or_else(|| BackendError::Other("chat not found in dialog cache".into()))?;
+        let peer_ref = self.resolve_chat_peer(bare_id).await?;
 
         debug!(bare_id, offset_id, limit, "Fetching paged message history");
 
@@ -1082,9 +1131,7 @@ impl Messenger for TelegramMessenger {
             _ => return Err(BackendError::Other("not a Telegram chat".into())),
         };
 
-        let peer_ref = self
-            .find_dialog_peer_ref(bare_id)
-            .ok_or_else(|| BackendError::Other("chat not found in dialog cache".into()))?;
+        let peer_ref = self.resolve_chat_peer(bare_id).await?;
         let id = message_id.to_i32().ok_or_else(|| {
             BackendError::Other("telegram reply needs a numeric message id".into())
         })?;
@@ -1125,9 +1172,7 @@ impl Messenger for TelegramMessenger {
             _ => return Err(BackendError::Other("not a Telegram chat".into())),
         };
 
-        let peer_ref = self
-            .find_dialog_peer_ref(bare_id)
-            .ok_or_else(|| BackendError::Other("chat not found in dialog cache".into()))?;
+        let peer_ref = self.resolve_chat_peer(bare_id).await?;
 
         let mut input = grammers_client::message::InputMessage::new().text(text.to_string());
         if let Some(reply_id) = reply_to.as_ref().and_then(|id| id.to_i32()) {
@@ -1155,9 +1200,7 @@ impl Messenger for TelegramMessenger {
             BackendError::Other("telegram delete needs a numeric message id".into())
         })?;
 
-        let peer_ref = self
-            .find_dialog_peer_ref(bare_id)
-            .ok_or_else(|| BackendError::Other("chat not found in dialog cache".into()))?;
+        let peer_ref = self.resolve_chat_peer(bare_id).await?;
 
         debug!(bare_id, msg_id, "Deleting message");
 
@@ -1176,9 +1219,7 @@ impl Messenger for TelegramMessenger {
             BackendError::Other("telegram edit needs a numeric message id".into())
         })?;
 
-        let peer_ref = self
-            .find_dialog_peer_ref(bare_id)
-            .ok_or_else(|| BackendError::Other("chat not found in dialog cache".into()))?;
+        let peer_ref = self.resolve_chat_peer(bare_id).await?;
 
         let input = grammers_client::message::InputMessage::new().text(text.to_string());
         let client = self.current_client().await;
@@ -1200,9 +1241,7 @@ impl Messenger for TelegramMessenger {
             return Ok(None);
         };
 
-        let peer_ref = self
-            .find_dialog_peer_ref(bare_id)
-            .ok_or_else(|| BackendError::Other("chat not found in dialog cache".into()))?;
+        let peer_ref = self.resolve_chat_peer(bare_id).await?;
 
         debug!(bare_id, message_id = id, "Fetching media bytes on demand");
         let client = self.current_client().await;
@@ -1421,6 +1460,26 @@ mod tests {
         );
         messenger.set_enabled(true);
         assert!(!updates_stored(&messenger), "listener started only once");
+
+        messenger.shutdown.store(true, Ordering::SeqCst);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn resolve_chat_peer_skips_refetch_when_cache_is_fresh() {
+        let (messenger, dir) = test_messenger(false).await;
+
+        // A fresh dialog snapshot (recent `cached_chats`) means the dialog list
+        // was already enumerated; a peer that is not in it is genuinely absent.
+        // The resolver must report that without attempting another network
+        // round-trip (which would fail offline).
+        *messenger.cached_chats.lock().await = Some((Instant::now(), Vec::new()));
+
+        let err = messenger.resolve_chat_peer(999).await.unwrap_err();
+        assert!(
+            matches!(err, BackendError::Other(ref msg) if msg.contains("chat 999 not found in dialog cache")),
+            "expected not-found error, got {err:?}"
+        );
 
         messenger.shutdown.store(true, Ordering::SeqCst);
         let _ = std::fs::remove_dir_all(&dir);

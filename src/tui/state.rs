@@ -12,6 +12,7 @@ use crate::backend::{
 };
 use crate::config::{Config, Keymap};
 use crate::tui::chat::{ChatState, OpenChat};
+use crate::tui::loading::{LoadingArea, LoadingState};
 use crate::tui::player::PlaybackState;
 use crate::tui::popup::PopupKind;
 use tracing::{debug, error, info, warn};
@@ -89,6 +90,12 @@ pub struct AppState {
     /// Drives the persistent disconnected indicator in the status bar.
     pub provider_connected: HashSet<Provider>,
 
+    /// Active loading indication (`None` = idle). A single slot that every
+    /// loading action claims via [`AppState::start_loading`] and releases via
+    /// [`AppState::finish_loading`]; the renderers only consult it to decide
+    /// whether and where to draw a spinner.
+    pub loading: Option<LoadingState>,
+
     /// Latest player report for the active audio session (`None` = no session).
     pub playback: Option<PlaybackState>,
 }
@@ -165,6 +172,7 @@ impl AppState {
             retry_draft: None,
             rate_limit: None,
             provider_connected: HashSet::new(),
+            loading: None,
             playback: None,
         };
 
@@ -301,6 +309,7 @@ impl AppState {
         self.apply_chats(chats);
 
         self.chats_loaded = true;
+        self.finish_loading(LoadingArea::ChatList);
 
         if !errors.is_empty() {
             self.create_popup(PopupKind::Error(
@@ -458,8 +467,28 @@ impl AppState {
         };
     }
 
+    /// Claim the loading slot for `area`, replacing any previous indication.
+    /// The animation restarts (the frame lives inside the new [`LoadingState`]).
+    pub fn start_loading(&mut self, area: LoadingArea, context: impl Into<String>) {
+        self.loading = Some(LoadingState {
+            area,
+            context: context.into(),
+            spinner: Default::default(),
+        });
+    }
+
+    /// Release the loading slot, but only when it belongs to `area`, so a stale
+    /// completion (e.g. an outdated chat-list fetch) never clears a newer
+    /// indication.
+    pub fn finish_loading(&mut self, area: LoadingArea) {
+        if self.loading.as_ref().is_some_and(|l| l.area == area) {
+            self.loading = None;
+        }
+    }
+
     pub fn cancel_chat_load(&mut self) {
         self.chat_load_generation = self.chat_load_generation.wrapping_add(1);
+        self.finish_loading(LoadingArea::Chat);
     }
 
     pub fn begin_chat_load(&mut self, index: usize) -> Option<(Chat, u64, MessengerKind)> {
@@ -497,6 +526,8 @@ impl AppState {
             .find(|m| m.provider() == chat.id.to_provider())?
             .clone();
 
+        self.start_loading(LoadingArea::Chat, chat.contact_name.clone());
+
         Some((chat, self.chat_load_generation, messenger))
     }
 
@@ -513,6 +544,8 @@ impl AppState {
         {
             return;
         }
+
+        self.finish_loading(LoadingArea::Chat);
 
         // The presence subscription was sent before history loaded; surface
         // the peer's status on the chat list row and, when the load succeeds,
@@ -562,12 +595,15 @@ impl AppState {
         chat_id: &ChatId,
         result: std::result::Result<Vec<Message>, BackendError>,
     ) {
+        if self.chat_state.open_chat.as_ref().map(|o| &o.chat.id) != Some(chat_id) {
+            return;
+        }
+
+        self.finish_loading(LoadingArea::Inline);
+
         let Some(open) = self.chat_state.open_chat.as_mut() else {
             return;
         };
-        if open.chat.id != *chat_id {
-            return;
-        }
 
         match result {
             Ok(older) if !older.is_empty() => {
@@ -1025,6 +1061,7 @@ impl AppState {
         if let Some(ref mut ls) = self.login_state {
             ls.submitting = true;
         }
+        self.start_loading(LoadingArea::FullScreen, provider.name().to_string());
 
         let result = {
             let messenger = self.provider_to_messenger_mut(provider).unwrap();
@@ -1034,6 +1071,7 @@ impl AppState {
         if let Some(ref mut ls) = self.login_state {
             ls.submitting = false;
         }
+        self.finish_loading(LoadingArea::FullScreen);
 
         match result {
             Ok(LoginStepState::Done) => {
@@ -1056,6 +1094,7 @@ impl AppState {
 
                 self.login_state = None;
                 self.screen = Screen::Main;
+                self.finish_loading(LoadingArea::FullScreen);
 
                 self.create_popup(PopupKind::Info(String::from("Logged in successfully")));
 
@@ -1120,6 +1159,7 @@ impl AppState {
             }
         }
         self.screen = Screen::Main;
+        self.finish_loading(LoadingArea::FullScreen);
     }
 
     pub fn handle_backend_event(&mut self, provider: Provider, event: BackendEvent) {
@@ -1143,6 +1183,7 @@ impl AppState {
                     if was_pairing {
                         self.login_state = None;
                         self.screen = Screen::Main;
+                        self.finish_loading(LoadingArea::FullScreen);
                     }
 
                     if !provider.is_enabled(&self.config.providers) {
@@ -1220,6 +1261,7 @@ impl AppState {
                     "ok" => {
                         self.login_state = None;
                         self.screen = Screen::Main;
+                        self.finish_loading(LoadingArea::FullScreen);
                         self.config.providers.whatsapp = true;
                         let _ = self.config.save_config().map_err(|err| {
                             self.create_popup(PopupKind::Error(format!(
@@ -1665,6 +1707,87 @@ mod tests {
         let mut app = AppState::new(config, keymap, messengers, false).await;
         fetch_and_apply(&mut app).await;
         app
+    }
+
+    #[tokio::test]
+    async fn finish_loading_only_clears_the_matching_area() {
+        let mut state = app_state().await;
+
+        state.start_loading(LoadingArea::Chat, "Alice");
+        state.finish_loading(LoadingArea::Inline);
+        assert!(
+            state
+                .loading
+                .as_ref()
+                .is_some_and(|l| l.area == LoadingArea::Chat),
+            "finishing a different area must not clear the active indication"
+        );
+
+        state.finish_loading(LoadingArea::Chat);
+        assert!(state.loading.is_none());
+
+        state.finish_loading(LoadingArea::Chat);
+        assert!(state.loading.is_none(), "finishing an idle area is a no-op");
+    }
+
+    #[tokio::test]
+    async fn chat_loading_engages_on_open_and_releases_on_apply() {
+        let mut state = app_state().await;
+        state.chat_state.chat_list_state.select(Some(0));
+        let chat = state.chat_state.chats[0].clone();
+
+        // `begin_chat_load` clones the messenger, which the test `Stub` cannot
+        // provide; drive the same transitions it performs instead.
+        state.start_loading(LoadingArea::Chat, chat.contact_name.clone());
+        assert_eq!(state.loading.as_ref().unwrap().area, LoadingArea::Chat);
+
+        state.apply_chat_load(
+            chat.clone(),
+            state.chat_load_generation,
+            Ok(Vec::new()),
+            None,
+        );
+        assert!(
+            state.loading.is_none(),
+            "a successful chat load releases the Chat indication"
+        );
+        assert!(state.chat_state.open_chat.is_some());
+
+        state.start_loading(LoadingArea::Chat, chat.contact_name);
+        state.cancel_chat_load();
+        assert!(state.loading.is_none(), "aborting a chat open releases it");
+    }
+
+    #[tokio::test]
+    async fn stale_chat_load_result_does_not_clear_newer_indication() {
+        let mut state = app_state().await;
+        state.chat_state.chat_list_state.select(Some(0));
+        let chat = state.chat_state.chats[0].clone();
+
+        // Simulate a chat open that is then aborted (bumping the generation),
+        // followed by a newer indication (a scroll-back page) claiming the slot.
+        let stale_generation = state.chat_load_generation;
+        state.start_loading(LoadingArea::Chat, chat.contact_name.clone());
+        state.cancel_chat_load();
+        state.start_loading(LoadingArea::Inline, "Loading older messages...");
+
+        state.apply_chat_load(chat, stale_generation, Ok(Vec::new()), None);
+        assert!(
+            state
+                .loading
+                .as_ref()
+                .is_some_and(|l| l.area == LoadingArea::Inline),
+            "an outdated chat-load result must not clear the Inline indication"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_fetched_releases_chatlist_loading() {
+        let mut state = app_state().await;
+
+        state.start_loading(LoadingArea::ChatList, "Fetching chats...");
+        state.apply_fetched(Vec::new(), Vec::new());
+        assert!(state.loading.is_none());
     }
 
     #[tokio::test]

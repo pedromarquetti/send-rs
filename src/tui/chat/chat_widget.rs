@@ -8,6 +8,7 @@ use ratatui_textarea::TextArea;
 use crate::backend::Message;
 use crate::helpers::wrap_text;
 use crate::tui::chat::ChatState;
+use crate::tui::loading::{LoadingArea, LoadingState, spinner_symbol};
 use crate::tui::state::Focus;
 
 pub struct ChatWidget<'a> {
@@ -18,6 +19,10 @@ pub struct ChatWidget<'a> {
     search_bar: Line<'static>,
     /// Active message-search query text used to highlight matches.
     message_needle: Option<String>,
+    /// Active loading indication, if any. Rendered as a title spinner
+    /// ([`LoadingArea::Inline`]) or, when no chat is open yet, as a centered
+    /// spinner ([`LoadingArea::Chat`]).
+    loading: Option<&'a LoadingState>,
 }
 
 impl<'a> ChatWidget<'a> {
@@ -27,6 +32,7 @@ impl<'a> ChatWidget<'a> {
         max_write_lines: usize,
         search_bar: Line<'static>,
         message_needle: Option<String>,
+        loading: Option<&'a LoadingState>,
     ) -> Self {
         Self {
             focus,
@@ -34,7 +40,13 @@ impl<'a> ChatWidget<'a> {
             max_write_lines: max_write_lines.max(1),
             search_bar,
             message_needle,
+            loading,
         }
+    }
+
+    /// Current animation frame, taken from the active loading state.
+    fn frame(&self) -> u8 {
+        self.loading.map(|l| l.spinner.frame()).unwrap_or(0)
     }
 }
 
@@ -75,7 +87,7 @@ impl StatefulWidget for ChatWidget<'_> {
                     _ => Span::from("•").style(Style::new().fg(Color::DarkGray)),
                 };
 
-                Line::from(vec![
+                let mut spans = vec![
                     Span::raw(format!(" {} ", label)),
                     bullet,
                     Span::styled(
@@ -84,7 +96,16 @@ impl StatefulWidget for ChatWidget<'_> {
                             .fg(Color::DarkGray)
                             .add_modifier(Modifier::ITALIC),
                     ),
-                ])
+                ];
+
+                if self.loading.is_some_and(|l| l.area == LoadingArea::Inline) {
+                    spans.push(Span::styled(
+                        format!(" {} ", spinner_symbol(self.frame()).to_string()),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+
+                Line::from(spans)
             })
             .unwrap_or_else(|| " No chat selected ".into());
 
@@ -191,6 +212,21 @@ impl StatefulWidget for ChatWidget<'_> {
                     .viewport_content_length(visible);
                 StatefulWidget::render(scrollbar, scrollbar_col, buf, &mut scrollbar_state);
             }
+        } else if let Some(loading) = self.loading.filter(|l| l.area == LoadingArea::Chat) {
+            let line = Line::from(vec![
+                Span::styled(
+                    spinner_symbol(self.frame()).to_string(),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    format!(" Loading {}... ", loading.context),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]);
+            let paragraph = Paragraph::new(line)
+                .block(block)
+                .alignment(Alignment::Center);
+            paragraph.render(msgs_area, buf);
         } else {
             let hint = if state.selected_chat().is_some() {
                 "Press Enter to open this chat"
@@ -372,7 +408,7 @@ fn message_lines(
                 }
                 None => vec![Line::from(vec![Span::styled(
                     format!("{}, click to show", media.kind.label()),
-                    style,
+                    style.add_modifier(Modifier::ITALIC),
                 )])],
             }
         }

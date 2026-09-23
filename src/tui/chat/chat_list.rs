@@ -2,6 +2,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, StatefulWidget};
 
 use crate::backend::Chat;
+use crate::tui::loading::spinner_symbol;
 use crate::tui::search::SearchState;
 use crate::tui::state::Focus;
 
@@ -10,6 +11,9 @@ pub struct ChatList<'a> {
     curr_tag: Option<&'static str>,
     focus: Focus,
     search: &'a SearchState,
+    /// When set, a spinner is appended to the title bar (the chat list is
+    /// already populated and is being re-fetched).
+    loading: Option<u8>,
 }
 
 impl<'a> ChatList<'a> {
@@ -18,12 +22,14 @@ impl<'a> ChatList<'a> {
         chats: Vec<&'a Chat>,
         focus: Focus,
         search: &'a SearchState,
+        loading: Option<u8>,
     ) -> Self {
         Self {
             chats,
             focus,
             curr_tag,
             search,
+            loading,
         }
     }
 }
@@ -42,8 +48,16 @@ impl StatefulWidget for ChatList<'_> {
             Style::default()
         };
 
+        let mut title = Line::from(" Chats ");
+        if let Some(frame) = self.loading {
+            title.push_span(Span::styled(
+                format!(" {} ", spinner_symbol(frame).to_string()),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+
         let block = Block::bordered()
-            .title(" Chats ")
+            .title(title)
             .title_bottom(self.search.title_line())
             .border_style(border);
 

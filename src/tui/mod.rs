@@ -21,7 +21,7 @@ use crate::helpers::available_message_actions;
 use crate::tui::chat::chat_list::ChatList;
 use crate::tui::chat::chat_widget::ChatWidget;
 use crate::tui::image::ImageWidgetState;
-use crate::tui::loading::{LoadingSpinner, LoadingWidget};
+use crate::tui::loading::{LoadingArea, LoadingWidget};
 use crate::tui::player::{PlayKey, PlayState, PlaybackState, Player, RodioEngine};
 use crate::tui::popup::{AudioPopup, ImagePopup, PopupKind};
 use crate::tui::settings::Settings;
@@ -244,6 +244,11 @@ async fn run_app(
         app.state.start_login(Provider::Telegram)?;
     }
 
+    // Engage the chat-list loading indicator for the non-blocking startup
+    // fetch; `apply_fetched` releases it when results arrive.
+    app.state
+        .start_loading(LoadingArea::ChatList, "Fetching chats...".to_string());
+
     // Kick off the initial chat list fetch in the background so the UI renders
     // immediately (non-blocking startup). Results arrive via `ChatsLoaded`.
     let chat_loader_tx = tx.clone();
@@ -327,6 +332,11 @@ async fn run_app(
                 app.state.chatlist_sync_in_flight = true;
                 app.state.chatlist_sync_pending = app.state.messengers.len();
 
+                app.state.start_loading(
+                    LoadingArea::ChatList,
+                    "Syncing chats...".to_string(),
+                );
+
                 for messenger in app.state.messengers.iter() {
                     let provider = messenger.provider();
 
@@ -372,6 +382,11 @@ async fn run_app(
                         // paired via QR), refresh the shared chat list so the
                         // new provider's dialogs appear without a restart.
                         if rebuild {
+                            app.state.start_loading(
+                                LoadingArea::ChatList,
+                                "Fetching chats...".to_string(),
+                            );
+
                             let chat_loader_tx = tx.clone();
                             let loader_messengers = app.state.messengers.clone();
                             let loader_providers = app.state.config.providers.clone();
@@ -424,6 +439,10 @@ async fn run_app(
                         app.state.chatlist_sync_pending =
                             app.state.chatlist_sync_pending.saturating_sub(1);
                         app.state.chatlist_sync_in_flight = app.state.chatlist_sync_pending > 0;
+
+                        if !app.state.chatlist_sync_in_flight {
+                            app.state.finish_loading(LoadingArea::ChatList);
+                        }
 
                         match result {
                             Ok(chats) => {
@@ -506,7 +525,6 @@ fn spawn_terminal_reader(tx: mpsc::UnboundedSender<UiEvent>) {
 
 struct App {
     state: AppState,
-    loading_spinner: LoadingSpinner,
     picker: Picker,
     player: Player,
     tx: mpsc::UnboundedSender<UiEvent>,
@@ -524,7 +542,6 @@ impl App {
     ) -> Self {
         Self {
             state: AppState::new(config, keymap, messengers, open_settings).await,
-            loading_spinner: LoadingSpinner::new(),
             picker,
             player: Player::new(Box::new(RodioEngine::default()), tx.clone()),
             tx,
@@ -599,6 +616,8 @@ impl App {
         let offset_id = open.history.first().and_then(|msg| msg.message_id.to_i32());
 
         self.cancel_chat_load();
+        self.state
+            .start_loading(LoadingArea::Inline, "Loading older messages...".to_string());
         let tx = self.tx.clone();
         let task_chat = chat_id.clone();
         self.chat_load_task = Some(tokio::spawn(async move {
@@ -1242,7 +1261,10 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut Frame) {
-        self.loading_spinner.tick();
+        if let Some(loading) = &mut self.state.loading {
+            loading.spinner.tick();
+        }
+
         match self.state.screen {
             Screen::Main => self.draw_main(frame),
             Screen::Settings => {
@@ -1263,13 +1285,16 @@ impl App {
                         let masked = steps.get(step) == Some(&AuthSteps::Password);
 
                         if let Some(ls) = self.state.login_state.as_mut() {
-                            if ls.submitting {
+                            if ls.submitting
+                                && let Some(loading) = self.state.loading.as_ref()
+                                && loading.area == LoadingArea::FullScreen
+                            {
                                 let step_label =
                                     steps.get(step).map(|s| s.to_string()).unwrap_or_default();
                                 LoadingWidget::new(
                                     &format!(" {} — {} ", provider.name(), step_label),
-                                    Some(format!("Waiting for {} ...", provider.name())),
-                                    &mut self.loading_spinner,
+                                    Some(format!("Waiting for {} ...", loading.context)),
+                                    loading.spinner.frame(),
                                 )
                                 .render(frame.area(), frame.buffer_mut());
                                 return;
@@ -1328,11 +1353,19 @@ impl App {
                 .filter_map(|&idx| self.state.chat_state.chats.get(idx))
                 .collect()
         };
+        let chatlist_loading_frame = self
+            .state
+            .loading
+            .as_ref()
+            .filter(|l| l.area == LoadingArea::ChatList)
+            .map(|l| l.spinner.frame());
+
         ChatList::new(
             self.state.chat_state.get_tag(),
             visible_chats,
             self.state.focus,
             &self.state.chat_state.search,
+            chatlist_loading_frame,
         )
         .render(
             horizontal[0],
@@ -1344,7 +1377,7 @@ impl App {
             LoadingWidget::new(
                 " Sender ",
                 Some("Fetching chats...".to_string()),
-                &mut self.loading_spinner,
+                chatlist_loading_frame.unwrap_or(0),
             )
             .render(horizontal[0], frame.buffer_mut());
         }
@@ -1365,6 +1398,7 @@ impl App {
             self.state.config.max_write_lines,
             message_search_bar,
             message_needle,
+            self.state.loading.as_ref(),
         )
         .render(
             horizontal[1],
