@@ -67,6 +67,7 @@ pub struct KeymapConfig {
     pub quit: String,
     pub open_settings: String,
     pub focus_write: String,
+    pub scroll_to_top: String,
     pub scroll_to_bottom: String,
     pub send: String,
     pub newline: String,
@@ -80,6 +81,7 @@ impl Default for KeymapConfig {
     fn default() -> Self {
         Self {
             scroll_up: "k".into(),
+            scroll_to_top: "g".into(),
             search_text: "/".into(),
             scroll_down: "j".into(),
             select: "enter".into(),
@@ -104,6 +106,7 @@ impl KeymapConfig {
     pub fn parse(&self) -> Result<Keymap> {
         Ok(Keymap {
             scroll_up: parse_key(&self.scroll_up)?,
+            scroll_to_top: parse_key(&self.scroll_to_top)?,
             search_text: parse_key(&self.search_text)?,
             scroll_down: parse_key(&self.scroll_down)?,
             select: parse_key(&self.select)?,
@@ -136,8 +139,7 @@ pub struct Keymap {
     pub quit: KeyEvent,
     pub open_settings: KeyEvent,
     pub focus_write: KeyEvent,
-    // TODO: add scroll_top
-    // gg?
+    pub scroll_to_top: KeyEvent,
     pub scroll_to_bottom: KeyEvent,
     pub send: KeyEvent,
     /// Enter (with a modifier) also inserts a newline; this key is honored if the terminal

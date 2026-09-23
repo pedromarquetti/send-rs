@@ -34,7 +34,7 @@ impl Widget for StatusBarWidget {
             Focus::Write => {
                 "Enter send; Alt+Enter newline; Esc back; Tab switch focus; Ctrl+C quit"
             }
-            Focus::Popup => "Esc close overlay",
+            Focus::Popup => "Esc close popup; g scroll to top",
         };
 
         let line = if let Some(status) = self.status {

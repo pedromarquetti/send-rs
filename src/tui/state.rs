@@ -356,7 +356,8 @@ impl AppState {
             popup_type,
             prev_focus: self.focus,
             scroll_idx: 0,
-        })
+        });
+        self.focus = Focus::Popup;
     }
 
     pub fn dismiss_popup(&mut self) {

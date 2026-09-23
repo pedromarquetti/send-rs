@@ -991,6 +991,8 @@ impl App {
                     self.state.chat_state.chat_list_state.select_previous();
                 } else if key == km.scroll_to_bottom {
                     self.state.chat_state.chat_list_state.select_last();
+                } else if key == km.scroll_to_top {
+                    self.state.chat_state.chat_list_state.select_first();
                 } else if key == km.scroll_down {
                     self.state.chat_state.chat_list_state.select_next();
                 } else if key == km.select
@@ -1042,6 +1044,8 @@ impl App {
                     }
                 } else if key == km.scroll_down {
                     self.state.chat_state.message_list_state.select_next();
+                } else if key == km.scroll_to_top {
+                    self.state.chat_state.message_list_state.select_first();
                 } else if key == km.scroll_to_bottom {
                     let last = self
                         .state
@@ -1136,7 +1140,7 @@ impl App {
                     self.state.write.input(key);
                 }
             }
-            Focus::Popup => {}
+            Focus::Popup => {} // this will never happen > key event is captured before
         }
     }
 
@@ -1159,6 +1163,8 @@ impl App {
 
         if key == km.scroll_up {
             popup.scroll_idx = popup.scroll_idx.saturating_sub(1);
+        } else if key == km.scroll_to_top {
+            popup.scroll_idx = 0
         } else if key == km.scroll_down {
             popup.scroll_idx = popup.scroll_idx.saturating_add(1);
         }
