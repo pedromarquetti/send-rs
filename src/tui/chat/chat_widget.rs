@@ -266,13 +266,34 @@ fn message_lines(
     max_lines: Option<usize>,
     needle: Option<&str>,
 ) -> Vec<Line<'static>> {
+    let tag = message.chat.tag();
     let sender = if message.from_me {
         "You".to_string()
     } else {
         message.sender.clone()
     };
 
+    let style = match sender.as_str() {
+        "You" => match tag {
+            "TG" => Style::default().fg(Color::Blue),
+            "WA" => Style::default().fg(Color::Green),
+            _ => Style::default().fg(Color::Yellow),
+        },
+        _ => Style::default().fg(Color::DarkGray),
+    };
+
     let mut result: Vec<Line> = Vec::new();
+
+    // Gray out messages that haven't been confirmed on the server yet.
+    let pending_style = message.pending || message.failed;
+
+    let normal_text = {
+        if pending_style {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default()
+        }
+    };
 
     if message.reply_to_id.is_some() {
         let who = if message.from_me {
@@ -283,19 +304,12 @@ fn message_lines(
 
         result.push(Line::from(Span::styled(
             format!("  {who} replied"),
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
+            style
+                .add_modifier(Modifier::ITALIC)
+                .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::DIM),
         )));
     }
-
-    // Gray out messages that haven't been confirmed on the server yet.
-    let pending_style = message.pending || message.failed;
-    let body_style = Style::default().fg(if pending_style {
-        Color::DarkGray
-    } else {
-        Color::Gray
-    });
 
     let status_suffix = if message.failed {
         " ⚠ failed"
@@ -310,10 +324,6 @@ fn message_lines(
         format_timestamp(message.timestamp)
     );
 
-    let header_style = Style::default()
-        .fg(Color::DarkGray)
-        .add_modifier(Modifier::BOLD);
-
     let header_width = head.len();
 
     // A chunk is only "truncated" when word-wrapping had to cut a word short
@@ -324,13 +334,6 @@ fn message_lines(
     // The first body chunk shares the header line, so it wraps one `header`
     // width shorter than the continuation lines.
     let text_avail = available.saturating_sub(header_width + 2);
-
-    // Media messages render the caption plus the media-type label (or the
-    // "click to show" fallback) instead of `message.text`; the label is gray +
-    // italic while the caption keeps the normal body style.
-    let media_style = Style::default()
-        .fg(Color::DarkGray)
-        .add_modifier(Modifier::ITALIC);
 
     // Physical body lines without the header. Media messages lead with the
     // media-type label ("Image:") on its own line; the caption follows below.
@@ -351,13 +354,17 @@ fn message_lines(
                     let mut lines: Vec<Line> = Vec::new();
                     lines.push(Line::from(Span::styled(
                         format!("{}:", media.kind.label()),
-                        media_style,
+                        normal_text
+                            .fg(Color::Gray)
+                            .add_modifier(Modifier::DIM)
+                            .add_modifier(Modifier::BOLD)
+                            .add_modifier(Modifier::ITALIC),
                     )));
 
                     for text_line in caption.lines() {
                         for chunk in wrap_text(text_line, available.max(1)) {
                             any_truncated |= chunk.ends_with('…');
-                            lines.push(Line::from(body_spans(&chunk, needle, body_style)));
+                            lines.push(Line::from(body_spans(&chunk, needle, normal_text)));
                         }
                     }
 
@@ -365,7 +372,7 @@ fn message_lines(
                 }
                 None => vec![Line::from(vec![Span::styled(
                     format!("{}, click to show", media.kind.label()),
-                    media_style,
+                    style,
                 )])],
             }
         }
@@ -381,14 +388,14 @@ fn message_lines(
                 };
                 any_truncated |= first_chunks.iter().any(|c| c.ends_with('…'));
                 for chunk in first_chunks {
-                    lines.push(Line::from(body_spans(&chunk, needle, body_style)));
+                    lines.push(Line::from(body_spans(&chunk, needle, normal_text)));
                 }
             }
 
             for line in text_lines {
                 for chunk in wrap_text(line, available) {
                     any_truncated |= chunk.ends_with('…');
-                    lines.push(Line::from(body_spans(&chunk, needle, body_style)));
+                    lines.push(Line::from(body_spans(&chunk, needle, normal_text)));
                 }
             }
             lines
@@ -397,16 +404,13 @@ fn message_lines(
 
     let mut body_lines = body_lines.into_iter();
     if let Some(first) = body_lines.next() {
-        let mut spans = vec![Span::styled(head, header_style), Span::raw("  ")];
+        let mut spans = vec![Span::styled(head, style), Span::raw("  ")];
         spans.extend(first);
         result.push(Line::from(spans));
 
         result.extend(body_lines);
     } else {
-        result.push(Line::from(vec![
-            Span::styled(head, header_style),
-            Span::raw("  "),
-        ]));
+        result.push(Line::from(vec![Span::styled(head, style), Span::raw("  ")]));
     }
 
     // Check if we need to truncate due to max_lines
