@@ -1,4 +1,4 @@
-use crate::backend::AuthSteps;
+use crate::backend::{AuthSteps, OutboundMessage};
 use crate::helpers::relative;
 
 use super::{
@@ -11,7 +11,7 @@ use grammers_client::peer::Dialog;
 use grammers_client::sender::SenderPool;
 use grammers_client::session::storages::SqliteSession;
 use grammers_client::update::Update;
-use grammers_client::{Client, SignInError};
+use grammers_client::{Client, SignInError, message};
 use grammers_session::updates::UpdatesLike;
 use grammers_tl_types as tl;
 use std::collections::HashMap;
@@ -39,7 +39,7 @@ fn message_actions(from_me: bool) -> Vec<MessageAction> {
     actions
 }
 
-fn telegram_media_kind(msg: &grammers_client::message::Message) -> Option<MediaKind> {
+fn telegram_media_kind(msg: &message::Message) -> Option<MediaKind> {
     match msg.media()? {
         grammers_client::media::Media::Photo(_) => Some(MediaKind::Image),
         grammers_client::media::Media::Document(doc) => {
@@ -67,7 +67,7 @@ fn telegram_media_kind(msg: &grammers_client::message::Message) -> Option<MediaK
     }
 }
 
-fn telegram_message_media(msg: &grammers_client::message::Message) -> Option<MessageMedia> {
+fn telegram_message_media(msg: &message::Message) -> Option<MessageMedia> {
     let kind = telegram_media_kind(msg)?;
     let caption = (!msg.text().trim().is_empty()).then(|| msg.text().to_string());
 
@@ -92,7 +92,7 @@ fn telegram_message_media(msg: &grammers_client::message::Message) -> Option<Mes
     })
 }
 
-fn telegram_message_text(msg: &grammers_client::message::Message) -> String {
+fn telegram_message_text(msg: &message::Message) -> String {
     if let Some(media) = telegram_message_media(msg) {
         return media
             .caption
@@ -103,7 +103,7 @@ fn telegram_message_text(msg: &grammers_client::message::Message) -> String {
     msg.text().to_string()
 }
 
-fn telegram_message_sender(msg: &grammers_client::message::Message, from_me: bool) -> String {
+fn telegram_message_sender(msg: &message::Message, from_me: bool) -> String {
     if from_me {
         return "You".to_string();
     }
@@ -115,16 +115,16 @@ fn telegram_message_sender(msg: &grammers_client::message::Message, from_me: boo
         .to_string()
 }
 
-fn telegram_message_id(msg: &grammers_client::message::Message) -> MessageId {
+fn telegram_message_id(msg: &message::Message) -> MessageId {
     msg.id().to_string().into()
 }
 
-fn telegram_message_reply_to(msg: &grammers_client::message::Message) -> Option<MessageId> {
+fn telegram_message_reply_to(msg: &message::Message) -> Option<MessageId> {
     msg.reply_to_message_id().map(|id| id.to_string().into())
 }
 
 fn normalize_telegram_message(
-    msg: &grammers_client::message::Message,
+    msg: &message::Message,
     chat: &ChatId,
     own_chat: Option<&ChatId>,
     reply_ctx: Option<ReplyContext>,
@@ -183,7 +183,7 @@ async fn self_user_id(client: &Client) -> Option<ChatId> {
         .and_then(|user| user.id().bare_id().map(ChatId::Telegram))
 }
 
-fn message_chat_id(msg: &grammers_client::message::Message) -> Option<ChatId> {
+fn message_chat_id(msg: &message::Message) -> Option<ChatId> {
     msg.peer()
         .and_then(|peer| peer.id().bare_id())
         .or_else(|| msg.peer_id().bare_id())
@@ -191,7 +191,7 @@ fn message_chat_id(msg: &grammers_client::message::Message) -> Option<ChatId> {
         .map(ChatId::Telegram)
 }
 
-fn pretty_peer_name(msg: &grammers_client::message::Message, fallback: &str) -> String {
+fn pretty_peer_name(msg: &message::Message, fallback: &str) -> String {
     msg.peer()
         .and_then(|peer| peer.name())
         .map(str::to_string)
@@ -914,11 +914,11 @@ impl TelegramMessenger {
 /// context for display. Returns `None` when `msg` is not a reply.
 async fn reply_context(
     _client: &Client,
-    msg: &grammers_client::message::Message,
+    msg: &message::Message,
 ) -> Option<ReplyContext> {
     msg.reply_to_message_id()?;
 
-    let target: grammers_client::message::Message = match msg.get_reply().await {
+    let target: message::Message = match msg.get_reply().await {
         Ok(Some(m)) => m,
         _ => return None,
     };
@@ -1164,7 +1164,7 @@ impl Messenger for TelegramMessenger {
     async fn send(
         &self,
         chat: &ChatId,
-        text: &str,
+        msg: &OutboundMessage,
         reply_to: Option<MessageId>,
     ) -> Result<Message, BackendError> {
         let bare_id = match chat {
@@ -1174,10 +1174,21 @@ impl Messenger for TelegramMessenger {
 
         let peer_ref = self.resolve_chat_peer(bare_id).await?;
 
-        let mut input = grammers_client::message::InputMessage::new().text(text.to_string());
-        if let Some(reply_id) = reply_to.as_ref().and_then(|id| id.to_i32()) {
-            input = input.reply_to(Some(reply_id));
-        }
+        let input = match msg {
+            OutboundMessage::Text { text } => {
+                let mut input =
+                    message::InputMessage::new().text(text.to_string());
+                if let Some(reply_id) = reply_to.as_ref().and_then(|id| id.to_i32()) {
+                    input = input.reply_to(Some(reply_id));
+                }
+                input
+            }
+            OutboundMessage::Media { .. } => {
+                return Err(BackendError::Other(
+                    "Telegram: media send not implemented".into(),
+                ));
+            }
+        };
 
         debug!(bare_id, "Sending message");
         let client = self.current_client().await;
@@ -1221,7 +1232,7 @@ impl Messenger for TelegramMessenger {
 
         let peer_ref = self.resolve_chat_peer(bare_id).await?;
 
-        let input = grammers_client::message::InputMessage::new().text(text.to_string());
+        let input = message::InputMessage::new().text(text.to_string());
         let client = self.current_client().await;
 
         client.edit_message(peer_ref, msg_id, input).await?;

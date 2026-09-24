@@ -1,3 +1,4 @@
+use crate::backend::OutboundMessage;
 use crate::config::Config;
 use crate::helpers::{now, relative};
 
@@ -2633,7 +2634,7 @@ impl Messenger for WhatsAppMessenger {
     async fn send(
         &self,
         chat: &ChatId,
-        text: &str,
+        msg: &OutboundMessage,
         reply_to: Option<MessageId>,
     ) -> Result<Message, BackendError> {
         self.check_logged_in().await?;
@@ -2646,15 +2647,26 @@ impl Messenger for WhatsAppMessenger {
             .map_err(|e| BackendError::Other(format!("WhatsApp: invalid chat jid: {e}")))?;
         let client = self.current_client();
 
-        let message = match &reply_to {
-            Some(id) => wa::Message::text_with_context(
-                text.to_string(),
-                wa::ContextInfo {
-                    stanza_id: Some(id.to_string()),
-                    ..Default::default()
-                },
-            ),
-            None => wa::Message::text(text.to_string()),
+        let (text_content, message) = match msg {
+            OutboundMessage::Text { text } => {
+                let content = text.clone();
+                let wa_msg = match &reply_to {
+                    Some(id) => wa::Message::text_with_context(
+                        text.clone(),
+                        wa::ContextInfo {
+                            stanza_id: Some(id.to_string()),
+                            ..Default::default()
+                        },
+                    ),
+                    None => wa::Message::text(text.clone()),
+                };
+                (content, wa_msg)
+            }
+            OutboundMessage::Media { .. } => {
+                return Err(BackendError::Other(
+                    "WhatsApp: media send not implemented".into(),
+                ));
+            }
         };
 
         let result = client
@@ -2667,7 +2679,7 @@ impl Messenger for WhatsAppMessenger {
             chat: chat.clone(),
             sender: "You".into(),
             author_id: None,
-            text: text.to_string(),
+            text: text_content,
             timestamp: now(),
             from_me: true,
             msg_actions: message_actions(true),

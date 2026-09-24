@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use crate::backend::{
     BackendError, BackendEvent, Chat, ChatId, LoginStepState, Message, MessageId, MessengerKind,
-    Provider,
+    OutboundMessage, Provider,
 };
 use crate::config::{Config, Keymap};
 use crate::tui::chat::{ChatState, OpenChat};
@@ -29,7 +29,7 @@ pub enum Focus {
 #[derive(Clone)]
 pub struct RetryDraft {
     pub chat: ChatId,
-    pub text: String,
+    pub msg: OutboundMessage,
     pub message_id: Option<MessageId>,
 }
 
@@ -684,8 +684,10 @@ impl AppState {
             return;
         }
 
+        let outgoing = OutboundMessage::Text { text };
+
         let send_result = match self.chat_owner(&chat.id) {
-            Some(messenger) => messenger.send(&chat.id, &text, reply_to.clone()).await,
+            Some(messenger) => messenger.send(&chat.id, &outgoing, reply_to.clone()).await,
             None => Err(BackendError::Other("no messenger for this chat".into())),
         };
 
@@ -708,7 +710,7 @@ impl AppState {
             Err(e) => {
                 self.retry_draft = Some(RetryDraft {
                     chat: chat.id.clone(),
-                    text,
+                    msg: outgoing,
                     message_id: reply_to,
                 });
                 self.create_popup(PopupKind::Error(format!(
@@ -727,7 +729,7 @@ impl AppState {
         let send_result = match self.chat_owner(&draft.chat) {
             Some(messenger) => {
                 messenger
-                    .send(&draft.chat, &draft.text, draft.message_id.clone())
+                    .send(&draft.chat, &draft.msg, draft.message_id.clone())
                     .await
             }
             None => Err(BackendError::Other("no messenger for this chat".into())),
@@ -2862,9 +2864,17 @@ mod tests {
         async fn send(
             &self,
             chat: &ChatId,
-            text: &str,
+            msg: &crate::backend::OutboundMessage,
             _reply_to: Option<MessageId>,
         ) -> Result<Message, BackendError> {
+            let text = match msg {
+                crate::backend::OutboundMessage::Text { text } => text.clone(),
+                crate::backend::OutboundMessage::Media { .. } => {
+                    return Err(BackendError::Other(
+                        "stub: media send not implemented".into(),
+                    ));
+                }
+            };
             match self.send_result.lock().unwrap().take() {
                 Some(Err(err)) => Err(err),
                 _ => Ok(Message {
@@ -2872,7 +2882,7 @@ mod tests {
                     chat: chat.clone(),
                     sender: "You".into(),
                     author_id: None,
-                    text: text.to_string(),
+                    text,
                     timestamp: 0,
                     from_me: true,
                     msg_actions: Vec::new(),
@@ -2976,6 +2986,40 @@ mod tests {
             }
             other => panic!("expected Error popup, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn stub_media_send_returns_explicit_error() {
+        let chat = Chat {
+            id: ChatId::Telegram(1),
+            contact_name: "Test".into(),
+            ..Default::default()
+        };
+        let stub = StubMessenger::new().with_chats(vec![chat.clone()]);
+        let mut config = Config::default();
+        config.providers.telegram.enabled = true;
+        let keymap = config.keys.parse().unwrap();
+        let state = AppState::new(
+            config,
+            keymap,
+            vec![MessengerKind::Stub(Provider::Telegram, Box::new(stub))],
+            false,
+        )
+        .await;
+        let owner = state
+            .chat_owner(&chat.id)
+            .expect("stub messenger should own the chat");
+        let media = crate::backend::OutboundMessage::Media {
+            kind: crate::backend::MediaKind::Image,
+            data: vec![1, 2, 3].into(),
+            file_name: "photo.jpg".into(),
+            caption: None,
+        };
+        let err = owner.send(&chat.id, &media, None).await.unwrap_err();
+        assert!(
+            err.to_string().contains("media send not implemented"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

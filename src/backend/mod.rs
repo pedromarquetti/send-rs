@@ -4,7 +4,7 @@ pub mod mock;
 pub mod telegram;
 pub mod whatsapp;
 
-use std::{fmt::Display, str::FromStr};
+use std::{fmt::Display, str::FromStr, sync};
 
 use anyhow::Result;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -296,6 +296,21 @@ pub struct MessageMedia {
     pub waveform: Option<Vec<u8>>,
 }
 
+/// Message that will be sent by us
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutboundMessage {
+    Text {
+        text: String,
+    },
+    /// Media Will be used to handle sending any type of [`MediaKind`]
+    Media {
+        kind: MediaKind,
+        data: sync::Arc<[u8]>,
+        file_name: String,
+        caption: Option<String>,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub message_id: MessageId,
@@ -450,7 +465,7 @@ pub trait Messenger: Send + Sync {
     async fn send(
         &self,
         chat: &ChatId,
-        text: &str,
+        msg: &OutboundMessage,
         reply_to: Option<MessageId>,
     ) -> Result<Message, BackendError>;
     /// Delete an already-sent message.
@@ -592,7 +607,7 @@ impl MessengerKind {
         , async fn history(&self, chat: &ChatId) -> Result<Vec<Message>, BackendError> ;
         , async fn history_page(&self, chat: &ChatId, offset_id: Option<i32>, limit: usize) -> Result<Vec<Message>, BackendError> ;
         , async fn reply_context(&self, chat: &ChatId, message_id: &MessageId) -> Result<Option<ReplyContext>, BackendError> ;
-        , async fn send(&self, chat: &ChatId, text: &str, reply_to: Option<MessageId>) -> Result<Message, BackendError> ;
+        , async fn send(&self, chat: &ChatId, msg: &OutboundMessage, reply_to: Option<MessageId>) -> Result<Message, BackendError> ;
         , async fn delete(&self, chat: &ChatId, id: &MessageId) -> Result<(), BackendError> ;
         , async fn edit(&self, chat: &ChatId, id: &MessageId, text: &str) -> Result<(), BackendError> ;
         , async fn media_bytes(&self, chat: &ChatId, message_id: &MessageId) -> Result<Option<Vec<u8>>, BackendError> ;
@@ -697,5 +712,27 @@ mod tests {
         let restored: MessageMedia = serde_json::from_str(&encoded).unwrap();
         assert_eq!(restored.duration_secs, Some(12));
         assert_eq!(restored.waveform, Some(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn outbound_message_distinguishes_text_from_media() {
+        let text = OutboundMessage::Text { text: "hi".into() };
+        let media = OutboundMessage::Media {
+            kind: MediaKind::Image,
+            data: vec![1, 2, 3].into(),
+            file_name: "photo.jpg".into(),
+            caption: Some("caption".into()),
+        };
+        assert!(std::mem::discriminant(&text) != std::mem::discriminant(&media));
+        assert_eq!(media, media.clone());
+        assert_ne!(
+            media,
+            OutboundMessage::Media {
+                kind: MediaKind::Audio,
+                data: vec![1, 2, 3].into(),
+                file_name: "photo.jpg".into(),
+                caption: Some("caption".into()),
+            }
+        );
     }
 }

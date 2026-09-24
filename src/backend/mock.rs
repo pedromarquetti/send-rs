@@ -192,9 +192,17 @@ impl Messenger for MockMessenger {
     async fn send(
         &self,
         chat: &ChatId,
-        text: &str,
+        msg_in: &crate::backend::OutboundMessage,
         reply_to: Option<MessageId>,
     ) -> Result<Message, BackendError> {
+        let text = match msg_in {
+            crate::backend::OutboundMessage::Text { text } => text.clone(),
+            crate::backend::OutboundMessage::Media { .. } => {
+                return Err(BackendError::Other(
+                    "mock: media send not implemented".into(),
+                ));
+            }
+        };
         let mut state = self
             .state
             .lock()
@@ -217,7 +225,7 @@ impl Messenger for MockMessenger {
             chat: chat.clone(),
             sender: "You".into(),
             author_id: None,
-            text: text.to_string(),
+            text: text.clone(),
             timestamp: now(),
             from_me: true,
             msg_actions: vec![MessageAction::Edit, MessageAction::Delete],
@@ -253,7 +261,7 @@ impl Messenger for MockMessenger {
         }
 
         if chat == &self.echo_chat {
-            self.spawn_echo(chat.clone(), text);
+            self.spawn_echo(chat.clone(), &text);
         }
         Ok(msg)
     }
@@ -665,7 +673,13 @@ mod tests {
         let mock = MockMessenger::new("Telegram");
         let mut rx = mock.subscribe();
         let chat = mock.chats().await.unwrap().remove(0).id;
-        mock.send(&chat, "hi", None).await.unwrap();
+        mock.send(
+            &chat,
+            &crate::backend::OutboundMessage::Text { text: "hi".into() },
+            None,
+        )
+        .await
+        .unwrap();
 
         let mut saw_message = false;
         let mut saw_chat = false;
@@ -691,6 +705,23 @@ mod tests {
         assert!(saw_chat, "expected a ChatUpdated event");
     }
 
+    #[tokio::test]
+    async fn media_send_is_rejected_with_explicit_error() {
+        let mock = MockMessenger::new("Telegram");
+        let chat = mock.chats().await.unwrap().remove(0).id;
+        let media = crate::backend::OutboundMessage::Media {
+            kind: crate::backend::MediaKind::Image,
+            data: vec![1, 2, 3].into(),
+            file_name: "photo.jpg".into(),
+            caption: None,
+        };
+        let err = mock.send(&chat, &media, None).await.unwrap_err();
+        assert!(
+            err.to_string().contains("media send not implemented"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn mock_data_is_deterministic() {
         let data = mock_data("Telegram");
@@ -710,7 +741,15 @@ mod tests {
         let mock = MockMessenger::new("Telegram");
         let mut rx = mock.subscribe();
         let echo = mock.echo_chat.clone();
-        mock.send(&echo, "hello there", None).await.unwrap();
+        mock.send(
+            &echo,
+            &crate::backend::OutboundMessage::Text {
+                text: "hello there".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
 
         let echoed = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
