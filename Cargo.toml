@@ -71,3 +71,8 @@ rodio = { version = "0.21.1", features = ["tracing"] }
 # transitive dependency, so `features = ["stdio"]` adds no new download.
 rustix = { version = "1.1", features = ["stdio"] }
 opus-pure = "0.2.1"
+# Mic capture for voice-note recording. Already in the tree via rodio's
+# playback, so this adds no new download. On Linux the ALSA target dep needs
+# `libasound2-dev` at build time; macOS (CoreAudio) and Windows (WASAPI) need
+# nothing extra. Default features on, no `jack` (optional).
+cpal = "0.16"

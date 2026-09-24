@@ -328,8 +328,8 @@ pub struct Message {
     pub from_me: bool,
     pub msg_actions: Vec<MessageAction>,
 
+    // TODO: check if these two are redundant
     pub media: Option<MessageMedia>,
-
     pub reply_to_id: Option<MessageId>,
 
     /// Set when this message quotes an earlier one (the reply target).

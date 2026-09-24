@@ -3506,6 +3506,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "cpal",
  "dirs",
  "grammers-client",
  "grammers-session",

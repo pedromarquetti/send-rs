@@ -1,6 +1,7 @@
 // dead_code is only allowed in tests
 #![cfg_attr(test, allow(dead_code))]
 
+mod audio;
 mod backend;
 mod config;
 mod helpers;

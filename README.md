@@ -3,6 +3,10 @@
 <!--toc:start-->
 
 - [Welcome to Sender!](#welcome-to-sender)
+  - [System requirements](#system-requirements)
+    - [Linux](#linux)
+    - [macOS](#macos)
+    - [Windows](#windows)
   - [Features](#features)
   - [Configuration](#configuration)
     - [Example `config.toml`:](#example-configtoml)
@@ -25,6 +29,32 @@ the future?) in one TUI app!
 > [!CAUTION]
 > This is an unofficial client! Your account might be banned by the service
 > provider! Use at your own risk
+
+## System requirements
+
+Building needs only the Rust toolchain plus the system audio libraries used for
+**recording** (Playback needs no extra libs — opus-pure decodes Opus in pure
+Rust):
+
+### Linux
+
+1. ALSA dev libraries
+
+- Package names: `alsa-lib` (Arch/Manjaro), `libasound2-dev` (Debian/Ubuntu),
+  `alsa-lib-devel` (Fedora/RHEL).
+
+2. `pkg-config` (cpal uses ALSA for input).
+
+### macOS
+
+- Xcode Command Line Tools — CoreAudio is linked automatically.
+
+### Windows
+
+None — WASAPI is linked automatically.
+
+At runtime, a working microphone/input device is required to use voice-note
+recording.
 
 ## Features
 
