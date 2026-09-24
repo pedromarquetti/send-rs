@@ -7,6 +7,7 @@ use super::{
 };
 use anyhow::Result;
 use grammers_client::client::UpdatesConfiguration;
+use grammers_client::media::Attribute;
 use grammers_client::peer::Dialog;
 use grammers_client::sender::SenderPool;
 use grammers_client::session::storages::SqliteSession;
@@ -15,6 +16,7 @@ use grammers_client::{Client, SignInError, message};
 use grammers_session::updates::UpdatesLike;
 use grammers_tl_types as tl;
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -912,10 +914,7 @@ impl TelegramMessenger {
 
 /// Fetches the quoted original message for an incoming reply and builds its
 /// context for display. Returns `None` when `msg` is not a reply.
-async fn reply_context(
-    _client: &Client,
-    msg: &message::Message,
-) -> Option<ReplyContext> {
+async fn reply_context(_client: &Client, msg: &message::Message) -> Option<ReplyContext> {
     msg.reply_to_message_id()?;
 
     let target: message::Message = match msg.get_reply().await {
@@ -943,6 +942,32 @@ async fn reply_context(
         text,
         timestamp,
     })
+}
+
+///
+/// Maps [`MediaKind`] -> [`Attribute`]
+///
+/// Photos use [`InputMessage::photo`] instead, plain documents and stickers need no extra attribute beyond the auto-added filename. Exact metadata (duration/dimensions) is derived server-side
+/// NOTE: These values are placeholders until we implement the TUI
+/// TODO: remove the above note when these values are correctly implemented
+fn telegram_media_attribute(kind: MediaKind) -> Option<Attribute> {
+    match kind {
+        MediaKind::Audio => Some(Attribute::Audio {
+            duration: Duration::ZERO,
+            title: None,
+            performer: None,
+        }),
+        MediaKind::Video => Some(Attribute::Video {
+            round_message: false,
+            supports_streaming: false,
+            duration: Duration::ZERO,
+            w: 0,
+            h: 0,
+        }),
+        MediaKind::Image | MediaKind::Document | MediaKind::Sticker | MediaKind::Unsupported => {
+            None
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -1167,35 +1192,83 @@ impl Messenger for TelegramMessenger {
         msg: &OutboundMessage,
         reply_to: Option<MessageId>,
     ) -> Result<Message, BackendError> {
+        // Reject unsupported media before any network work so the error is
+        // surfaced (and testable) offline.
+        if let OutboundMessage::Media {
+            kind: MediaKind::Unsupported,
+            ..
+        } = msg
+        {
+            return Err(BackendError::Other(
+                "Telegram: unsupported media kind".into(),
+            ));
+        }
+
         let bare_id = match chat {
             ChatId::Telegram(id) => *id,
             _ => return Err(BackendError::Other("not a Telegram chat".into())),
         };
 
         let peer_ref = self.resolve_chat_peer(bare_id).await?;
+        let client = self.current_client().await;
+
+        let reply_id = reply_to.as_ref().and_then(|id| id.to_i32());
 
         let input = match msg {
             OutboundMessage::Text { text } => {
-                let mut input =
-                    message::InputMessage::new().text(text.to_string());
-                if let Some(reply_id) = reply_to.as_ref().and_then(|id| id.to_i32()) {
+                let mut input = message::InputMessage::new().text(text.to_string());
+                if let Some(reply_id) = reply_id {
                     input = input.reply_to(Some(reply_id));
                 }
                 input
             }
-            OutboundMessage::Media { .. } => {
-                return Err(BackendError::Other(
-                    "Telegram: media send not implemented".into(),
-                ));
+            OutboundMessage::Media {
+                kind,
+                data,
+                file_name,
+                caption,
+            } => {
+                let uploaded = client
+                    .upload_stream(&mut Cursor::new(&data[..]), data.len(), file_name.clone())
+                    .await
+                    .map_err(|e| BackendError::Other(format!("Telegram: upload failed: {e}")))?;
+
+                let caption = caption.clone().unwrap_or_default();
+                let mut input = match *kind {
+                    MediaKind::Image => message::InputMessage::new().text(caption).photo(uploaded),
+                    MediaKind::Audio
+                    | MediaKind::Video
+                    | MediaKind::Document
+                    | MediaKind::Sticker => {
+                        let mut input = message::InputMessage::new()
+                            .text(caption)
+                            .document(uploaded);
+
+                        if let Some(attribute) = telegram_media_attribute(kind.clone()) {
+                            input = input.attribute(attribute);
+                        }
+
+                        input
+                    }
+                    MediaKind::Unsupported => unreachable!("rejected above"),
+                };
+
+                if let Some(reply_id) = reply_id {
+                    input = input.reply_to(Some(reply_id));
+                }
+
+                input
             }
         };
 
         debug!(bare_id, "Sending message");
+
         let client = self.current_client().await;
         let sent = client.send_message(peer_ref, input).await?;
 
         let own_chat = Some(chat);
         let message = normalize_telegram_message(&sent, chat, own_chat, None, false, false);
+
         Ok(Message {
             reply_to_id: reply_to.clone(),
             ..message
@@ -1446,6 +1519,47 @@ mod tests {
 
     fn updates_stored(messenger: &TelegramMessenger) -> bool {
         messenger.updates.lock().unwrap().is_some()
+    }
+
+    #[test]
+    fn media_attribute_maps_kinds() {
+        use grammers_client::media::Attribute;
+        assert!(matches!(
+            telegram_media_attribute(MediaKind::Audio),
+            Some(Attribute::Audio { .. })
+        ));
+        assert!(matches!(
+            telegram_media_attribute(MediaKind::Video),
+            Some(Attribute::Video { .. })
+        ));
+        for kind in [
+            MediaKind::Image,
+            MediaKind::Document,
+            MediaKind::Sticker,
+            MediaKind::Unsupported,
+        ] {
+            assert!(telegram_media_attribute(kind.clone()).is_none(), "{kind:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_media_kind_is_rejected_offline() {
+        let (messenger, dir) = test_messenger(false).await;
+        let media = OutboundMessage::Media {
+            kind: MediaKind::Unsupported,
+            data: vec![].into(),
+            file_name: "x.bin".into(),
+            caption: None,
+        };
+        let err = messenger
+            .send(&ChatId::Telegram(1), &media, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported media kind"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

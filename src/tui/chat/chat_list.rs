@@ -51,7 +51,7 @@ impl StatefulWidget for ChatList<'_> {
         let mut title = Line::from(" Chats ");
         if let Some(frame) = self.loading {
             title.push_span(Span::styled(
-                format!(" {} ", spinner_symbol(frame).to_string()),
+                format!(" {} ", spinner_symbol(frame)),
                 Style::default().fg(Color::DarkGray),
             ));
         }

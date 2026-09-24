@@ -303,6 +303,7 @@ pub enum OutboundMessage {
         text: String,
     },
     /// Media Will be used to handle sending any type of [`MediaKind`]
+    #[expect(dead_code, reason = "This is not yet being called by the TUI")]
     Media {
         kind: MediaKind,
         data: sync::Arc<[u8]>,

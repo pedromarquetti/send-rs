@@ -100,7 +100,7 @@ impl StatefulWidget for ChatWidget<'_> {
 
                 if self.loading.is_some_and(|l| l.area == LoadingArea::Inline) {
                     spans.push(Span::styled(
-                        format!(" {} ", spinner_symbol(self.frame()).to_string()),
+                        format!(" {} ", spinner_symbol(self.frame())),
                         Style::default().fg(Color::DarkGray),
                     ));
                 }
