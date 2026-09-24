@@ -2803,7 +2803,7 @@ impl Messenger for WhatsAppMessenger {
             .map_err(|e| BackendError::Other(format!("WhatsApp: invalid chat jid: {e}")))?;
         let client = self.current_client();
 
-        let (text_content, message, media) = match msg {
+        let (text_content, message, media, media_ref) = match msg {
             OutboundMessage::Text { text } => {
                 let content = text.clone();
                 let wa_msg = match &reply_to {
@@ -2816,7 +2816,7 @@ impl Messenger for WhatsAppMessenger {
                     ),
                     None => wa::Message::text(text.clone()),
                 };
-                (content, wa_msg, None)
+                (content, wa_msg, None, None)
             }
             OutboundMessage::Media {
                 kind,
@@ -2863,12 +2863,17 @@ impl Messenger for WhatsAppMessenger {
                     caption: caption.clone(),
                     file_name: Some(file_name.clone()),
                 });
+                // Own-sent media stays playable even if the server never echoes
+                // it back: reuse the same ref extraction the inbound paths use,
+                // so `media_bytes` re-downloads driven by the persisted stanza
+                // id resolve for clips this session sent too.
+                let media_ref = wa_media_ref(&message);
                 let text_content = caption
                     .clone()
                     .filter(|c| !c.trim().is_empty())
                     .unwrap_or_else(|| format!("{}, click to show", kind.label()));
 
-                (text_content, message, media)
+                (text_content, message, media, media_ref)
             }
         };
 
@@ -2900,6 +2905,15 @@ impl Messenger for WhatsAppMessenger {
                 result.message_id.clone(),
                 (chat.clone(), sent.message_id.clone()),
             );
+
+            // Persist the outbound CDN reference alongside the stanza id so
+            // own-sent media (audio clips in particular) resolves through
+            // `media_bytes` without waiting for any server echo.
+            if let Some(media_ref) = media_ref {
+                state
+                    .media_refs
+                    .insert(result.message_id.clone(), media_ref);
+            }
 
             let is_dup = state
                 .history
@@ -4757,6 +4771,55 @@ fn sample_cdn() -> CdnFields {
         let dm = doc.document_message.as_option().unwrap();
         assert_eq!(dm.file_name.as_deref(), Some("report.pdf"));
         assert_eq!(dm.mimetype.as_deref(), Some("application/octet-stream"));
+    }
+
+    #[test]
+    fn own_sent_audio_keeps_a_persistable_media_ref() {
+        let msg = outbound_media_message(
+            MediaKind::Audio {
+                duration_secs: Some(2),
+                is_voice: true,
+                waveform: Some(vec![64; 16]),
+            },
+            sample_cdn(),
+            "note.ogg",
+            None,
+            None,
+        )
+        .unwrap();
+
+        let r = wa_media_ref(&msg).expect("own-sent audio carries a re-derivable ref");
+        match &r.kind {
+            MediaKind::Audio {
+                duration_secs,
+                is_voice,
+                waveform,
+            } => {
+                assert_eq!(*duration_secs, Some(2));
+                assert!(is_voice);
+                assert_eq!(waveform.as_deref(), Some(&[64u8; 16][..]));
+            }
+            other => panic!("expected audio kind, got {other:#?}"),
+        }
+        assert_eq!(r.direct_path, "/d");
+        assert_eq!(r.media_key, [1u8; 32]);
+        assert_eq!(r.file_sha256, [3u8; 32]);
+        assert_eq!(r.file_enc_sha256, [2u8; 32]);
+        assert_eq!(r.file_length, 4096);
+
+        // The send path keys the ref by the returned stanza/message id; the
+        // persisted cache round-trips that lookup for `media_bytes`.
+        let mut state = WhatsAppState::default();
+        state.media_refs.insert("stanza-42".into(), r.clone());
+        let restored: WhatsAppState =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert!(
+            matches!(
+                restored.media_refs.get("stanza-42"),
+                Some(MediaRef { kind: MediaKind::Audio { .. }, .. })
+            ),
+            "own-sent clip must stay resolvable after a restart"
+        );
     }
 
     #[test]

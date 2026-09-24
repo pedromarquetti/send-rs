@@ -944,10 +944,13 @@ async fn reply_context(_client: &Client, msg: &message::Message) -> Option<Reply
     })
 }
 
-///
 /// Maps [`MediaKind`] -> [`Attribute`]
 ///
-/// Photos use [`InputMessage::photo`] instead, plain documents and stickers need no extra attribute beyond the auto-added filename. Exact metadata (duration/dimensions) is derived server-side
+/// Photos use [`InputMessage::photo`] instead; plain documents and stickers need
+/// no extra attribute beyond the auto-added filename. Audio kinds are the
+/// metadata-driven case: a voice note becomes `Attribute::Voice { duration,
+/// waveform }`, a regular audio file `Attribute::Audio`, using the real
+/// `duration_secs` (not a zero placeholder).
 fn telegram_media_attribute(kind: MediaKind) -> Option<Attribute> {
     match kind {
         MediaKind::Audio {
@@ -1535,22 +1538,39 @@ mod tests {
     #[test]
     fn media_attribute_maps_kinds() {
         use grammers_client::media::Attribute;
-        assert!(matches!(
-            telegram_media_attribute(MediaKind::Audio {
-                duration_secs: Some(2),
-                is_voice: true,
-                waveform: None,
-            }),
-            Some(Attribute::Voice { .. })
-        ));
-        assert!(matches!(
-            telegram_media_attribute(MediaKind::Audio {
-                duration_secs: Some(2),
-                is_voice: false,
-                waveform: None,
-            }),
-            Some(Attribute::Audio { .. })
-        ));
+
+        // A voice-note kind yields `Attribute::Voice` carrying the *real*
+        // duration and waveform from the kind (payload -> attribute flow).
+        let voice = telegram_media_attribute(MediaKind::Audio {
+            duration_secs: Some(14),
+            is_voice: true,
+            waveform: Some(vec![7, 9, 11]),
+        })
+        .unwrap();
+        match voice {
+            Attribute::Voice { duration, waveform } => {
+                assert_eq!(duration.as_secs(), 14);
+                assert_eq!(waveform, Some(vec![7, 9, 11]));
+            }
+            _ => panic!("expected Voice attribute"),
+        }
+
+        // A non-voice audio file stays `Attribute::Audio` but keeps its length.
+        let audio = telegram_media_attribute(MediaKind::Audio {
+            duration_secs: Some(180),
+            is_voice: false,
+            waveform: None,
+        })
+        .unwrap();
+        match audio {
+            Attribute::Audio {
+                duration,
+                title: None,
+                performer: None,
+            } => assert_eq!(duration.as_secs(), 180),
+            _ => panic!("expected Audio attribute"),
+        }
+
         assert!(matches!(
             telegram_media_attribute(MediaKind::Video),
             Some(Attribute::Video { .. })
