@@ -36,14 +36,15 @@ the future?) in one TUI app!
 - [x] Descriptive error handling
 - [ ] WhatsApp integration
 - [ ] Message actions (reply, edit, delete) for whatsapp
+- [ ] Copy messages' text to clipboard
 - [x] Telegram integration
 - [x] Message actions (reply, edit, delete) for telegram
 - [x] **Telegram** - Support for endless chat scroll.
 - [x] **WhatsApp** - Support for endless chat scroll.
 - [x] Image rendering
-- [ ] Audio playback
-- [ ] Send images - TODO: check if possible: send images
-- [ ] Send audip - TODO: check if possible: send audio
+- [x] Audio playback
+- [ ] Send images - TODO: check if possible: send images + "paste to send"
+- [ ] Send audio - TODO: check if possible: send audio
 - [ ] Support for notifications
 - [x] Ordered chat list - All chats, ordered by pinned/most recent.
 - [ ] Dedicated chatlist for each provider
