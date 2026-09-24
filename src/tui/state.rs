@@ -469,6 +469,7 @@ impl AppState {
 
     /// Claim the loading slot for `area`, replacing any previous indication.
     /// The animation restarts (the frame lives inside the new [`LoadingState`]).
+    // TODO: the spinner is not spinning. make it auto tick every x ms
     pub fn start_loading(&mut self, area: LoadingArea, context: impl Into<String>) {
         self.loading = Some(LoadingState {
             area,

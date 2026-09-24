@@ -17,9 +17,11 @@ use tokio::sync::{RwLock, broadcast};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use whatsapp_rust::Client;
+use whatsapp_rust::UploadOptions;
 use whatsapp_rust::download::DownloadParams;
 use whatsapp_rust::prelude::{
-    Bot, Event, Jid, MessageBuilderExt, MessageExt, MessageInfo, Server, SqliteStore, wa,
+    Bot, Event, Jid, MessageBuilderExt, MessageExt, MessageField, MessageInfo, Server, SqliteStore,
+    wa,
 };
 use whatsapp_rust::wacore::download::MediaType;
 use whatsapp_rust::wacore::store::DevicePropsOverride;
@@ -2305,6 +2307,149 @@ fn history_info(
     info
 }
 
+/// The CDN/crypto fields a WhatsApp upload returns, mirrored from whatsapp-rust's
+/// `UploadResponse` (which is `#[non_exhaustive]`, so it cannot be constructed
+/// in tests or decomposed here).
+struct CdnFields {
+    url: String,
+    direct_path: String,
+    media_key: [u8; 32],
+    file_enc_sha256: [u8; 32],
+    file_sha256: [u8; 32],
+    file_length: u64,
+    media_key_timestamp: i64,
+    streaming_sidecar: Option<Vec<u8>>,
+}
+
+/// Build the outbound `wa::Message` for uploaded bytes, mapping the
+/// provider-neutral kind onto WhatsApp's media sub-protos and carrying the
+/// reply context. Deterministic given the CDN fields, so the mapping is
+/// testable offline.
+fn outbound_media_message(
+    kind: MediaKind,
+    cdn: CdnFields,
+    file_name: &str,
+    caption: Option<&str>,
+    reply_to: Option<&MessageId>,
+) -> Result<WaMessage, BackendError> {
+    let CdnFields {
+        url,
+        direct_path,
+        media_key,
+        file_enc_sha256,
+        file_sha256,
+        file_length,
+        media_key_timestamp,
+        streaming_sidecar,
+    } = cdn;
+
+    let caption = caption.map(str::to_string);
+    let context_info = reply_to.map(|id| {
+        Box::new(wa::ContextInfo {
+            stanza_id: Some(id.to_string()),
+            ..Default::default()
+        })
+    });
+
+    let message = match kind {
+        MediaKind::Image => WaMessage {
+            image_message: MessageField::some(wa::message::ImageMessage {
+                url: Some(url),
+                direct_path: Some(direct_path),
+                media_key: Some(media_key.to_vec()),
+                file_enc_sha256: Some(file_enc_sha256.to_vec()),
+                file_sha256: Some(file_sha256.to_vec()),
+                file_length: Some(file_length),
+                media_key_timestamp: Some(media_key_timestamp),
+                mimetype: Some("image/jpeg".into()),
+                caption,
+                context_info: context_info
+                    .map(|ci| MessageField::some(*ci))
+                    .unwrap_or_default(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        MediaKind::Video => WaMessage {
+            video_message: MessageField::some(wa::message::VideoMessage {
+                url: Some(url),
+                direct_path: Some(direct_path),
+                media_key: Some(media_key.to_vec()),
+                file_enc_sha256: Some(file_enc_sha256.to_vec()),
+                file_sha256: Some(file_sha256.to_vec()),
+                file_length: Some(file_length),
+                media_key_timestamp: Some(media_key_timestamp),
+                streaming_sidecar,
+                mimetype: Some("video/mp4".into()),
+                caption,
+                context_info: context_info
+                    .map(|ci| MessageField::some(*ci))
+                    .unwrap_or_default(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        MediaKind::Audio => WaMessage {
+            audio_message: MessageField::some(wa::message::AudioMessage {
+                url: Some(url),
+                direct_path: Some(direct_path),
+                media_key: Some(media_key.to_vec()),
+                file_enc_sha256: Some(file_enc_sha256.to_vec()),
+                file_sha256: Some(file_sha256.to_vec()),
+                file_length: Some(file_length),
+                media_key_timestamp: Some(media_key_timestamp),
+                streaming_sidecar,
+                mimetype: Some("audio/ogg; codecs=opus".into()),
+                context_info: context_info
+                    .map(|ci| MessageField::some(*ci))
+                    .unwrap_or_default(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        MediaKind::Document => WaMessage {
+            document_message: MessageField::some(wa::message::DocumentMessage {
+                url: Some(url),
+                direct_path: Some(direct_path),
+                media_key: Some(media_key.to_vec()),
+                file_enc_sha256: Some(file_enc_sha256.to_vec()),
+                file_sha256: Some(file_sha256.to_vec()),
+                file_length: Some(file_length),
+                media_key_timestamp: Some(media_key_timestamp),
+                mimetype: Some("application/octet-stream".into()),
+                file_name: Some(file_name.to_string()),
+                caption,
+                context_info: context_info
+                    .map(|ci| MessageField::some(*ci))
+                    .unwrap_or_default(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        MediaKind::Sticker => WaMessage {
+            sticker_message: MessageField::some(wa::message::StickerMessage {
+                url: Some(url),
+                direct_path: Some(direct_path),
+                media_key: Some(media_key.to_vec()),
+                mimetype: Some("image/webp".into()),
+                file_length: Some(file_length),
+                media_key_timestamp: Some(media_key_timestamp),
+                context_info: context_info
+                    .map(|ci| MessageField::some(*ci))
+                    .unwrap_or_default(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        MediaKind::Unsupported => {
+            return Err(BackendError::Other(
+                "WhatsApp: unsupported media kind".into(),
+            ));
+        }
+    };
+    Ok(message)
+}
+
 #[async_trait::async_trait]
 impl Messenger for WhatsAppMessenger {
     async fn is_authenticated(&self) -> bool {
@@ -2647,7 +2792,7 @@ impl Messenger for WhatsAppMessenger {
             .map_err(|e| BackendError::Other(format!("WhatsApp: invalid chat jid: {e}")))?;
         let client = self.current_client();
 
-        let (text_content, message) = match msg {
+        let (text_content, message, media) = match msg {
             OutboundMessage::Text { text } => {
                 let content = text.clone();
                 let wa_msg = match &reply_to {
@@ -2660,12 +2805,60 @@ impl Messenger for WhatsAppMessenger {
                     ),
                     None => wa::Message::text(text.clone()),
                 };
-                (content, wa_msg)
+                (content, wa_msg, None)
             }
-            OutboundMessage::Media { .. } => {
-                return Err(BackendError::Other(
-                    "WhatsApp: media send not implemented".into(),
-                ));
+            OutboundMessage::Media {
+                kind,
+                data,
+                file_name,
+                caption,
+            } => {
+                let media_type = match kind {
+                    MediaKind::Image => MediaType::Image,
+                    MediaKind::Video => MediaType::Video,
+                    MediaKind::Audio => MediaType::Audio,
+                    MediaKind::Document => MediaType::Document,
+                    MediaKind::Sticker => MediaType::Sticker,
+                    MediaKind::Unsupported => {
+                        return Err(BackendError::Other(
+                            "WhatsApp: unsupported media kind".into(),
+                        ));
+                    }
+                };
+
+                let upload = client
+                    .upload(data.to_vec(), media_type, UploadOptions::new())
+                    .await
+                    .map_err(BackendError::from)?;
+                let message = outbound_media_message(
+                    kind.clone(),
+                    CdnFields {
+                        url: upload.url,
+                        direct_path: upload.direct_path,
+                        media_key: upload.media_key,
+                        file_enc_sha256: upload.file_enc_sha256,
+                        file_sha256: upload.file_sha256,
+                        file_length: upload.file_length,
+                        media_key_timestamp: upload.media_key_timestamp,
+                        streaming_sidecar: upload.streaming_sidecar,
+                    },
+                    file_name,
+                    caption.as_deref(),
+                    reply_to.as_ref(),
+                )?;
+                let media = Some(MessageMedia {
+                    kind: kind.clone(),
+                    caption: caption.clone(),
+                    file_name: Some(file_name.clone()),
+                    duration_secs: None,
+                    waveform: None,
+                });
+                let text_content = caption
+                    .clone()
+                    .filter(|c| !c.trim().is_empty())
+                    .unwrap_or_else(|| format!("{}, click to show", kind.label()));
+
+                (text_content, message, media)
             }
         };
 
@@ -2683,7 +2876,7 @@ impl Messenger for WhatsAppMessenger {
             timestamp: now(),
             from_me: true,
             msg_actions: message_actions(true),
-            media: None,
+            media,
             reply_to_id: reply_to.clone(),
             reply_ctx: None,
             pending: false,
@@ -4466,6 +4659,93 @@ mod tests {
         assert_eq!(
             presence_label(false, Some(now() - 172800)),
             Some("last seen 2d ago".to_string())
+        );
+    }
+
+fn sample_cdn() -> CdnFields {
+    CdnFields {
+        url: "https://cdn.example/u".to_string(),
+        direct_path: "/d".to_string(),
+        media_key: [1u8; 32],
+        file_enc_sha256: [2u8; 32],
+        file_sha256: [3u8; 32],
+        file_length: 4096,
+        media_key_timestamp: 1_700_000_000,
+        streaming_sidecar: Some(vec![9, 9, 9]),
+    }
+}
+
+    #[test]
+    fn outbound_image_message_maps_cdn_fields_and_context() {
+        let msg = outbound_media_message(
+            MediaKind::Image,
+            sample_cdn(),
+            "pic.jpg",
+            Some("caption"),
+            Some(&MessageId("stanza-1".into())),
+        )
+        .unwrap();
+        let im = msg.image_message.as_option().unwrap();
+        assert_eq!(im.url.as_deref(), Some("https://cdn.example/u"));
+        assert_eq!(im.direct_path.as_deref(), Some("/d"));
+        assert_eq!(im.media_key.as_deref(), Some(&[1u8; 32][..]));
+        assert_eq!(im.file_enc_sha256.as_deref(), Some(&[2u8; 32][..]));
+        assert_eq!(im.file_sha256.as_deref(), Some(&[3u8; 32][..]));
+        assert_eq!(im.file_length, Some(4096));
+        assert_eq!(im.media_key_timestamp, Some(1_700_000_000));
+        assert_eq!(im.caption.as_deref(), Some("caption"));
+        assert_eq!(
+            im.context_info.as_option().unwrap().stanza_id.as_deref(),
+            Some("stanza-1")
+        );
+    }
+
+    #[test]
+    fn outbound_video_and_audio_carry_streaming_sidecar() {
+        let video =
+            outbound_media_message(MediaKind::Video, sample_cdn(), "clip.mp4", Some("hi"), None)
+                .unwrap();
+        let vm = video.video_message.as_option().unwrap();
+        assert_eq!(vm.streaming_sidecar.as_deref(), Some(&[9, 9, 9][..]));
+        assert_eq!(vm.caption.as_deref(), Some("hi"));
+        assert!(!vm.context_info.is_set());
+
+        let audio =
+            outbound_media_message(MediaKind::Audio, sample_cdn(), "note.ogg", None, None).unwrap();
+        let am = audio.audio_message.as_option().unwrap();
+        assert_eq!(am.streaming_sidecar.as_deref(), Some(&[9, 9, 9][..]));
+        assert_eq!(am.mimetype.as_deref(), Some("audio/ogg; codecs=opus"));
+    }
+
+    #[test]
+    fn outbound_document_sets_file_name() {
+        let doc =
+            outbound_media_message(MediaKind::Document, sample_cdn(), "report.pdf", None, None)
+                .unwrap();
+        let dm = doc.document_message.as_option().unwrap();
+        assert_eq!(dm.file_name.as_deref(), Some("report.pdf"));
+        assert_eq!(dm.mimetype.as_deref(), Some("application/octet-stream"));
+    }
+
+    #[test]
+    fn outbound_sticker_builds_sticker_message() {
+        let msg =
+            outbound_media_message(MediaKind::Sticker, sample_cdn(), "s.webp", None, None).unwrap();
+        let sm = msg.sticker_message.as_option().unwrap();
+        assert_eq!(sm.url.as_deref(), Some("https://cdn.example/u"));
+        assert_eq!(sm.direct_path.as_deref(), Some("/d"));
+        assert_eq!(sm.media_key.as_deref(), Some(&[1u8; 32][..]));
+        assert_eq!(sm.mimetype.as_deref(), Some("image/webp"));
+    }
+
+    #[test]
+    fn outbound_unsupported_kind_is_rejected() {
+        let err = outbound_media_message(MediaKind::Unsupported, sample_cdn(), "x.bin", None, None)
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string().contains("unsupported media kind"),
+            "unexpected error: {err}"
         );
     }
 }
