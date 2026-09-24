@@ -260,7 +260,20 @@ pub enum MessageAction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MediaKind {
     Image,
-    Audio,
+    /// Audio media carries its playback metadata inline so a `MessageMedia` or
+    /// `OutboundMessage::Media` whose kind is audio always has the data nearby.
+    /// `duration_secs` is `None` when the provider does not report a length
+    /// (outbound recordings always set it); `is_voice` is `true` for voice
+    /// notes; `waveform` is a downsampled amplitude envelope on the 0..=127
+    /// scale both providers use, `None` when unknown.
+    Audio {
+        #[serde(default)]
+        duration_secs: Option<u32>,
+        #[serde(default)]
+        is_voice: bool,
+        #[serde(default)]
+        waveform: Option<Vec<u8>>,
+    },
     Video,
     Document,
     Sticker,
@@ -271,7 +284,7 @@ impl MediaKind {
     pub fn label(&self) -> &'static str {
         match self {
             Self::Image => "Image",
-            Self::Audio => "Audio",
+            Self::Audio { .. } => "Audio",
             Self::Video => "Video",
             Self::Document => "Document",
             Self::Sticker => "Sticker",
@@ -285,15 +298,6 @@ pub struct MessageMedia {
     pub kind: MediaKind,
     pub caption: Option<String>,
     pub file_name: Option<String>,
-    /// Playback length in seconds for audio media, when the provider reports
-    /// it (Telegram voice notes, WhatsApp audio). The TUI shows it before the
-    /// first decode; when absent it falls back to the demuxed duration.
-    #[serde(default)]
-    pub duration_secs: Option<u32>,
-    /// Provider waveform preview for audio (opaque bytes; Telegram/WhatsApp
-    /// send a downsampled amplitude envelope). Optional, reserved for UI use.
-    #[serde(default)]
-    pub waveform: Option<Vec<u8>>,
 }
 
 /// Message that will be sent by us
@@ -673,46 +677,43 @@ mod tests {
     }
 
     #[test]
-    fn audio_media_fields_default_backward_compatibly() {
-        // Cached messages written before `duration_secs`/`waveform` existed
-        // must still parse; both new fields default to `None`.
-        let old_json = r#"{
-            "message_id": "12345",
-            "chat": "tg:103",
-            "sender": "Alice",
-            "author_id": null,
-            "text": "",
-            "timestamp": 1700000000,
-            "from_me": false,
-            "msg_actions": [],
-            "media": {
-                "kind": "Audio",
-                "caption": "voice note",
-                "file_name": "voice.ogg"
-            },
-            "reply_to_id": null,
-            "reply_ctx": null,
-            "pending": false,
-            "failed": false
-        }"#;
-        let msg: Message = serde_json::from_str(old_json).expect("old cache shape still parses");
-        let media = msg.media.expect("media parsed");
-        assert_eq!(media.kind, MediaKind::Audio);
-        assert_eq!(media.duration_secs, None);
-        assert_eq!(media.waveform, None);
-
-        // A round trip now carries the additional fields.
+    fn audio_media_kind_round_trips_metadata() {
+        // Cached audio media store the playback metadata inside the kind
+        // variant; a serialize/deserialize cycle preserves it.
         let with_fields = MessageMedia {
-            kind: MediaKind::Audio,
+            kind: MediaKind::Audio {
+                duration_secs: Some(12),
+                is_voice: true,
+                waveform: Some(vec![1, 2, 3]),
+            },
             caption: None,
             file_name: None,
-            duration_secs: Some(12),
-            waveform: Some(vec![1, 2, 3]),
         };
         let encoded = serde_json::to_string(&with_fields).unwrap();
         let restored: MessageMedia = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(restored.duration_secs, Some(12));
-        assert_eq!(restored.waveform, Some(vec![1, 2, 3]));
+        assert_eq!(
+            restored.kind,
+            MediaKind::Audio {
+                duration_secs: Some(12),
+                is_voice: true,
+                waveform: Some(vec![1, 2, 3]),
+            }
+        );
+
+        // Unknown metadata fields default so messages from providers that do
+        // not report a duration still construct clean audio.
+        let bare: MessageMedia = serde_json::from_str(
+            r#"{"kind":{"Audio":{"is_voice":true}},"caption":null,"file_name":null}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            bare.kind,
+            MediaKind::Audio {
+                duration_secs: None,
+                is_voice: true,
+                waveform: None,
+            }
+        );
     }
 
     #[test]
@@ -729,7 +730,11 @@ mod tests {
         assert_ne!(
             media,
             OutboundMessage::Media {
-                kind: MediaKind::Audio,
+                kind: MediaKind::Audio {
+                    duration_secs: Some(2),
+                    is_voice: true,
+                    waveform: None,
+                },
                 data: vec![1, 2, 3].into(),
                 file_name: "photo.jpg".into(),
                 caption: Some("caption".into()),

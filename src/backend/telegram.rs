@@ -45,18 +45,26 @@ fn telegram_media_kind(msg: &message::Message) -> Option<MediaKind> {
     match msg.media()? {
         grammers_client::media::Media::Photo(_) => Some(MediaKind::Image),
         grammers_client::media::Media::Document(doc) => {
-            let raw = doc.raw;
+            let raw = &doc.raw;
 
             if raw.video {
                 return Some(MediaKind::Video);
             }
 
             if raw.voice {
-                return Some(MediaKind::Audio);
+                return Some(MediaKind::Audio {
+                    // `doc.duration()` reads the `DocumentAttributeAudio`
+                    // attribute, so voice notes report their length before the
+                    // TUI decodes the file.
+                    duration_secs: doc.duration().map(|d| d.round() as u32),
+                    is_voice: true,
+                    waveform: None,
+                });
             };
 
             Some(MediaKind::Document)
         }
+
         grammers_client::media::Media::Sticker(_) => Some(MediaKind::Sticker),
         grammers_client::media::Media::Geo(_) => Some(MediaKind::Unsupported),
         grammers_client::media::Media::Dice(_) => Some(MediaKind::Unsupported),
@@ -73,24 +81,16 @@ fn telegram_message_media(msg: &message::Message) -> Option<MessageMedia> {
     let kind = telegram_media_kind(msg)?;
     let caption = (!msg.text().trim().is_empty()).then(|| msg.text().to_string());
 
-    // Document-backed media carry a file name and (audio/video) a duration;
-    // Photos do not. `doc.duration()` reads the `DocumentAttributeAudio`/
-    // `DocumentAttributeVideo` attributes, so voice notes report their length
-    // before the TUI decodes the file.
-    let (file_name, duration_secs) = match msg.media() {
-        Some(grammers_client::media::Media::Document(doc)) => (
-            doc.name().map(str::to_string),
-            doc.duration().map(|d| d.round() as u32),
-        ),
-        _ => (None, None),
+    // Document-backed media carry a file name; Photos do not.
+    let file_name = match msg.media() {
+        Some(grammers_client::media::Media::Document(doc)) => doc.name().map(str::to_string),
+        _ => None,
     };
 
     Some(MessageMedia {
         kind,
         caption,
         file_name,
-        duration_secs,
-        waveform: None,
     })
 }
 
@@ -948,12 +948,22 @@ async fn reply_context(_client: &Client, msg: &message::Message) -> Option<Reply
 /// Maps [`MediaKind`] -> [`Attribute`]
 ///
 /// Photos use [`InputMessage::photo`] instead, plain documents and stickers need no extra attribute beyond the auto-added filename. Exact metadata (duration/dimensions) is derived server-side
-/// NOTE: These values are placeholders until we implement the TUI
-/// TODO: remove the above note when these values are correctly implemented
 fn telegram_media_attribute(kind: MediaKind) -> Option<Attribute> {
     match kind {
-        MediaKind::Audio => Some(Attribute::Audio {
-            duration: Duration::ZERO,
+        MediaKind::Audio {
+            duration_secs,
+            is_voice: true,
+            waveform,
+        } => Some(Attribute::Voice {
+            duration: Duration::from_secs(u64::from(duration_secs.unwrap_or(0))),
+            waveform,
+        }),
+        MediaKind::Audio {
+            duration_secs,
+            is_voice: false,
+            ..
+        } => Some(Attribute::Audio {
+            duration: Duration::from_secs(u64::from(duration_secs.unwrap_or(0))),
             title: None,
             performer: None,
         }),
@@ -1227,6 +1237,7 @@ impl Messenger for TelegramMessenger {
                 data,
                 file_name,
                 caption,
+                ..
             } => {
                 let uploaded = client
                     .upload_stream(&mut Cursor::new(&data[..]), data.len(), file_name.clone())
@@ -1236,7 +1247,7 @@ impl Messenger for TelegramMessenger {
                 let caption = caption.clone().unwrap_or_default();
                 let mut input = match *kind {
                     MediaKind::Image => message::InputMessage::new().text(caption).photo(uploaded),
-                    MediaKind::Audio
+                    MediaKind::Audio { .. }
                     | MediaKind::Video
                     | MediaKind::Document
                     | MediaKind::Sticker => {
@@ -1525,7 +1536,19 @@ mod tests {
     fn media_attribute_maps_kinds() {
         use grammers_client::media::Attribute;
         assert!(matches!(
-            telegram_media_attribute(MediaKind::Audio),
+            telegram_media_attribute(MediaKind::Audio {
+                duration_secs: Some(2),
+                is_voice: true,
+                waveform: None,
+            }),
+            Some(Attribute::Voice { .. })
+        ));
+        assert!(matches!(
+            telegram_media_attribute(MediaKind::Audio {
+                duration_secs: Some(2),
+                is_voice: false,
+                waveform: None,
+            }),
             Some(Attribute::Audio { .. })
         ));
         assert!(matches!(

@@ -3603,8 +3603,6 @@ mod tests {
                 kind: MediaKind::Image,
                 caption: Some("sunset".into()),
                 file_name: Some("sunset.png".into()),
-                duration_secs: None,
-                waveform: None,
             }),
             reply_to_id: None,
             reply_ctx: None,
@@ -3715,11 +3713,13 @@ mod tests {
         let mut msg = image_message();
         msg.message_id = MessageId::from("audio-1");
         msg.media = Some(MessageMedia {
-            kind: MediaKind::Audio,
+            kind: MediaKind::Audio {
+                duration_secs: Some(2),
+                is_voice: true,
+                waveform: None,
+            },
             caption: Some("voice note".into()),
             file_name: Some("voice.ogg".into()),
-            duration_secs: Some(2),
-            waveform: None,
         });
         msg.msg_actions = vec![MessageAction::Reply, MessageAction::Delete];
         msg

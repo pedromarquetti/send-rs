@@ -86,7 +86,11 @@ fn audio_media_ref(msg: &WaMessage) -> Option<MediaRef> {
     let audio = msg.get_base_message().audio_message.as_option()?;
 
     Some(MediaRef {
-        kind: MediaKind::Audio,
+        kind: MediaKind::Audio {
+            duration_secs: audio.seconds,
+            is_voice: audio.ptt.unwrap_or(false),
+            waveform: audio.waveform.clone(),
+        },
         direct_path: audio.direct_path.as_ref()?.clone(),
         media_key: audio.media_key.as_ref()?.clone(),
         file_sha256: audio.file_sha256.as_ref()?.clone(),
@@ -307,8 +311,14 @@ fn handle_wa_media(msg: &WaMessage) -> Option<MessageMedia> {
         MediaKind::Image
     } else if base.video_message.is_set() {
         MediaKind::Video
-    } else if base.audio_message.is_set() {
-        MediaKind::Audio
+    } else if let Some(audio) = base.audio_message.as_option() {
+        // Voice notes/audio report their playback length; the TUI shows it
+        // before the first decode.
+        MediaKind::Audio {
+            duration_secs: audio.seconds,
+            is_voice: audio.ptt.unwrap_or(false),
+            waveform: audio.waveform.clone(),
+        }
     } else if base.sticker_message.is_set() {
         MediaKind::Sticker
     } else if base.document_message.is_set() {
@@ -324,16 +334,10 @@ fn handle_wa_media(msg: &WaMessage) -> Option<MessageMedia> {
         .as_option()
         .and_then(|d| d.file_name.clone());
 
-    // Voice notes/audio report their playback length; the TUI shows it before
-    // the first decode.
-    let duration_secs = base.audio_message.as_option().and_then(|a| a.seconds);
-
     Some(MessageMedia {
         kind,
         caption,
         file_name,
-        duration_secs,
-        waveform: None,
     })
 }
 
@@ -2389,7 +2393,11 @@ fn outbound_media_message(
             }),
             ..Default::default()
         },
-        MediaKind::Audio => WaMessage {
+        MediaKind::Audio {
+            duration_secs,
+            is_voice,
+            waveform,
+        } => WaMessage {
             audio_message: MessageField::some(wa::message::AudioMessage {
                 url: Some(url),
                 direct_path: Some(direct_path),
@@ -2399,6 +2407,9 @@ fn outbound_media_message(
                 file_length: Some(file_length),
                 media_key_timestamp: Some(media_key_timestamp),
                 streaming_sidecar,
+                seconds: duration_secs,
+                ptt: Some(is_voice),
+                waveform,
                 mimetype: Some("audio/ogg; codecs=opus".into()),
                 context_info: context_info
                     .map(|ci| MessageField::some(*ci))
@@ -2755,7 +2766,7 @@ impl Messenger for WhatsAppMessenger {
         // `MediaType` decrypts the stream (audio and image use different keys).
         let media_type = match r.kind {
             MediaKind::Image => MediaType::Image,
-            MediaKind::Audio => MediaType::Audio,
+            MediaKind::Audio { .. } => MediaType::Audio,
             // No other kind is ever stored in `media_refs`.
             _ => return Ok(None),
         };
@@ -2812,11 +2823,12 @@ impl Messenger for WhatsAppMessenger {
                 data,
                 file_name,
                 caption,
+                ..
             } => {
                 let media_type = match kind {
                     MediaKind::Image => MediaType::Image,
                     MediaKind::Video => MediaType::Video,
-                    MediaKind::Audio => MediaType::Audio,
+                    MediaKind::Audio { .. } => MediaType::Audio,
                     MediaKind::Document => MediaType::Document,
                     MediaKind::Sticker => MediaType::Sticker,
                     MediaKind::Unsupported => {
@@ -2850,8 +2862,6 @@ impl Messenger for WhatsAppMessenger {
                     kind: kind.clone(),
                     caption: caption.clone(),
                     file_name: Some(file_name.clone()),
-                    duration_secs: None,
-                    waveform: None,
                 });
                 let text_content = caption
                     .clone()
@@ -4445,11 +4455,13 @@ mod tests {
             from_me: false,
             msg_actions: Vec::new(),
             media: Some(MessageMedia {
-                kind: MediaKind::Audio,
+                kind: MediaKind::Audio {
+                    duration_secs: Some(12),
+                    is_voice: true,
+                    waveform: None,
+                },
                 caption: None,
                 file_name: None,
-                duration_secs: Some(12),
-                waveform: None,
             }),
             reply_to_id: None,
             reply_ctx: None,
@@ -4505,7 +4517,7 @@ mod tests {
             .media_refs
             .get("wa-cached-audio")
             .expect("resynced cached message gains its audio ref");
-        assert_eq!(r.kind, MediaKind::Audio);
+        assert!(matches!(r.kind, MediaKind::Audio { .. }));
         assert_eq!(r.direct_path, "/v/t62.7118-24/9876_54321/mp3");
         assert_eq!(r.file_length, 4096);
         // The stored message is not duplicated by the resync.
@@ -4560,7 +4572,7 @@ mod tests {
             ..Default::default()
         };
         let r = wa_media_ref(&audio).expect("complete audio yields a ref");
-        assert_eq!(r.kind, MediaKind::Audio);
+        assert!(matches!(r.kind, MediaKind::Audio { .. }));
         assert_eq!(r.direct_path, "/v/t62.7118-24/9876_5432/mp3");
         assert_eq!(r.media_key, vec![0, 1, 2, 3]);
         assert_eq!(r.file_length, 4096);
@@ -4591,8 +4603,14 @@ mod tests {
             ..Default::default()
         };
         let media = handle_wa_media(&audio).expect("audio yields media");
-        assert_eq!(media.kind, MediaKind::Audio);
-        assert_eq!(media.duration_secs, Some(42));
+        assert_eq!(
+            media.kind,
+            MediaKind::Audio {
+                duration_secs: Some(42),
+                is_voice: false,
+                waveform: None,
+            }
+        );
 
         // Text messages carry no media at all.
         assert!(handle_wa_media(&text_message("hello")).is_none());
@@ -4711,10 +4729,24 @@ fn sample_cdn() -> CdnFields {
         assert!(!vm.context_info.is_set());
 
         let audio =
-            outbound_media_message(MediaKind::Audio, sample_cdn(), "note.ogg", None, None).unwrap();
+            outbound_media_message(
+                MediaKind::Audio {
+                    duration_secs: Some(2),
+                    is_voice: true,
+                    waveform: Some(vec![64; 16]),
+                },
+                sample_cdn(),
+                "note.ogg",
+                None,
+                None,
+            )
+            .unwrap();
         let am = audio.audio_message.as_option().unwrap();
         assert_eq!(am.streaming_sidecar.as_deref(), Some(&[9, 9, 9][..]));
         assert_eq!(am.mimetype.as_deref(), Some("audio/ogg; codecs=opus"));
+        assert_eq!(am.seconds, Some(2));
+        assert_eq!(am.ptt, Some(true));
+        assert_eq!(am.waveform.as_deref(), Some(&[64u8; 16][..]));
     }
 
     #[test]

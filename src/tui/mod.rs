@@ -770,11 +770,15 @@ impl App {
         // Seed the session so early worker reports are accepted by
         // `apply_playback_state`'s same-source guard. The provider-reported
         // duration (Telegram/WhatsApp audio metadata) is shown until the first
-        // decode reports the real playback length.
+        // decode reports the real playback length. Audio metadata lives inside
+        // the kind variant, and this popup only opens for audio media.
         let known_duration = msg
             .media
             .as_ref()
-            .and_then(|m| m.duration_secs)
+            .and_then(|m| match &m.kind {
+                MediaKind::Audio { duration_secs, .. } => *duration_secs,
+                _ => None,
+            })
             .unwrap_or(0) as f64;
 
         self.state.playback = Some(PlaybackState {
@@ -1121,7 +1125,7 @@ impl App {
 
                     match msg.media.as_ref().map(|m| m.kind.clone()) {
                         Some(MediaKind::Image) => self.open_image_popup(msg),
-                        Some(MediaKind::Audio) => self.open_audio_popup(msg),
+                        Some(MediaKind::Audio { .. }) => self.open_audio_popup(msg),
                         _ => self.state.create_popup(PopupKind::Message(msg)),
                     }
                 }
@@ -1462,11 +1466,13 @@ mod tests {
             from_me: false,
             msg_actions: vec![MessageAction::Reply, MessageAction::Delete],
             media: Some(MessageMedia {
-                kind: MediaKind::Audio,
+                kind: MediaKind::Audio {
+                    duration_secs: Some(2),
+                    is_voice: true,
+                    waveform: None,
+                },
                 caption: Some("voice note".into()),
                 file_name: Some("voice.ogg".into()),
-                duration_secs: Some(2),
-                waveform: None,
             }),
             reply_to_id: None,
             reply_ctx: None,

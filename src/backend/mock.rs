@@ -195,12 +195,24 @@ impl Messenger for MockMessenger {
         msg_in: &crate::backend::OutboundMessage,
         reply_to: Option<MessageId>,
     ) -> Result<Message, BackendError> {
-        let text = match msg_in {
-            crate::backend::OutboundMessage::Text { text } => text.clone(),
-            crate::backend::OutboundMessage::Media { .. } => {
-                return Err(BackendError::Other(
-                    "mock: media send not implemented".into(),
-                ));
+        let (text, media) = match msg_in {
+            crate::backend::OutboundMessage::Text { text } => (text.clone(), None),
+            crate::backend::OutboundMessage::Media {
+                kind,
+                file_name,
+                caption,
+                ..
+            } => {
+                let media = Some(MessageMedia {
+                    kind: kind.clone(),
+                    caption: caption.clone(),
+                    file_name: Some(file_name.clone()),
+                });
+                let text = caption
+                    .clone()
+                    .filter(|c| !c.trim().is_empty())
+                    .unwrap_or_else(|| format!("{}, click to show", kind.label()));
+                (text, media)
             }
         };
         let mut state = self
@@ -229,7 +241,7 @@ impl Messenger for MockMessenger {
             timestamp: now(),
             from_me: true,
             msg_actions: vec![MessageAction::Edit, MessageAction::Delete],
-            media: None,
+            media: media.clone(),
             reply_to_id: reply_to.clone(),
             reply_ctx: reply_context,
             pending: false,
@@ -261,7 +273,7 @@ impl Messenger for MockMessenger {
         }
 
         if chat == &self.echo_chat {
-            self.spawn_echo(chat.clone(), &text);
+            self.spawn_echo(chat.clone(), &text, media);
         }
         Ok(msg)
     }
@@ -309,7 +321,7 @@ impl Messenger for MockMessenger {
         drop(state);
         match kind {
             Some(MediaKind::Image) => {}
-            Some(MediaKind::Audio) => return Ok(Some(fixture_wav_bytes())),
+            Some(MediaKind::Audio { .. }) => return Ok(Some(fixture_wav_bytes())),
             _ => return Ok(None),
         }
 
@@ -351,7 +363,7 @@ impl Messenger for MockMessenger {
 }
 
 impl MockMessenger {
-    fn spawn_echo(&self, chat: ChatId, text: &str) {
+    fn spawn_echo(&self, chat: ChatId, text: &str, media: Option<MessageMedia>) {
         let tx = self.tx.clone();
         let state = self.state.clone();
         let sender = ECHO_SENDER.to_string();
@@ -371,7 +383,7 @@ impl MockMessenger {
                 timestamp: now(),
                 from_me: false,
                 msg_actions: Vec::new(),
-                media: None,
+                media: media.clone(),
                 reply_to_id: None,
                 reply_ctx: None,
                 pending: false,
@@ -466,16 +478,16 @@ fn mock_data(name: &'static str) -> MockData {
                 kind: MediaKind::Image,
                 caption: Some("sunset over the lake".into()),
                 file_name: Some("sunset.png".into()),
-                duration_secs: None,
-                waveform: None,
             });
             let mut voice = message("tg-6", &ALICE_ID, "Alice", "", false);
             voice.media = Some(MessageMedia {
-                kind: MediaKind::Audio,
+                kind: MediaKind::Audio {
+                    duration_secs: Some(2),
+                    is_voice: true,
+                    waveform: None,
+                },
                 caption: Some("voice note".into()),
                 file_name: Some("voice.ogg".into()),
-                duration_secs: Some(2),
-                waveform: None,
             });
             history.insert(
                 ALICE_ID.clone(),
@@ -706,19 +718,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn media_send_is_rejected_with_explicit_error() {
+    async fn media_send_stores_media_and_echoes_it_back() {
         let mock = MockMessenger::new("Telegram");
-        let chat = mock.chats().await.unwrap().remove(0).id;
+        let mut rx = mock.subscribe();
+        let echo = mock.echo_chat.clone();
         let media = crate::backend::OutboundMessage::Media {
-            kind: crate::backend::MediaKind::Image,
+            kind: crate::backend::MediaKind::Audio {
+                duration_secs: Some(2),
+                is_voice: true,
+                waveform: Some(vec![64; 16]),
+            },
             data: vec![1, 2, 3].into(),
-            file_name: "photo.jpg".into(),
+            file_name: "voice.ogg".into(),
             caption: None,
         };
-        let err = mock.send(&chat, &media, None).await.unwrap_err();
-        assert!(
-            err.to_string().contains("media send not implemented"),
-            "unexpected error: {err}"
+
+        let sent = mock.send(&echo, &media, None).await.unwrap();
+        assert_eq!(sent.text, "Audio, click to show");
+        let sent_media = sent.media.expect("sent message carries media");
+        assert_eq!(
+            sent_media.kind,
+            MediaKind::Audio {
+                duration_secs: Some(2),
+                is_voice: true,
+                waveform: Some(vec![64; 16]),
+            }
+        );
+
+        let bytes = mock
+            .media_bytes(&echo, &sent.message_id)
+            .await
+            .unwrap()
+            .expect("audio media yielded bytes");
+        assert_eq!(&bytes[..4], b"RIFF", "fixture must be a WAV container");
+
+        let echoed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match rx.recv().await {
+                    Ok(BackendEvent::MessageReceived(msg)) if !msg.from_me && msg.chat == echo => {
+                        break msg;
+                    }
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => panic!("channel closed before echo"),
+                }
+            }
+        })
+        .await
+        .expect("echo reply never arrived");
+
+        assert_eq!(echoed.sender, ECHO_SENDER);
+        let echoed_media = echoed.media.expect("echo carries media back");
+        assert_eq!(
+            echoed_media.kind,
+            MediaKind::Audio {
+                duration_secs: Some(2),
+                is_voice: true,
+                waveform: Some(vec![64; 16]),
+            }
         );
     }
 

@@ -583,8 +583,6 @@ mod tests {
             kind,
             caption: caption.map(str::to_string),
             file_name: None,
-            duration_secs: None,
-            waveform: None,
         });
         msg
     }
