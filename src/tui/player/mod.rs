@@ -66,10 +66,14 @@ impl PlaybackState {
     }
 }
 
-/// A pluggable audio engine, owned and driven by the player worker thread.
-/// The concrete [`RodioEngine`] plays decoded bytes; a `StubEngine` drives the
-/// UI-level tests.
-pub trait MediaEngine: Send {
+/// A pluggable audio engine, constructed and driven by the player worker
+/// thread. The concrete [`RodioEngine`] plays decoded bytes; a `StubEngine`
+/// drives the UI-level tests.
+///
+/// cpal's coreaudio stream is not `Send` (it holds a device-disconnect listener
+/// callback), so [`Player::new`] builds the engine on the worker thread via
+/// [`EngineBox`], which requires `Send` on every platform except macOS.
+pub trait MediaEngine {
     /// Load `bytes` for playback. Returns the duration in seconds (`0.0` when
     /// unknown) or an error description; on error the engine must leave its
     /// status as [`PlayState::Error`].
@@ -85,6 +89,13 @@ pub trait MediaEngine: Send {
     /// sampling (e.g. a sink that has emptied out).
     fn status(&mut self) -> PlayState;
 }
+
+/// The engine box a player worker is built from. `Send` is required on every
+/// platform except macOS, where cpal's coreaudio stream is not `Send`.
+#[cfg(not(target_os = "macos"))]
+type EngineBox = Box<dyn MediaEngine + Send>;
+#[cfg(target_os = "macos")]
+type EngineBox = Box<dyn MediaEngine>;
 
 /// Commands the UI sends to the player worker.
 enum PlayerCommand {
@@ -106,11 +117,16 @@ pub struct Player {
 }
 
 impl Player {
-    /// Spawn the worker thread that owns `engine` and drives it with commands
-    /// from this handle, reporting snapshots over `ui_tx`.
-    pub fn new(engine: Box<dyn MediaEngine>, ui_tx: UnboundedSender<UiEvent>) -> Self {
+    /// Spawn the worker thread and drive it with commands from this handle,
+    /// reporting snapshots over `ui_tx`. `make_engine` runs *on the worker
+    /// thread*, so engines that are not `Send` (cpal on macOS) never leave it.
+    pub fn new(
+        make_engine: impl FnOnce() -> EngineBox + Send + 'static,
+        ui_tx: UnboundedSender<UiEvent>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
-        std::thread::spawn(|| run_worker(rx, engine, ui_tx));
+        std::thread::spawn(move || run_worker(rx, make_engine(), ui_tx));
+
         Self { tx }
     }
 
@@ -408,7 +424,7 @@ mod tests {
     fn player_forwards_commands_and_reports_state() {
         let (engine, inner) = StubEngine::new(8.0);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let player = Player::new(Box::new(engine), tx);
+        let player = Player::new(move || Box::new(engine), tx);
         let src = key(1, "42");
 
         player.load(src.clone(), b"fake-ogg".to_vec());
@@ -442,7 +458,7 @@ mod tests {
     fn seek_is_clamped_to_duration_bounds() {
         let (engine, inner) = StubEngine::new(10.0);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let player = Player::new(Box::new(engine), tx);
+        let player = Player::new(move || Box::new(engine), tx);
 
         player.load(key(1, "42"), b"fake-ogg".to_vec());
         rx.blocking_recv().unwrap();
@@ -484,7 +500,7 @@ mod tests {
         let (engine, inner) = StubEngine::new(0.0);
         inner.lock().unwrap().load_result = Some(Err("boom".to_string()));
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let player = Player::new(Box::new(engine), tx);
+        let player = Player::new(move || Box::new(engine), tx);
 
         player.load(key(1, "42"), b"not-audio".to_vec());
         assert_playback(rx.blocking_recv().unwrap(), PlayState::Loading);

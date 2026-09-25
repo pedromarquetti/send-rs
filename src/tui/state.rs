@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::audio::{self, MicCapture};
+use crate::audio::{self, MicCaptureBox};
 use crate::backend::{
     BackendError, BackendEvent, Chat, ChatId, LoginStepState, MediaKind, Message, MessageId,
     MessengerKind, OutboundMessage, Provider,
@@ -38,12 +38,12 @@ pub struct RetryDraft {
 /// An in-flight push-to-talk recording. Owns the live mic capture until it is
 /// finished (encoded and sent) or cancelled (dropped).
 pub struct AudioRecording {
-    recorder: Box<dyn MicCapture>,
+    recorder: MicCaptureBox,
     pub(crate) started_at: Instant,
 }
 
 impl AudioRecording {
-    pub fn new(recorder: Box<dyn MicCapture>) -> Self {
+    pub fn new(recorder: MicCaptureBox) -> Self {
         Self {
             recorder,
             started_at: Instant::now(),
@@ -1736,6 +1736,7 @@ pub async fn fetch_all_chats(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::MicCapture;
     use crate::backend::mock::MockMessenger;
     use crate::backend::{MediaKind, Message, MessageAction, MessageId, MessageMedia, Messenger};
     use crate::config::KeymapConfig;

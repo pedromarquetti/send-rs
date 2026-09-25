@@ -132,7 +132,12 @@ impl Recorder {
 /// The capture surface the push-to-talk state machine drives. `Recorder` is
 /// the hardware-backed impl; the state tests inject a fake instead of opening
 /// a real mic, so the press/release transitions run fully offline.
-pub trait MicCapture: Send {
+///
+/// The capture is created and driven on the UI thread (`AppState::recording`)
+/// and never crosses a thread. cpal's coreaudio stream is not `Send` because
+/// it holds a device-disconnect listener callback, so the [`MicCaptureBox`]
+/// bound is `Send` on every platform except macOS.
+pub trait MicCapture {
     /// How long the recording is so far.
     fn duration(&self) -> Duration;
     /// Most recent captured RMS level, roughly 0.0..=1.0, for a live meter.
@@ -157,6 +162,13 @@ impl MicCapture for Recorder {
         Recorder::finish(self)
     }
 }
+
+/// The capture box the push-to-talk state machine holds. `Send` is required on
+/// every platform except macOS, where cpal's coreaudio stream is not `Send`.
+#[cfg(not(target_os = "macos"))]
+pub type MicCaptureBox = Box<dyn MicCapture + Send>;
+#[cfg(target_os = "macos")]
+pub type MicCaptureBox = Box<dyn MicCapture>;
 
 /// Push one capture buffer into the shared state: convert to f32, mix down,
 /// append, enforce the length cap and refresh the live level.

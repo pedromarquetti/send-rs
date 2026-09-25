@@ -574,7 +574,7 @@ impl App {
         Self {
             state: AppState::new(config, keymap, messengers, open_settings).await,
             picker,
-            player: Player::new(Box::new(RodioEngine::default()), tx.clone()),
+            player: Player::new(|| Box::new(RodioEngine::default()), tx.clone()),
             tx,
             chat_load_task: None,
         }

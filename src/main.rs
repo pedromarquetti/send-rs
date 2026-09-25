@@ -17,6 +17,9 @@ use crate::{
     config::Config,
 };
 
+// TODO: Add:
+// 1 - Mock flag so the user can test the app without actually using wp/tg
+// 2 - Add screenshots
 #[tokio::main]
 async fn main() -> Result<()> {
     let log_path = dirs::data_local_dir()
@@ -36,13 +39,18 @@ async fn main() -> Result<()> {
     // this is a fix for an audio playback integration i was having:
     // text was being written to the TUI instead of being logged/displayed properly
     // TODO: do a recheck if this is needed
+    // rustix only exposes `stdio` on Unix, so Windows keeps stderr on the console.
+    #[cfg(not(windows))]
     let stderr_redirected = rustix::stdio::dup2_stderr(&log_file).is_ok();
+    #[cfg(not(windows))]
     if !stderr_redirected {
         eprintln!(
             "warning: could not redirect stderr to {}",
             log_path.display()
         );
     }
+    #[cfg(windows)]
+    let stderr_redirected = false;
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -59,10 +67,13 @@ async fn main() -> Result<()> {
     // `tracing`; bridge it so their records land in sender.log too.
     let _ = tracing_log::LogTracer::init();
 
+    #[cfg(not(windows))]
     info!(
         stderr_redirected,
         "stderr redirected to the log file so audio diagnostics stay out of the TUI"
     );
+    #[cfg(windows)]
+    info!("stderr is not redirected on Windows: audio diagnostics may reach the console");
 
     let first_boot = !config::Config::exists();
     let config = config::Config::load()?.unwrap_or_default();
