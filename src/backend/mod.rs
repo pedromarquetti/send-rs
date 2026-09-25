@@ -306,8 +306,8 @@ pub enum OutboundMessage {
     Text {
         text: String,
     },
-    /// Media Will be used to handle sending any type of [`MediaKind`]
-    #[expect(dead_code, reason = "This is not yet being called by the TUI")]
+    /// Media used to send any type of [`MediaKind`]; voice-note recordings ride
+    /// this variant (`MediaKind::Audio` with `is_voice: true`).
     Media {
         kind: MediaKind,
         data: sync::Arc<[u8]>,

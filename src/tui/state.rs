@@ -4,11 +4,13 @@ use ratatui::style::{Color, Style};
 use ratatui::widgets::ListState;
 use ratatui_textarea::{TextArea, WrapMode};
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use crate::audio::{self, MicCapture};
 use crate::backend::{
-    BackendError, BackendEvent, Chat, ChatId, LoginStepState, Message, MessageId, MessengerKind,
-    OutboundMessage, Provider,
+    BackendError, BackendEvent, Chat, ChatId, LoginStepState, MediaKind, Message, MessageId,
+    MessengerKind, OutboundMessage, Provider,
 };
 use crate::config::{Config, Keymap};
 use crate::tui::chat::{ChatState, OpenChat};
@@ -32,6 +34,40 @@ pub struct RetryDraft {
     pub msg: OutboundMessage,
     pub message_id: Option<MessageId>,
 }
+
+/// An in-flight push-to-talk recording. Owns the live mic capture until it is
+/// finished (encoded and sent) or cancelled (dropped).
+pub struct AudioRecording {
+    recorder: Box<dyn MicCapture>,
+    pub(crate) started_at: Instant,
+}
+
+impl AudioRecording {
+    pub fn new(recorder: Box<dyn MicCapture>) -> Self {
+        Self {
+            recorder,
+            started_at: Instant::now(),
+        }
+    }
+
+    /// Whole seconds recorded so far, for the live indicator.
+    pub fn seconds(&self) -> u64 {
+        self.recorder.duration().as_secs()
+    }
+
+    /// Most recent capture level for the live meter.
+    pub fn rms(&self) -> f32 {
+        self.recorder.rms()
+    }
+}
+
+/// A record-key press outside a take is always allowed. Inside a take the
+/// send-on-press fallback (terminals without REPORT_EVENT_TYPES) requires the
+/// take to have outlived the OS auto-repeat initial delay AND the press to be
+/// more than one auto-repeat cadence away from the previous press, so a held
+/// key cannot finish a take by echoing.
+const RECORD_MIN_HOLD: Duration = Duration::from_millis(800);
+const RECORD_REPEAT_GAP: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -98,6 +134,16 @@ pub struct AppState {
 
     /// Latest player report for the active audio session (`None` = no session).
     pub playback: Option<PlaybackState>,
+
+    /// An in-flight push-to-talk voice-note recording, if active.
+    /// Visible to the TUI module so dispatch tests can install a take without
+    /// opening a real mic.
+    pub(crate) recording: Option<AudioRecording>,
+
+    /// When the last push-to-talk key event arrived, for separating a deliberate
+    /// second press (send) from the auto-repeat stream on terminals that do not
+    /// report event types.
+    last_record_key: Option<Instant>,
 }
 
 pub struct LoginState {
@@ -174,6 +220,8 @@ impl AppState {
             provider_connected: HashSet::new(),
             loading: None,
             playback: None,
+            recording: None,
+            last_record_key: None,
         };
 
         if let Ok(chat_cache) = Config::load_chats() {
@@ -687,16 +735,29 @@ impl AppState {
 
         let outgoing = OutboundMessage::Text { text };
 
-        let send_result = match self.chat_owner(&chat.id) {
-            Some(messenger) => messenger.send(&chat.id, &outgoing, reply_to.clone()).await,
+        if self.send_outbound(&chat.id, outgoing, reply_to).await {
+            self.write.clear();
+            self.chat_state.drafts.remove(&chat.id);
+        }
+    }
+
+    /// Send `outgoing` to `chat_id` quoting `reply_to`, echoing the confirmed
+    /// message or stashing a retry draft and popping up the error. Returns
+    /// whether the send was confirmed (the caller then clears its transient
+    /// input). Shared by the text and voice-note paths.
+    async fn send_outbound(
+        &mut self,
+        chat_id: &ChatId,
+        outgoing: OutboundMessage,
+        reply_to: Option<MessageId>,
+    ) -> bool {
+        let send_result = match self.chat_owner(chat_id) {
+            Some(messenger) => messenger.send(chat_id, &outgoing, reply_to.clone()).await,
             None => Err(BackendError::Other("no messenger for this chat".into())),
         };
 
         match send_result {
             Ok(confirmed) => {
-                self.write.clear();
-                self.chat_state.drafts.remove(&chat.id);
-
                 let sent_ts = confirmed.timestamp;
                 let sent_chat_id = confirmed.chat.clone();
 
@@ -707,19 +768,132 @@ impl AppState {
                 });
 
                 self.chat_state.push_incoming(confirmed);
+                true
             }
             Err(e) => {
                 self.retry_draft = Some(RetryDraft {
-                    chat: chat.id.clone(),
+                    chat: chat_id.clone(),
                     msg: outgoing,
                     message_id: reply_to,
                 });
                 self.create_popup(PopupKind::Error(format!(
                     "{} failed to send message: {e}, press 1 to retry",
-                    chat.id.platform()
+                    chat_id.platform()
+                )));
+                false
+            }
+        }
+    }
+
+    /// Begin a push-to-talk recording on the default input device. On failure
+    /// shows an error popup and stays idle.
+    pub fn start_recording(&mut self) {
+        if self.recording.is_some() {
+            return;
+        }
+        match audio::Recorder::start() {
+            Ok(recorder) => self.recording = Some(AudioRecording::new(Box::new(recorder))),
+            Err(e) => {
+                warn!(error = %e, "failed to start audio recording");
+                self.create_popup(PopupKind::Error(format!(
+                    "Audio recording unavailable: {e}"
                 )));
             }
         }
+    }
+
+    /// Stop push-to-talk recording, encode the take as an Opus voice note and
+    /// send it to the selected chat (quoting any pending reply). An empty take
+    /// is dropped without sending.
+    pub async fn finish_recording(&mut self) {
+        let Some(mut recording) = self.recording.take() else {
+            return;
+        };
+
+        let sample_rate = recording.recorder.sample_rate();
+        let pcm = recording.recorder.finish();
+
+        let ogg = match audio::encode_opus_ogg(&pcm, sample_rate, 1) {
+            Ok(ogg) => ogg,
+            Err(audio::AudioError::EmptyRecording) => {
+                return;
+            }
+            Err(e) => {
+                self.create_popup(PopupKind::Error(format!("Failed to encode recording: {e}")));
+                return;
+            }
+        };
+
+        let Some(chat) = self.chat_state.selected_chat().cloned() else {
+            self.create_popup(PopupKind::Error(String::from("No chat selected")));
+            return;
+        };
+
+        let reply_to = self.chat_state.pending_reply.take().map(|i| i.message_id);
+
+        let outgoing = OutboundMessage::Media {
+            kind: MediaKind::Audio {
+                duration_secs: Some((pcm.len() as u64 / u64::from(sample_rate)) as u32),
+                is_voice: true,
+                waveform: Some(audio::waveform_from_pcm(&pcm, 128)),
+            },
+            data: Arc::from(ogg.as_slice()),
+            file_name: "voice.oga".into(),
+            caption: None,
+        };
+
+        self.send_outbound(&chat.id, outgoing, reply_to).await;
+    }
+
+    /// Discard the current recording without sending.
+    pub fn cancel_recording(&mut self) {
+        self.recording = None;
+    }
+
+    pub fn recording_active(&self) -> bool {
+        self.recording.is_some()
+    }
+
+    /// Account for a push-to-talk key event and report whether a press may
+    /// finish the current take (the send-on-press fallback for terminals that
+    /// do not report event types). Age gates out the auto-repeat's first fire
+    /// (which waits out the initial repeat delay), while the gap from the last
+    /// recorded event gates out the continuous repeat stream itself, so a held
+    /// key can never finish a take on its own.
+    pub fn record_key_pressed(&mut self, now: Instant) -> bool {
+        let allowed = match self
+            .recording
+            .as_ref()
+            .map(|recording| recording.started_at)
+        {
+            Some(started) => {
+                let age = now.saturating_duration_since(started);
+                let origin = self.last_record_key.unwrap_or(started);
+                let gap = now.saturating_duration_since(origin);
+                age >= RECORD_MIN_HOLD && gap >= RECORD_REPEAT_GAP
+            }
+            None => true,
+        };
+        self.last_record_key = Some(now);
+        allowed
+    }
+
+    /// Whole seconds recorded so far, for the push-to-talk indicator.
+    #[expect(dead_code, reason = "used by the recording indicator")]
+    pub fn recording_seconds(&self) -> u64 {
+        self.recording
+            .as_ref()
+            .map(AudioRecording::seconds)
+            .unwrap_or(0)
+    }
+
+    /// Most recent capture level, for the push-to-talk meter.
+    #[expect(dead_code, reason = "used by the recording indicator")]
+    pub fn recording_rms(&self) -> f32 {
+        self.recording
+            .as_ref()
+            .map(AudioRecording::rms)
+            .unwrap_or(0.0)
     }
 
     pub async fn retry_message(&mut self) {
@@ -3872,5 +4046,214 @@ mod tests {
         (&mut PopUp::new(tag)).render(area, &mut buf, &mut popup);
         let rendered: String = buf.content.iter().map(|c| c.symbol()).collect();
         assert!(!rendered.contains("⚠"), "no error note without a failure");
+    }
+
+    /// Deterministic mic for push-to-talk tests: no hardware involved.
+    struct FakeMic {
+        pcm: Vec<f32>,
+        rate: u32,
+        level: f32,
+    }
+
+    impl MicCapture for FakeMic {
+        fn duration(&self) -> std::time::Duration {
+            std::time::Duration::from_secs_f64(self.pcm.len() as f64 / f64::from(self.rate))
+        }
+        fn rms(&self) -> f32 {
+            self.level
+        }
+        fn sample_rate(&self) -> u32 {
+            self.rate
+        }
+        fn finish(&mut self) -> Vec<f32> {
+            std::mem::take(&mut self.pcm)
+        }
+    }
+
+    fn fake_mic(seconds: f32) -> FakeMic {
+        let rate = audio::CAPTURE_RATE;
+        let samples = (f64::from(rate) * f64::from(seconds)) as usize;
+        let pcm = (0..samples)
+            .map(|i| {
+                let t = i as f64 / f64::from(rate);
+                (t * 440.0 * std::f64::consts::TAU).sin() as f32 * 0.5
+            })
+            .collect();
+        FakeMic {
+            pcm,
+            rate,
+            level: 0.42,
+        }
+    }
+
+    #[tokio::test]
+    async fn push_to_talk_starts_idle_and_cancel_discards() {
+        let mut state = app_state().await;
+        assert!(!state.recording_active());
+        assert_eq!(state.recording_seconds(), 0);
+        assert_eq!(state.recording_rms(), 0.0);
+
+        state.recording = Some(AudioRecording::new(Box::new(fake_mic(0.5))));
+        assert!(state.recording_active());
+        assert_eq!(state.recording_rms(), 0.42);
+        assert_eq!(state.recording_seconds(), 0, "sub-second take");
+
+        state.cancel_recording();
+        assert!(!state.recording_active(), "cancel discards immediately");
+        assert_eq!(state.recording_seconds(), 0);
+    }
+
+    #[tokio::test]
+    async fn record_key_fallback_requires_a_deliberate_press() {
+        let mut state = app_state().await;
+        let t0 = Instant::now();
+
+        // A fresh press with no take active is always allowed and remembered.
+        assert!(state.record_key_pressed(t0));
+
+        // Start a take whose clock we control.
+        state.recording = Some(AudioRecording {
+            recorder: Box::new(fake_mic(2.0)),
+            started_at: t0,
+        });
+
+        // Auto-repeat stream while the key is held: every press is either
+        // inside the initial repeat delay or too close to the previous one to
+        // be deliberate.
+        let t_early = t0 + Duration::from_millis(50);
+        assert!(
+            !state.record_key_pressed(t_early),
+            "too early to be deliberate"
+        );
+
+        let t_mid = t0 + Duration::from_millis(780);
+        assert!(
+            !state.record_key_pressed(t_mid),
+            "still inside the hold floor"
+        );
+
+        let t_repeat = t0 + Duration::from_millis(810);
+        assert!(
+            !state.record_key_pressed(t_repeat),
+            "past the hold floor, but within repeat cadence of the previous press"
+        );
+        assert!(
+            state.recording_active(),
+            "a rejected press must not end the take"
+        );
+
+        // A deliberate repress well after the key was released is a send.
+        let t_deliberate = t0 + Duration::from_millis(1_400);
+        assert!(state.record_key_pressed(t_deliberate));
+    }
+
+    #[tokio::test]
+    async fn finish_recording_sends_a_voice_note_to_the_selected_chat() {
+        let mock = MockMessenger::new("Telegram");
+        // Keep a receiver alive so the mock's send echo can broadcast back.
+        let _keep_alive = mock.subscribe();
+        let mut config = Config::default();
+        config.providers.telegram.enabled = true;
+        let keymap = config.keys.parse().unwrap();
+        let mut state = AppState::new(
+            config,
+            keymap,
+            vec![MessengerKind::Stub(Provider::Telegram, Box::new(mock))],
+            false,
+        )
+        .await;
+        fetch_and_apply(&mut state).await;
+        state.chat_state.chat_list_state.select(Some(0));
+        let chat = state.chat_state.chats[0].clone();
+        state.chat_state.open_chat = Some(OpenChat {
+            chat,
+            history: Vec::new(),
+            has_more_history: true,
+        });
+
+        state.recording = Some(AudioRecording::new(Box::new(fake_mic(0.25))));
+        state.finish_recording().await;
+
+        assert!(!state.recording_active());
+        assert!(state.retry_draft.is_none(), "send should have succeeded");
+        let echoed = state
+            .chat_state
+            .open_chat
+            .as_ref()
+            .and_then(|o| o.history.last());
+        let media = echoed
+            .and_then(|m| m.media.as_ref())
+            .expect("echoed media present");
+        match &media.kind {
+            MediaKind::Audio {
+                is_voice,
+                duration_secs,
+                waveform,
+            } => {
+                assert!(is_voice, "voice note must carry the PTT flag");
+                assert_eq!(*duration_secs, Some(0), "0.25s rounds down to 0 sec");
+                assert_eq!(
+                    waveform.as_ref().map(Vec::len),
+                    Some(128),
+                    "waveform has one bucket per bar"
+                );
+            }
+            other => panic!("expected MediaKind::Audio, got {other:#?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_take_is_dropped_without_sending() {
+        let mut state = app_state().await;
+        state.recording = Some(AudioRecording::new(Box::new(fake_mic(0.0))));
+        state.finish_recording().await;
+        assert!(!state.recording_active());
+        assert!(state.retry_draft.is_none(), "empty take must not send");
+        assert!(state.pop_up.is_none(), "empty take is silent, not an error");
+    }
+
+    #[tokio::test]
+    async fn failed_voice_send_stashes_a_retry_draft() {
+        let chat = Chat {
+            id: ChatId::Telegram(1),
+            contact_name: "Test".into(),
+            ..Default::default()
+        };
+        let stub = StubMessenger::new().with_chats(vec![chat]);
+        let mut config = Config::default();
+        config.providers.telegram.enabled = true;
+        let keymap = config.keys.parse().unwrap();
+        let mut state = AppState::new(
+            config,
+            keymap,
+            vec![MessengerKind::Stub(Provider::Telegram, Box::new(stub))],
+            false,
+        )
+        .await;
+        fetch_and_apply(&mut state).await;
+        state.chat_state.chat_list_state.select(Some(0));
+
+        state.recording = Some(AudioRecording::new(Box::new(fake_mic(0.25))));
+        state.finish_recording().await;
+
+        assert!(!state.recording_active());
+        let draft = state
+            .retry_draft
+            .as_ref()
+            .expect("media send failure stashes a retry draft");
+        assert_eq!(draft.chat, ChatId::Telegram(1));
+        match &draft.msg {
+            OutboundMessage::Media {
+                kind: MediaKind::Audio { is_voice: true, .. },
+                data,
+                file_name,
+                caption,
+            } => {
+                assert_eq!(file_name, "voice.oga");
+                assert!(caption.is_none());
+                assert!(!data.is_empty(), "encoded take survives into the draft");
+            }
+            other => panic!("expected OutboundMessage::Media audio, got {other:#?}"),
+        }
     }
 }

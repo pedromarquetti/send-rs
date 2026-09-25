@@ -5,10 +5,6 @@
 //! [`waveform_from_pcm`] derives the preview peaks both providers show. The
 //! send paths in later phases only ever see the encoded bytes and the
 //! waveform.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "will be wired up in future commit")
-)]
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -120,10 +116,44 @@ impl Recorder {
         f32::from_bits(self.shared.level.load(Ordering::Relaxed))
     }
 
+    /// The sample rate the capture was opened at an Opus-supported rate.
+    pub fn sample_rate(&self) -> u32 {
+        self.shared.sample_rate
+    }
+
     /// Stop the capture and return the mono f32 frames recorded so far.
     pub fn finish(&mut self) -> Vec<f32> {
         let mut frames = self.shared.frames.lock().unwrap();
         std::mem::take(&mut *frames)
+    }
+}
+
+/// The capture surface the push-to-talk state machine drives. `Recorder` is
+/// the hardware-backed impl; the state tests inject a fake instead of opening
+/// a real mic, so the press/release transitions run fully offline.
+pub trait MicCapture: Send {
+    /// How long the recording is so far.
+    fn duration(&self) -> Duration;
+    /// Most recent captured RMS level, roughly 0.0..=1.0, for a live meter.
+    fn rms(&self) -> f32;
+    /// The sample rate the capture was opened at.
+    fn sample_rate(&self) -> u32;
+    /// Stop the capture and return the mono f32 frames recorded so far.
+    fn finish(&mut self) -> Vec<f32>;
+}
+
+impl MicCapture for Recorder {
+    fn duration(&self) -> Duration {
+        Recorder::duration(self)
+    }
+    fn rms(&self) -> f32 {
+        Recorder::rms(self)
+    }
+    fn sample_rate(&self) -> u32 {
+        Recorder::sample_rate(self)
+    }
+    fn finish(&mut self) -> Vec<f32> {
+        Recorder::finish(self)
     }
 }
 

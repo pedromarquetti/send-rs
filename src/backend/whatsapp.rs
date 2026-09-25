@@ -2929,14 +2929,19 @@ impl Messenger for WhatsAppMessenger {
                     .push(sent.clone());
             }
 
-            for c in state.chats.iter_mut() {
-                if c.id == *chat {
-                    c.last_message_ts = Some(sent.timestamp);
-                    c.unread = false;
-                    c.unread_count = 0;
-                }
+            // Ensure the target chat has a row (creating it for a brand-new
+            // conversation) and mark it read — the send just took place.
+            state.upsert_chat_from_message(chat.clone(), &sent);
+            if let Some(c) = state.chats.iter_mut().find(|c| c.id == *chat) {
+                c.unread = false;
+                c.unread_count = 0;
             }
         }
+
+        // Persist the send now instead of waiting for a later event: media sent
+        // to the self-chat (audio clips in particular) never gets an inflowing
+        // re-delivery, so an early quit must not lose it from the cache.
+        self.state.read().await.save_to(&self.cache_path);
 
         let _ = self.tx.send(BackendEvent::MessageReceived(sent.clone()));
         Ok(sent)
@@ -3054,6 +3059,11 @@ impl Messenger for WhatsAppMessenger {
         if let Some(task) = run_task {
             let _ = task.await;
         }
+
+        // Flush the final session state now that the run task is done and can
+        // no longer overwrite it, so a clean exit right after a send never
+        // drops the last messages from the cache.
+        self.state.read().await.save_to(&self.cache_path);
 
         Ok(())
     }
@@ -4820,6 +4830,110 @@ fn sample_cdn() -> CdnFields {
             ),
             "own-sent clip must stay resolvable after a restart"
         );
+    }
+
+    #[test]
+    fn upsert_chat_from_message_creates_row_for_outgoing_self_chat() {
+        let mut state = WhatsAppState::default();
+        state.own_lid = Some("1555000000100@lid".into());
+        let chat = ChatId::jid_to_chat_id("1555000000100@lid");
+
+        let mut msg = build_msg("s1", "note.ogg", &chat, true);
+        msg.timestamp = 9000;
+
+        state.upsert_chat_from_message(chat.clone(), &msg);
+
+        let row = state
+            .chats
+            .iter()
+            .find(|c| c.id == chat)
+            .expect("an outgoing send creates the chat row");
+        assert_eq!(row.contact_name, "Myself");
+        assert_eq!(row.last_message_ts, Some(9000));
+        assert!(!row.unread);
+        assert_eq!(row.unread_count, 0);
+    }
+
+    #[test]
+    fn outbound_audio_round_trips_through_disk_cache() {
+        let wa_msg = outbound_media_message(
+            MediaKind::Audio {
+                duration_secs: Some(2),
+                is_voice: true,
+                waveform: Some(vec![64; 16]),
+            },
+            sample_cdn(),
+            "note.ogg",
+            None,
+            None,
+        )
+        .unwrap();
+
+        let mut state = WhatsAppState::default();
+        state.own_lid = Some("1555000000100@lid".into());
+        let chat = ChatId::jid_to_chat_id("1555000000100@lid");
+
+        let msg = Message {
+            message_id: MessageId("stanza-99".into()),
+            chat: chat.clone(),
+            sender: "You".into(),
+            author_id: None,
+            text: "Audio, click to show".into(),
+            timestamp: 9000,
+            from_me: true,
+            msg_actions: message_actions(true),
+            media: Some(MessageMedia {
+                kind: MediaKind::Audio {
+                    duration_secs: Some(2),
+                    is_voice: true,
+                    waveform: Some(vec![64; 16]),
+                },
+                caption: None,
+                file_name: Some("note.ogg".into()),
+            }),
+            reply_to_id: None,
+            reply_ctx: None,
+            pending: false,
+            failed: false,
+        };
+        state
+            .history
+            .entry(chat.clone())
+            .or_default()
+            .push(msg.clone());
+        state
+            .media_refs
+            .insert("stanza-99".into(), wa_media_ref(&wa_msg).unwrap());
+        state.upsert_chat_from_message(chat.clone(), &msg);
+
+        let path = std::env::temp_dir().join(format!(
+            "senders_wa_outbound_test_{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        state.save_to(&path);
+        let restored = WhatsAppState::load_from(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+
+        let hist = restored.history.get(&chat).expect("history survives");
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].message_id, msg.message_id);
+        assert_eq!(hist[0].media.as_ref().unwrap().kind, MediaKind::Audio {
+            duration_secs: Some(2),
+            is_voice: true,
+            waveform: Some(vec![64; 16]),
+        });
+        assert!(
+            restored.media_refs.contains_key("stanza-99"),
+            "the persisted media ref keeps the clip resolvable after restart"
+        );
+        let row = restored
+            .chats
+            .iter()
+            .find(|c| c.id == chat)
+            .expect("chat row survives");
+        assert_eq!(row.contact_name, "Myself");
+        assert_eq!(row.last_message_ts, Some(9000));
     }
 
     #[test]

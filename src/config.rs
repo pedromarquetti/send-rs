@@ -72,6 +72,7 @@ pub struct KeymapConfig {
     pub send: String,
     pub newline: String,
     pub retry_connection: String,
+    pub record_voice: String,
     pub play_pause: String,
     pub seek_back: String,
     pub seek_forward: String,
@@ -98,6 +99,7 @@ impl Default for KeymapConfig {
             play_pause: "space".into(),
             seek_back: "<".into(),
             seek_forward: ">".into(),
+            record_voice: "a".into(),
         }
     }
 }
@@ -123,6 +125,7 @@ impl KeymapConfig {
             play_pause: parse_key(&self.play_pause)?,
             seek_back: parse_key(&self.seek_back)?,
             seek_forward: parse_key(&self.seek_forward)?,
+            record_voice: parse_key(&self.record_voice)?,
         })
     }
 }
@@ -154,6 +157,9 @@ pub struct Keymap {
     pub seek_back: KeyEvent,
     /// Seek forward on the audio popup.
     pub seek_forward: KeyEvent,
+    /// Push-to-talk voice-note recording (press starts, release sends; a second
+    /// press acts as stop-and-send on terminals without key-release events).
+    pub record_voice: KeyEvent,
 }
 
 /// Tests must never read or write a real user's config. Under `#[cfg(test)]`
@@ -372,6 +378,10 @@ mod tests {
             keymap.seek_forward,
             KeyEvent::new(KeyCode::Char('>'), KeyModifiers::NONE)
         );
+        assert_eq!(
+            keymap.record_voice,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)
+        );
     }
 
     #[test]
@@ -421,6 +431,7 @@ mod tests {
         assert_eq!(config.keys.play_pause, "space");
         assert_eq!(config.keys.seek_back, "<");
         assert_eq!(config.keys.seek_forward, ">");
+        assert_eq!(config.keys.record_voice, "a");
     }
 
     #[test]

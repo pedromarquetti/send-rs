@@ -25,11 +25,13 @@ impl Widget for StatusBarWidget {
         Self: Sized,
     {
         let hint = match self.focus {
+            // TODO: make these hints actually follow the user-defined keys! this is currently
+            // hardcoded
             Focus::ChatList => {
                 "Ctrl+C quit; j/k move (up/down); Enter select chat; Tab switch focus; i select chat + write; s settings; "
             }
             Focus::Chat => {
-                "j/k scroll; G bottom; PgUp/PgDn page; i write; Tab switch focus; s settings; Ctrl+C quit"
+                "j/k scroll; G bottom; g Top; PgUp/PgDn page; i write; Tab switch focus; s settings; Ctrl+C quit"
             }
             Focus::Write => {
                 "Enter send; Alt+Enter newline; Esc back; Tab switch focus; Ctrl+C quit"

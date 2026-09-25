@@ -2,6 +2,8 @@ use anyhow::Result;
 use ratatui::crossterm::ExecutableCommand;
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyEventState, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use ratatui::layout::{Constraint, Layout};
 use ratatui::widgets::{StatefulWidget, Widget};
@@ -94,7 +96,24 @@ pub async fn run(
     // Let the terminal send pasted text as a single bracketed-paste event instead of a stream of
     // raw keys, so multi-line paste cannot trigger Enter=send mid-paste.
     std::io::stdout().execute(EnableBracketedPaste)?;
+
+    // Push-to-talk needs a clean Press→Release lifecycle: report event types
+    // (release/repeat kinds) and disambiguate modified keys as CSI-u sequences.
+    // Terminals that reject these flags keep working via the second-press
+    // fallback in `handle_main_key`.
+    //
+    // TODO: holding the PTT record key on kitty yields a Press stream with no
+    // Release, because `a` is a text key and kitty only reports text keys as
+    // events under REPORT_ALL_KEYS_AS_ESCAPE_CODES (bit 8); sending on release
+    // therefore falls back to the gated second press. Worth checking whether
+    // enabling bit 8 (real key-up finishing) is a worthwhile compat fix.
+    std::io::stdout().execute(PushKeyboardEnhancementFlags(
+        KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+            | KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+    ))?;
+
     let result = run_app(&mut terminal, config, keymap, messengers, open_settings).await;
+    let _ = std::io::stdout().execute(PopKeyboardEnhancementFlags);
     let _ = std::io::stdout().execute(DisableBracketedPaste);
     ratatui::restore();
     result
@@ -183,7 +202,7 @@ async fn run_app(
 
     info!(protocol = ?picker.protocol_type(), "terminal image protocol selected");
 
-    spawn_terminal_reader(tx.clone());
+    spawn_terminal_reader(tx.clone(), keymap.record_voice);
     spawn_signal_listener(tx.clone());
 
     // handling new events for each messenger type
@@ -497,7 +516,7 @@ async fn run_app(
     Ok(())
 }
 
-fn spawn_terminal_reader(tx: mpsc::UnboundedSender<UiEvent>) {
+fn spawn_terminal_reader(tx: mpsc::UnboundedSender<UiEvent>, record_key: KeyEvent) {
     std::thread::spawn(move || {
         loop {
             match event::read() {
@@ -506,10 +525,22 @@ fn spawn_terminal_reader(tx: mpsc::UnboundedSender<UiEvent>) {
                         break;
                     }
                 }
-                Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+
+                // Press and Repeat are the events the whole UI already consumes
+                // (Repeat keeps hold-down scrolling/typing working on
+                // terminals that report kinds). Release is forwarded ONLY for
+                // the push-to-talk record key so PTT gets a clean key-up signal
+                // while no stray Release can ever reach the write box.
+                Ok(Event::Key(key))
+                    if key.kind == KeyEventKind::Press
+                        || key.kind == KeyEventKind::Repeat
+                        || (key.kind == KeyEventKind::Release
+                            && key.code == record_key.code
+                            && key.modifiers == record_key.modifiers) =>
+                {
                     if tx.send(UiEvent::Key(key)).is_err() {
                         break;
-                    }
+                    };
                 }
                 Ok(Event::Paste(text)) => {
                     if tx.send(UiEvent::Paste(text)).is_err() {
@@ -847,7 +878,15 @@ impl App {
         self.state.running = false;
     }
 
-    async fn handle_key(&mut self, key: KeyEvent) {
+    async fn handle_key(&mut self, mut key: KeyEvent) {
+        // Num/Caps Lock are layout status, not modifiers. kitty tags every
+        // non-text key (CSI-u reporting) with the active lock bits, which
+        // would otherwise poison each `key == binding` comparison: the keymap
+        // is parsed with an empty KeyEventState. Strip them here so bindings
+        // keep working regardless of lock state.
+        key.state
+            .remove(KeyEventState::CAPS_LOCK | KeyEventState::NUM_LOCK);
+
         // TODO: add a overlay menu / screen to display all the keymappings
         if key == self.state.keymap.quit {
             self.state.running = false;
@@ -915,6 +954,37 @@ impl App {
         // explicitly captured keys (esc/ctrl+c/enter, tab in the write box)
         // are handled, everything else reaches the text widget.
         let insert = self.state.mode == Mode::Insert;
+
+        // Push-to-talk owns the keyboard while recording: key-up sends, and on
+        // terminals that report no event types a deliberate second press sends
+        // and Esc cancels; anything else is ignored so navigation or the OS
+        // auto-repeat can't interrupt the take. Releases never carry a fresh
+        // press, so `record_key_pressed` gates only Press events.
+        let record_key = km.record_voice;
+        let is_record_key = key.code == record_key.code && key.modifiers == record_key.modifiers;
+
+        if self.state.recording_active() {
+            if key == km.dismiss {
+                self.state.cancel_recording();
+                return;
+            }
+
+            let finish_take = match key.kind {
+                // Key-up always sends.
+                KeyEventKind::Release => true,
+                // Terminals without event types auto-repeat a Press; only a
+                // deliberate press (aged past the repeat delay/cadence) sends.
+                KeyEventKind::Press => self.state.record_key_pressed(Instant::now()),
+                // OS-level hold-repeat: never a send in itself.
+                _ => false,
+            };
+
+            if is_record_key && finish_take {
+                self.state.finish_recording().await;
+            }
+
+            return;
+        }
 
         // Esc while a flood-wait countdown is active cancels the in-flight
         // refresh and defers it to the next chat-list sync tick, instead of
@@ -1038,6 +1108,17 @@ impl App {
                     return;
                 }
 
+                // Push-to-talk start: with a chat open, a fresh press begins a
+                // voice-note recording (letters are otherwise unused here).
+                if is_record_key
+                    && key.kind == KeyEventKind::Press
+                    && self.state.chat_state.open_chat.is_some()
+                {
+                    self.state.record_key_pressed(Instant::now());
+                    self.state.start_recording();
+                    return;
+                }
+
                 if key == km.search_text {
                     self.state.chat_state.begin_message_search();
                     return;
@@ -1111,7 +1192,7 @@ impl App {
                         match messenger.reply_context(&msg.chat, &msg.message_id).await {
                             Ok(context) => msg.reply_ctx = context,
                             Err(error) => {
-                                tracing::debug!(
+                                debug!(
                                     message = %msg.message_id,
                                     %error,
                                     "Unable to load reply context for popup"
@@ -1136,6 +1217,12 @@ impl App {
                 // it is captured here instead.
                 if key == km.dismiss {
                     self.state.cycle_focus();
+                    return;
+                }
+
+                if key.kind == KeyEventKind::Release {
+                    // Only the record key's Release is ever forwarded; never
+                    // let a key-up land in the draft.
                     return;
                 }
 
@@ -1436,7 +1523,7 @@ mod tests {
     use crate::backend::MessageMedia;
     use crate::backend::mock::MockMessenger;
     use crate::tui::chat::OpenChat;
-    use ratatui::crossterm::event::KeyCode;
+    use ratatui::crossterm::event::{KeyCode, KeyEventKind, KeyEventState, KeyModifiers};
 
     const TONE_WAV: &[u8] = include_bytes!("player/engine/fixtures/tone.wav");
 
@@ -1626,5 +1713,105 @@ mod tests {
         assert_eq!(playback.status, PlayState::Paused);
         assert!(playback.position.abs() < 0.001, "must sit at the start");
         assert!((playback.duration - 1.0).abs() < 0.05);
+    }
+
+    /// Hardware-free mic for push-to-talk dispatch tests; always yields an
+    /// empty take so finishing it is a silent drop.
+    #[derive(Default)]
+    struct FakeMic {
+        pcm: Vec<f32>,
+    }
+
+    impl crate::audio::MicCapture for FakeMic {
+        fn duration(&self) -> std::time::Duration {
+            std::time::Duration::from_secs_f64(
+                self.pcm.len() as f64 / f64::from(crate::audio::CAPTURE_RATE),
+            )
+        }
+        fn rms(&self) -> f32 {
+            0.0
+        }
+        fn sample_rate(&self) -> u32 {
+            crate::audio::CAPTURE_RATE
+        }
+        fn finish(&mut self) -> Vec<f32> {
+            std::mem::take(&mut self.pcm)
+        }
+    }
+
+    #[tokio::test]
+    async fn push_to_talk_ignores_auto_repeat_and_finishes_on_release() {
+        let mut app = test_app().await;
+        app.state.focus = Focus::Chat;
+        app.state.chat_state.open_chat = Some(OpenChat {
+            chat: audio_chat(),
+            history: Vec::new(),
+            has_more_history: false,
+        });
+
+        // Simulate a take right after its start press (fresh mic, empty PCM).
+        app.state.recording = Some(crate::tui::state::AudioRecording::new(Box::new(
+            FakeMic::default(),
+        )));
+        app.state.record_key_pressed(Instant::now());
+
+        // An auto-repeat press lands milliseconds later: it must not send.
+        app.handle_main_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+            .await;
+        assert!(
+            app.state.recording_active(),
+            "in-hold auto-repeat must not finish the take"
+        );
+
+        // A key-up finishes and encodes the take.
+        app.handle_main_key(KeyEvent::new_with_kind(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        ))
+        .await;
+        assert!(!app.state.recording_active(), "Release must send the take");
+    }
+
+    #[tokio::test]
+    async fn lock_key_state_is_ignored_for_binding_matching() {
+        let mut app = test_app().await;
+
+        // kitty tags non-text keys with the active lock bits (e.g. NUM_LOCK
+        // with Num Lock on); the parsed keymap is state-less, so the Esc
+        // binding must match anyway. Dismissing from the write box cycles to
+        // the chat pane.
+        app.state.focus = Focus::Write;
+        app.handle_key(KeyEvent::new_with_kind_and_state(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+            KeyEventState::NUM_LOCK,
+        ))
+        .await;
+        assert_eq!(
+            app.state.focus,
+            Focus::Chat,
+            "Num Lock state must not block the Esc dismiss"
+        );
+    }
+
+    #[tokio::test]
+    async fn lock_key_state_does_not_block_popup_dismissal() {
+        let mut app = test_app().await;
+        app.state.create_popup(PopupKind::Error("test".into()));
+        assert!(app.state.pop_up.is_some());
+
+        app.handle_key(KeyEvent::new_with_kind_and_state(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+            KeyEventState::NUM_LOCK,
+        ))
+        .await;
+        assert!(
+            app.state.pop_up.is_none(),
+            "Num Lock state must not block popup Esc dismissal"
+        );
     }
 }
