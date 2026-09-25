@@ -24,7 +24,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  initjob:
+  init:
     name: Initial Job
     runs-on: ubuntu-latest
     timeout-minutes: 30
