@@ -1,0 +1,148 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  workflow_call:
+    outputs:
+      version:
+        description: Package version from Cargo.toml
+        value: ${{ jobs.quality.outputs.version }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  initjob:
+    name: Initial Job
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+    steps:
+      - name: Checkout Code 
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          components: rustfmt, clippy
+      - name: Cache Rust 
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libasound2-dev libsqlite3-dev pkg-config
+      - name: Read package version
+        id: metadata
+        run: |
+          version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Run cargo fmt
+        run: cargo fmt --all -- --check
+      - name: Run tests
+        run: cargo test --locked --all-targets
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: init
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+          - name: Windows
+            os: windows-latest
+          - name: macOS
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libasound2-dev libsqlite3-dev pkg-config
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: brew install pkg-config
+      - name: Install Windows dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vcpkgRoot = if ($env:VCPKG_INSTALLATION_ROOT) { $env:VCPKG_INSTALLATION_ROOT } else { $env:VCPKG_ROOT }
+          if (-not $vcpkgRoot) { throw "vcpkg root not found" }
+          $vcpkg = Join-Path $vcpkgRoot "vcpkg.exe"
+          & $vcpkg install sqlite3:x64-windows-static
+          "VCPKG_ROOT=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "VCPKGRS_TRIPLET=x64-windows-static" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Build release binary
+        run: cargo build --locked --release --bin send-rs
+      - name: Package Unix release
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          VERSION: ${{ needs.quality.outputs.version }}
+        run: |
+          set -euo pipefail
+          archive="send-rs-${VERSION}-${{ runner.os }}-${{ runner.arch }}"
+          mkdir "$archive"
+          cp target/release/send-rs "$archive/send-rs"
+          cp README.md "$archive/README.md"
+          tar -czf "${archive}.tar.gz" "$archive"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${archive}.tar.gz" > "${archive}.tar.gz.sha256"
+          else
+            shasum -a 256 "${archive}.tar.gz" > "${archive}.tar.gz.sha256"
+          fi
+      - name: Package Windows release
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.quality.outputs.version }}
+        run: |
+          $archive = "send-rs-$env:VERSION-${{ runner.os }}-${{ runner.arch }}"
+          New-Item -ItemType Directory -Path $archive | Out-Null
+          Copy-Item target/release/send-rs.exe "$archive\send-rs.exe"
+          Copy-Item README.md "$archive\README.md"
+          Compress-Archive -Path $archive -DestinationPath "$archive.zip"
+          $hash = (Get-FileHash "$archive.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $archive.zip" | Set-Content "$archive.zip.sha256"
+      - name: Upload Unix release
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: send-rs-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            send-rs-*.tar.gz
+            send-rs-*.tar.gz.sha256
+          if-no-files-found: error
+      - name: Upload Windows release
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: send-rs-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            send-rs-*.zip
+            send-rs-*.zip.sha256
+          if-no-files-found: error
+

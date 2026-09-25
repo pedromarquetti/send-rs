@@ -10,10 +10,18 @@
 //! position, so seeking and progress never depend on the device round-trip.
 
 use std::io::Cursor;
+#[cfg(test)]
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use opus_pure::ogg::GRANULE_RATE;
 use opus_pure::{MAX_PACKET_SAMPLES, OggOpusReader, OggPacket, OpusDecoder};
+#[cfg(test)]
+use rodio::queue::SourcesQueueOutput;
 use rodio::source::SeekError;
 use rodio::{Decoder, OutputStream, OutputStreamBuilder, Sink, Source};
 use tracing::{debug, warn};
@@ -275,6 +283,12 @@ pub struct RodioEngine {
     bytes: Option<Vec<u8>>,
     timing: Timing,
     status: PlayState,
+    /// Tests run where no audio device exists, so `open_output` hands playback
+    /// to a device-free sink drained in real time instead of cpal.
+    #[cfg(test)]
+    headless: bool,
+    #[cfg(test)]
+    virtual_output: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
 }
 
 impl Default for RodioEngine {
@@ -286,23 +300,43 @@ impl Default for RodioEngine {
             bytes: None,
             timing: Timing::default(),
             status: PlayState::Stopped,
+            #[cfg(test)]
+            headless: false,
+            #[cfg(test)]
+            virtual_output: None,
         }
     }
 }
 
 impl RodioEngine {
-    /// Bind the engine to an already-built sink, skipping device discovery.
-    /// Test-only: the audio pipeline runs against a driver thread instead of
-    /// an output device.
+    /// Engine bound to a device-free sink. The audio pipeline runs against a
+    /// drain thread instead of an output device, so playback can be exercised
+    /// on machines (and CI containers) without a sound card.
     #[cfg(test)]
-    fn with_sink(sink: Sink) -> Self {
-        Self {
-            sink: Some(sink),
-            ..Self::default()
+    fn headless() -> Self {
+        let mut engine = Self::default();
+        engine.headless = true;
+        engine
+    }
+
+    #[cfg(test)]
+    fn stop_virtual_output(&mut self) {
+        if let Some((done, drain)) = self.virtual_output.take() {
+            done.store(true, Ordering::Relaxed);
+            let _ = drain.join();
         }
     }
 
     fn open_output(&mut self) -> Result<(), String> {
+        #[cfg(test)]
+        if self.headless {
+            self.stop_virtual_output();
+            let (sink, output) = Sink::new();
+            self.virtual_output = Some(drain_in_real_time(output));
+            self.sink = Some(sink);
+            return Ok(());
+        }
+
         let mut stream = OutputStreamBuilder::open_default_stream()
             .map_err(|err| format!("cannot open the audio output device: {err}"))?;
         // rodio logs a "Dropping OutputStream" notice, but only as noise; the
@@ -482,29 +516,53 @@ impl MediaEngine for RodioEngine {
     }
 }
 
+/// Consume a queue output at real time, the way an output device would. EOF is
+/// detected through `Sink::empty()` while the engine extrapolates its own
+/// wall-clock position, so draining faster than real time would end the cue
+/// before the engine believes it played.
+#[cfg(test)]
+fn drain_in_real_time(mut output: SourcesQueueOutput) -> (Arc<AtomicBool>, JoinHandle<()>) {
+    let done = Arc::new(AtomicBool::new(false));
+    let finished = done.clone();
+
+    let drain = std::thread::spawn(move || {
+        let start = Instant::now();
+        let mut consumed = 0.0_f64;
+
+        while !finished.load(Ordering::Relaxed) {
+            for _ in 0..1024 {
+                if output.next().is_none() {
+                    break;
+                }
+                consumed += 1.0;
+            }
+
+            let rate = f64::from(output.sample_rate()) * f64::from(output.channels());
+            if rate > 0.0 {
+                let ahead = consumed / rate - start.elapsed().as_secs_f64();
+                if ahead > 0.0 {
+                    std::thread::sleep(Duration::from_secs_f64(ahead.min(0.05)));
+                }
+            }
+        }
+    });
+
+    (done, drain)
+}
+
+#[cfg(test)]
+impl Drop for RodioEngine {
+    fn drop(&mut self) {
+        self.stop_virtual_output();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rodio::queue::SourcesQueueOutput;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::thread::JoinHandle;
 
     const TONE_WAV: &[u8] = include_bytes!("fixtures/tone.wav");
     const VOICE_OGG: &[u8] = include_bytes!("fixtures/voice.ogg");
-
-    /// Consume the sink output in a loop until the test signals completion.
-    /// `Sink::try_seek` waits for feedback that is only produced while the
-    /// queue is being consumed, so this thread is required for engine seek
-    /// tests (and for decoding to progress at all).
-    fn spawn_drain(output: SourcesQueueOutput, done: Arc<AtomicBool>) -> JoinHandle<()> {
-        let mut output = output;
-        std::thread::spawn(move || {
-            while !done.load(Ordering::Relaxed) {
-                let _ = output.next();
-            }
-        })
-    }
 
     fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) {
         let deadline = Instant::now() + timeout;
@@ -515,13 +573,6 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         panic!("condition not met within {timeout:?}");
-    }
-
-    fn engine_harness() -> (RodioEngine, Arc<AtomicBool>, JoinHandle<()>) {
-        let (sink, output) = Sink::new();
-        let done = Arc::new(AtomicBool::new(false));
-        let drain = spawn_drain(output, done.clone());
-        (RodioEngine::with_sink(sink), done, drain)
     }
 
     #[test]
@@ -592,18 +643,14 @@ mod tests {
 
     #[test]
     fn malformed_bytes_report_error_status() {
-        let mut engine = RodioEngine::with_sink({
-            let (sink, output) = Sink::new();
-            drop(output);
-            sink
-        });
+        let mut engine = RodioEngine::headless();
         assert!(engine.load(b"definitely not audio").is_err());
         assert_eq!(engine.status(), PlayState::Error);
     }
 
     #[test]
     fn engine_load_play_pause_seek_stop() {
-        let (mut engine, done, drain) = engine_harness();
+        let mut engine = RodioEngine::headless();
 
         let duration = engine.load(VOICE_OGG).unwrap();
         assert!((duration - 2.0).abs() < 0.1);
@@ -644,14 +691,11 @@ mod tests {
         engine.stop();
         assert_eq!(engine.status(), PlayState::Stopped);
         assert_eq!(engine.position(), 0.0);
-
-        done.store(true, Ordering::Relaxed);
-        drain.join().unwrap();
     }
 
     #[test]
     fn engine_reports_eof_as_stopped() {
-        let (mut engine, done, drain) = engine_harness();
+        let mut engine = RodioEngine::headless();
 
         engine.load(VOICE_OGG).unwrap();
         engine.play();
@@ -665,28 +709,22 @@ mod tests {
             (position - 2.0).abs() < 0.1,
             "expected the end position, got {position}"
         );
-
-        done.store(true, Ordering::Relaxed);
-        drain.join().unwrap();
     }
 
     #[test]
     fn seek_before_first_play_starts_at_position() {
-        let (mut engine, done, drain) = engine_harness();
+        let mut engine = RodioEngine::headless();
 
         engine.load(VOICE_OGG).unwrap();
         engine.seek(1.0);
         engine.play();
 
         wait_until(Duration::from_secs(3), || engine.position() > 1.05);
-
-        done.store(true, Ordering::Relaxed);
-        drain.join().unwrap();
     }
 
     #[test]
     fn play_after_eof_restarts_from_the_beginning() {
-        let (mut engine, done, drain) = engine_harness();
+        let mut engine = RodioEngine::headless();
 
         engine.load(VOICE_OGG).unwrap();
         engine.play();
@@ -706,14 +744,11 @@ mod tests {
             let position = engine.position();
             position > 0.0 && position < 0.5
         });
-
-        done.store(true, Ordering::Relaxed);
-        drain.join().unwrap();
     }
 
     #[test]
     fn stop_forgets_session_so_play_does_not_restart() {
-        let (mut engine, done, drain) = engine_harness();
+        let mut engine = RodioEngine::headless();
 
         engine.load(VOICE_OGG).unwrap();
         engine.stop();
@@ -725,9 +760,6 @@ mod tests {
             PlayState::Stopped,
             "an explicitly stopped session must not come back on play"
         );
-
-        done.store(true, Ordering::Relaxed);
-        drain.join().unwrap();
     }
 
     #[test]

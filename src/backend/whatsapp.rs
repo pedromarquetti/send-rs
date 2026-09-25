@@ -114,6 +114,8 @@ struct WhatsAppState {
     // it should load
     enabled: bool,
     chats: Vec<Chat>,
+    // BUG: WhatsApp is still not delivering messages properly on cold starts:
+    // Messages received during our app's inactivity are not being fetched
     history: HashMap<ChatId, Vec<Message>>,
     /// Stanza is a XML-like structure exchanged between client and server.
     /// Each Stanza contains data that identifies and populates the message
@@ -4836,8 +4838,10 @@ mod tests {
 
     #[test]
     fn upsert_chat_from_message_creates_row_for_outgoing_self_chat() {
-        let mut state = WhatsAppState::default();
-        state.own_lid = Some("1555000000100@lid".into());
+        let mut state = WhatsAppState {
+            own_lid: Some("1555000000100@lid".into()),
+            ..WhatsAppState::default()
+        };
         let chat = ChatId::jid_to_chat_id("1555000000100@lid");
 
         let mut msg = build_msg("s1", "note.ogg", &chat, true);
@@ -4871,8 +4875,10 @@ mod tests {
         )
         .unwrap();
 
-        let mut state = WhatsAppState::default();
-        state.own_lid = Some("1555000000100@lid".into());
+        let mut state = WhatsAppState {
+            own_lid: Some("1555000000100@lid".into()),
+            ..WhatsAppState::default()
+        };
         let chat = ChatId::jid_to_chat_id("1555000000100@lid");
 
         let msg = Message {

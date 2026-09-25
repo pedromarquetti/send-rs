@@ -656,7 +656,7 @@ mod tests {
         assert_eq!(lines.len(), 2, "media label line + caption line");
         let label_line = lines[0].to_string();
         assert!(
-            label_line.contains("Alice 31/12/1969 21:00  Image:"),
+            label_line.contains(&format!("Alice {}  Image:", format_timestamp(0))),
             "the media-type label leads the first line, got: {label_line}"
         );
         assert!(
