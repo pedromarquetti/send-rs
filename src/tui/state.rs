@@ -16,7 +16,7 @@ use crate::config::{Config, Keymap};
 use crate::tui::chat::{ChatState, OpenChat};
 use crate::tui::loading::{LoadingArea, LoadingState};
 use crate::tui::player::PlaybackState;
-use crate::tui::popup::PopupKind;
+use crate::tui::popup::{AudioPopup, ImagePopup, PopupKind};
 use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -423,6 +423,20 @@ impl AppState {
         // so reopening starts from a fresh fetch + fresh engine load. Clearing
         // here also makes `apply_playback_state`'s guard drop any late reports.
         self.playback = None;
+    }
+
+    /// The message a Message/Image/Audio popup quotes, when it can be replied
+    /// to (confirmed, not pending/failed). The record key over such a popup
+    /// starts a voice-note reply to it.
+    pub fn reply_recording_target(&self) -> Option<MessageId> {
+        let popup = self.pop_up.as_ref()?;
+        let msg = match &popup.popup_type {
+            PopupKind::Message(msg)
+            | PopupKind::Image(ImagePopup { msg, .. })
+            | PopupKind::Audio(AudioPopup { msg, .. }) => msg,
+            _ => return None,
+        };
+        (!msg.pending && !msg.failed).then(|| msg.message_id.clone())
     }
 
     /// Apply a player report for the audio session. Reports are dropped unless
@@ -879,7 +893,6 @@ impl AppState {
     }
 
     /// Whole seconds recorded so far, for the push-to-talk indicator.
-    #[expect(dead_code, reason = "used by the recording indicator")]
     pub fn recording_seconds(&self) -> u64 {
         self.recording
             .as_ref()
@@ -888,7 +901,6 @@ impl AppState {
     }
 
     /// Most recent capture level, for the push-to-talk meter.
-    #[expect(dead_code, reason = "used by the recording indicator")]
     pub fn recording_rms(&self) -> f32 {
         self.recording
             .as_ref()
@@ -4255,5 +4267,99 @@ mod tests {
             }
             other => panic!("expected OutboundMessage::Media audio, got {other:#?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn reply_recording_target_reads_confirmable_popup_messages() {
+        let mut state = app_state().await;
+
+        state.create_popup(PopupKind::Info("nope".into()));
+        assert_eq!(
+            state.reply_recording_target(),
+            None,
+            "popups without a message are not reply targets"
+        );
+
+        let msg = audio_message();
+
+        state.dismiss_popup();
+        state.create_popup(PopupKind::Message(msg.clone()));
+        assert_eq!(state.reply_recording_target(), Some(msg.message_id.clone()));
+
+        state.dismiss_popup();
+        state.create_popup(PopupKind::Audio(AudioPopup {
+            msg: msg.clone(),
+            playback: None,
+            error_note: None,
+        }));
+        assert_eq!(state.reply_recording_target(), Some(msg.message_id.clone()));
+
+        state.dismiss_popup();
+        let (wake, _rx) = tokio::sync::mpsc::unbounded_channel();
+        state.create_popup(PopupKind::Image(ImagePopup {
+            msg: msg.clone(),
+            view: ImageWidgetState::new(wake),
+        }));
+        assert_eq!(state.reply_recording_target(), Some(msg.message_id.clone()));
+
+        // Pending/failed sends are not replyable: the target must go quiet.
+        state.dismiss_popup();
+        let mut pending = msg.clone();
+        pending.pending = true;
+        state.create_popup(PopupKind::Message(pending));
+        assert_eq!(state.reply_recording_target(), None);
+
+        state.dismiss_popup();
+        let mut failed = msg;
+        failed.failed = true;
+        state.create_popup(PopupKind::Audio(AudioPopup {
+            msg: failed,
+            playback: None,
+            error_note: None,
+        }));
+        assert_eq!(state.reply_recording_target(), None);
+    }
+
+    #[tokio::test]
+    async fn voice_reply_sends_with_reply_to() {
+        let mock = MockMessenger::new("Telegram");
+        let _keep_alive = mock.subscribe();
+        let mut config = Config::default();
+        config.providers.telegram.enabled = true;
+        let keymap = config.keys.parse().unwrap();
+        let mut state = AppState::new(
+            config,
+            keymap,
+            vec![MessengerKind::Stub(Provider::Telegram, Box::new(mock))],
+            false,
+        )
+        .await;
+        fetch_and_apply(&mut state).await;
+        state.chat_state.chat_list_state.select(Some(0));
+        let chat = state.chat_state.chats[0].clone();
+        state.chat_state.open_chat = Some(OpenChat {
+            chat,
+            history: Vec::new(),
+            has_more_history: true,
+        });
+
+        // A voice reply: the popup's message was stashed as the reply target.
+        let target = audio_message();
+        state.chat_state.pending_reply = Some(target.clone());
+
+        state.recording = Some(AudioRecording::new(Box::new(fake_mic(0.25))));
+        state.finish_recording().await;
+
+        let echoed = state
+            .chat_state
+            .open_chat
+            .as_ref()
+            .and_then(|o| o.history.last())
+            .expect("send echo present");
+        assert_eq!(
+            echoed.reply_to_id.as_ref(),
+            Some(&target.message_id),
+            "the voice note must quote the popup message"
+        );
     }
 }

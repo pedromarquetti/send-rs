@@ -4704,18 +4704,18 @@ mod tests {
         );
     }
 
-fn sample_cdn() -> CdnFields {
-    CdnFields {
-        url: "https://cdn.example/u".to_string(),
-        direct_path: "/d".to_string(),
-        media_key: [1u8; 32],
-        file_enc_sha256: [2u8; 32],
-        file_sha256: [3u8; 32],
-        file_length: 4096,
-        media_key_timestamp: 1_700_000_000,
-        streaming_sidecar: Some(vec![9, 9, 9]),
+    fn sample_cdn() -> CdnFields {
+        CdnFields {
+            url: "https://cdn.example/u".to_string(),
+            direct_path: "/d".to_string(),
+            media_key: [1u8; 32],
+            file_enc_sha256: [2u8; 32],
+            file_sha256: [3u8; 32],
+            file_length: 4096,
+            media_key_timestamp: 1_700_000_000,
+            streaming_sidecar: Some(vec![9, 9, 9]),
+        }
     }
-}
 
     #[test]
     fn outbound_image_message_maps_cdn_fields_and_context() {
@@ -4752,19 +4752,18 @@ fn sample_cdn() -> CdnFields {
         assert_eq!(vm.caption.as_deref(), Some("hi"));
         assert!(!vm.context_info.is_set());
 
-        let audio =
-            outbound_media_message(
-                MediaKind::Audio {
-                    duration_secs: Some(2),
-                    is_voice: true,
-                    waveform: Some(vec![64; 16]),
-                },
-                sample_cdn(),
-                "note.ogg",
-                None,
-                None,
-            )
-            .unwrap();
+        let audio = outbound_media_message(
+            MediaKind::Audio {
+                duration_secs: Some(2),
+                is_voice: true,
+                waveform: Some(vec![64; 16]),
+            },
+            sample_cdn(),
+            "note.ogg",
+            None,
+            None,
+        )
+        .unwrap();
         let am = audio.audio_message.as_option().unwrap();
         assert_eq!(am.streaming_sidecar.as_deref(), Some(&[9, 9, 9][..]));
         assert_eq!(am.mimetype.as_deref(), Some("audio/ogg; codecs=opus"));
@@ -4826,7 +4825,10 @@ fn sample_cdn() -> CdnFields {
         assert!(
             matches!(
                 restored.media_refs.get("stanza-42"),
-                Some(MediaRef { kind: MediaKind::Audio { .. }, .. })
+                Some(MediaRef {
+                    kind: MediaKind::Audio { .. },
+                    ..
+                })
             ),
             "own-sent clip must stay resolvable after a restart"
         );
@@ -4918,11 +4920,14 @@ fn sample_cdn() -> CdnFields {
         let hist = restored.history.get(&chat).expect("history survives");
         assert_eq!(hist.len(), 1);
         assert_eq!(hist[0].message_id, msg.message_id);
-        assert_eq!(hist[0].media.as_ref().unwrap().kind, MediaKind::Audio {
-            duration_secs: Some(2),
-            is_voice: true,
-            waveform: Some(vec![64; 16]),
-        });
+        assert_eq!(
+            hist[0].media.as_ref().unwrap().kind,
+            MediaKind::Audio {
+                duration_secs: Some(2),
+                is_voice: true,
+                waveform: Some(vec![64; 16]),
+            }
+        );
         assert!(
             restored.media_refs.contains_key("stanza-99"),
             "the persisted media ref keeps the clip resolvable after restart"

@@ -897,7 +897,54 @@ impl App {
         // app-level bindings can be gated on whether a text box has focus.
         self.state.update_mode();
 
+        // Push-to-talk owns the keyboard while recording: key-up sends, and on
+        // terminals that report no event types a deliberate second press sends
+        // and Esc cancels; anything else is ignored so navigation or the OS
+        // auto-repeat can't interrupt the take. Releases never carry a fresh
+        // press, so `record_key_pressed` gates only Press events.
+        if self.state.recording_active() {
+            let record_key = self.state.keymap.record_voice;
+            let is_record_key =
+                key.code == record_key.code && key.modifiers == record_key.modifiers;
+
+            if key == self.state.keymap.dismiss {
+                self.state.cancel_recording();
+                return;
+            }
+
+            let finish_take = match key.kind {
+                // Key-up always sends.
+                KeyEventKind::Release => true,
+                // Terminals without event types auto-repeat a Press; only a
+                // deliberate press (aged past the repeat delay/cadence) sends.
+                KeyEventKind::Press => self.state.record_key_pressed(Instant::now()),
+                // OS-level hold-repeat: never a send in itself.
+                _ => false,
+            };
+
+            if is_record_key && finish_take {
+                self.state.finish_recording().await;
+            }
+
+            return;
+        }
+
         if self.state.pop_up.is_some() {
+            // Pressing the record key over a message popup records a voice note
+            // sent as a reply to the popup's message (popup dismisses, the
+            // write box shows the pending reply).
+            let record_key = self.state.keymap.record_voice;
+            if key.code == record_key.code
+                && key.modifiers == record_key.modifiers
+                && key.kind == KeyEventKind::Press
+                && let Some(msg_id) = self.state.reply_recording_target()
+            {
+                self.dismiss_popup();
+                self.state.reply_to_message(&msg_id);
+                self.state.record_key_pressed(Instant::now());
+                self.state.start_recording();
+                return;
+            }
             self.handle_popup_key(key).await;
             return;
         }
@@ -955,36 +1002,8 @@ impl App {
         // are handled, everything else reaches the text widget.
         let insert = self.state.mode == Mode::Insert;
 
-        // Push-to-talk owns the keyboard while recording: key-up sends, and on
-        // terminals that report no event types a deliberate second press sends
-        // and Esc cancels; anything else is ignored so navigation or the OS
-        // auto-repeat can't interrupt the take. Releases never carry a fresh
-        // press, so `record_key_pressed` gates only Press events.
         let record_key = km.record_voice;
         let is_record_key = key.code == record_key.code && key.modifiers == record_key.modifiers;
-
-        if self.state.recording_active() {
-            if key == km.dismiss {
-                self.state.cancel_recording();
-                return;
-            }
-
-            let finish_take = match key.kind {
-                // Key-up always sends.
-                KeyEventKind::Release => true,
-                // Terminals without event types auto-repeat a Press; only a
-                // deliberate press (aged past the repeat delay/cadence) sends.
-                KeyEventKind::Press => self.state.record_key_pressed(Instant::now()),
-                // OS-level hold-repeat: never a send in itself.
-                _ => false,
-            };
-
-            if is_record_key && finish_take {
-                self.state.finish_recording().await;
-            }
-
-            return;
-        }
 
         // Esc while a flood-wait countdown is active cancels the in-flight
         // refresh and defers it to the next chat-list sync tick, instead of
@@ -1483,6 +1502,11 @@ impl App {
             )
         };
 
+        let recording = self
+            .state
+            .recording_active()
+            .then(|| (self.state.recording_seconds(), self.state.recording_rms()));
+
         ChatWidget::new(
             self.state.focus,
             &mut self.state.write,
@@ -1490,6 +1514,7 @@ impl App {
             message_search_bar,
             message_needle,
             self.state.loading.as_ref(),
+            recording,
         )
         .render(
             horizontal[1],
@@ -1756,7 +1781,7 @@ mod tests {
         app.state.record_key_pressed(Instant::now());
 
         // An auto-repeat press lands milliseconds later: it must not send.
-        app.handle_main_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
             .await;
         assert!(
             app.state.recording_active(),
@@ -1764,7 +1789,7 @@ mod tests {
         );
 
         // A key-up finishes and encodes the take.
-        app.handle_main_key(KeyEvent::new_with_kind(
+        app.handle_key(KeyEvent::new_with_kind(
             KeyCode::Char('a'),
             KeyModifiers::NONE,
             KeyEventKind::Release,
@@ -1812,6 +1837,53 @@ mod tests {
         assert!(
             app.state.pop_up.is_none(),
             "Num Lock state must not block popup Esc dismissal"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_key_over_message_popup_starts_a_voice_reply() {
+        let mut app = test_app().await;
+        app.state.chat_state.open_chat = Some(OpenChat {
+            chat: audio_chat(),
+            history: vec![audio_demo_message()],
+            has_more_history: false,
+        });
+        let msg = audio_demo_message();
+        app.state.create_popup(PopupKind::Message(msg.clone()));
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('a'))).await;
+
+        let reply = app
+            .state
+            .chat_state
+            .pending_reply
+            .as_ref()
+            .expect("the voice reply must be armed");
+        assert_eq!(reply.message_id, msg.message_id);
+
+        // The message popup is dismissed when the voice reply starts. Opening
+        // a real mic may fail in a headless run and surface an error popup
+        // instead; either way the popup can never linger as the message one.
+        assert!(
+            !matches!(
+                app.state.pop_up.as_ref().map(|p| &p.popup_type),
+                Some(PopupKind::Message(_) | PopupKind::Audio(_))
+            ),
+            "the message popup must be dismissed when a voice reply starts"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_key_over_popup_without_message_is_inert() {
+        let mut app = test_app().await;
+        app.state.create_popup(PopupKind::Error("nope".into()));
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('a'))).await;
+
+        assert!(app.state.pop_up.is_some(), "non-message popup stays open");
+        assert!(
+            app.state.chat_state.pending_reply.is_none(),
+            "no reply target without a message popup"
         );
     }
 }

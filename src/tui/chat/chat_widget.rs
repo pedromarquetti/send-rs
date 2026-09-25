@@ -23,6 +23,9 @@ pub struct ChatWidget<'a> {
     /// ([`LoadingArea::Inline`]) or, when no chat is open yet, as a centered
     /// spinner ([`LoadingArea::Chat`]).
     loading: Option<&'a LoadingState>,
+    /// Live push-to-talk indicator: `(whole seconds, RMS level)`, `None` while
+    /// no take is in flight.
+    recording: Option<(u64, f32)>,
 }
 
 impl<'a> ChatWidget<'a> {
@@ -33,6 +36,7 @@ impl<'a> ChatWidget<'a> {
         search_bar: Line<'static>,
         message_needle: Option<String>,
         loading: Option<&'a LoadingState>,
+        recording: Option<(u64, f32)>,
     ) -> Self {
         Self {
             focus,
@@ -41,6 +45,7 @@ impl<'a> ChatWidget<'a> {
             search_bar,
             message_needle,
             loading,
+            recording,
         }
     }
 
@@ -121,10 +126,22 @@ impl StatefulWidget for ChatWidget<'_> {
             area.height,
         );
 
-        let split =
-            Layout::vertical([Constraint::Fill(1), Constraint::Length(write_height)]).split(area);
+        // A foreground recording claims the footer row between the messages and
+        // the write box for the live ● mm:ss + RMS meter.
+        let recording = self.recording;
+        let split = if recording.is_some() {
+            Layout::vertical([
+                Constraint::Fill(1),
+                Constraint::Length(1),
+                Constraint::Length(write_height),
+            ])
+        } else {
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(write_height)])
+        }
+        .split(area);
         let msgs_area = split[0];
-        let write_area = split[1];
+        let indicator_area = recording.is_some().then(|| split[1]);
+        let write_area = split[usize::from(recording.is_some()) + 1];
 
         let opened = state.selected_chat().and_then(|chat| {
             state
@@ -288,8 +305,36 @@ impl StatefulWidget for ChatWidget<'_> {
             }
         }
 
+        if let (Some(row), Some((seconds, rms))) = (indicator_area, recording) {
+            Paragraph::new(recording_line(seconds, rms, row.width))
+                .alignment(Alignment::Right)
+                .render(row, buf);
+        }
+
         Widget::render(&*self.write, write_area, buf);
     }
+}
+
+/// One-row push-to-talk footer: a red ●, the elapsed time and a short level
+/// bar whose fill tracks the recording's RMS, right-aligned to the tool row.
+fn recording_line(seconds: u64, rms: f32, width: u16) -> Line<'static> {
+    let label = format!(
+        "Press the dismiss key to cancel; ● Rec {:02}:{:02} ",
+        seconds / 60,
+        seconds % 60
+    );
+    let bar_width = (width.saturating_sub(label.len() as u16)).clamp(1, 16) as usize;
+    let filled = (rms.clamp(0.0, 1.0) * bar_width as f32).round() as usize;
+    let bar = "█".repeat(filled);
+    let bar = format!("{bar}{}", "░".repeat(bar_width - filled));
+
+    Line::from(vec![
+        Span::styled(
+            label,
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(bar, Style::default().fg(Color::Red)),
+    ])
 }
 
 /// Renders one message as one or more physical lines, word-wrapped to fit `width` columns.

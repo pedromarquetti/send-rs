@@ -60,6 +60,7 @@ pub enum AudioError {
 /// Cannot be constructed or tested without a real audio device; the offline
 /// tests cover the pure helpers instead.
 pub struct Recorder {
+    #[expect(dead_code, reason = "kept alive for the lifetime of the stream")]
     stream: cpal::Stream,
     shared: Arc<Shared>,
 }
