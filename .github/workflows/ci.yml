@@ -11,7 +11,7 @@ on:
     outputs:
       version:
         description: Package version from Cargo.toml
-        value: ${{ jobs.quality.outputs.version }}
+        value: ${{ jobs.init.outputs.version }}
 
 permissions:
   contents: read
@@ -47,6 +47,10 @@ jobs:
         id: metadata
         run: |
           version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          if [ -z "$version" ] || [ "$version" = "null" ]; then
+            echo "could not read version from Cargo.toml" >&2
+            exit 1
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
       - name: Run cargo fmt
         run: cargo fmt --all -- --check
@@ -101,7 +105,7 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         env:
-          VERSION: ${{ needs.quality.outputs.version }}
+          VERSION: ${{ needs.init.outputs.version }}
         run: |
           set -euo pipefail
           archive="send-rs-${VERSION}-${{ runner.os }}-${{ runner.arch }}"
@@ -118,7 +122,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         env:
-          VERSION: ${{ needs.quality.outputs.version }}
+          VERSION: ${{ needs.init.outputs.version }}
         run: |
           $archive = "send-rs-$env:VERSION-${{ runner.os }}-${{ runner.arch }}"
           New-Item -ItemType Directory -Path $archive | Out-Null
