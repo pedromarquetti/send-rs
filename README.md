@@ -64,8 +64,8 @@ recording.
 - [x] Draft / Myself conversation - using wp/tg integrated self chat
 - [ ] Help menu Popup to show keymaps
 - [x] Descriptive error handling
-- [ ] WhatsApp integration
-- [ ] Message actions (reply, edit, delete) for whatsapp
+- [x] WhatsApp integration
+- [x] Message actions (reply, edit, delete) for whatsapp
 - [ ] Copy messages' text to clipboard
 - [x] Telegram integration
 - [x] Message actions (reply, edit, delete) for telegram
@@ -74,7 +74,7 @@ recording.
 - [x] Image rendering
 - [x] Audio playback
 - [ ] Send images - TODO: check if possible: send images + "paste to send"
-- [ ] Send audio - TODO: check if possible: send audio
+- [x] Send audio
 - [ ] Support for notifications
 - [x] Ordered chat list - All chats, ordered by pinned/most recent.
 - [ ] Dedicated chatlist for each provider
