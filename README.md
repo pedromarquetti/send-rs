@@ -100,19 +100,25 @@ sync_update_state_secs = 60
 chat_list_sync_secs = 10
 
 [keys]
+search_text = "/"
 scroll_up = "k"
 scroll_down = "j"
 select = "enter"
-pane_next = "tab"
 pane_prev = "shift+tab"
+pane_next = "tab"
 dismiss = "esc"
 quit = "ctrl+c"
 open_settings = "s"
 focus_write = "i"
+scroll_to_top = "g"
 scroll_to_bottom = "G"
 send = "enter"
 newline = "shift+enter"
 retry_connection = "r"
+record_voice = "a"
+play_pause = "space"
+seek_back = "<"
+seek_forward = ">"
 
 [providers.telegram]
 enabled = true
@@ -197,20 +203,26 @@ WhatsApp has no credentials — pairing happens through a QR code:
 
 ## Controls / Key Bindings
 
-| Keys        | Pane / Mode   | Action                                                                                                                                                                  |
-| ----------- | ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `j/k`       | -             | go up (k) or down (j)                                                                                                                                                   |
-| `Enter`     | Chat list     | select chat                                                                                                                                                             |
-| `Tab`       | -             | Change pane focus (Chat list → Chat → Write)                                                                                                                            |
-| `Esc`       | -             | Remove focus from 'write message' or dismiss error/info dialog                                                                                                          |
-| `Ctrl+c`    | -             | Quit app                                                                                                                                                                |
-| `s`         | Normal mode   | open settings                                                                                                                                                           |
-| `i`         | Chat          | Focus on 'write message'                                                                                                                                                |
-| `PgUp/PgDn` | Chat          | Page up / down on chat history (fixed, not configurable)                                                                                                                |
-| `Enter`     | Write message | Send message (configurable)                                                                                                                                             |
-| `Alt+Enter` | Write message | Insert newline. `Shift+Enter` also works but only on terminals that report modifier keys on Enter (kitty, foot, WezTerm, Alacritty; not GNOME Terminal or a plain TTY). |
-| `Enter`     | Settings      | Select items (use j/k for scrolling)                                                                                                                                    |
-| `r`         | Normal mode   | Force a reconnect when a provider is stuck in the "connection lost" state (e.g. after consecutive Telegram-stream failures)                                             |
+| Keys        | Pane / Mode      | Action                                                                                                                                                                  |
+| ----------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `j/k`       | -                | go up (k) or down (j)                                                                                                                                                   |
+| `Enter`     | Chat list        | select chat                                                                                                                                                             |
+| `Tab`       | -                | Change pane focus (Chat list → Chat → Write)                                                                                                                            |
+| `Esc`       | -                | Remove focus from 'write message' or dismiss error/info dialog                                                                                                          |
+| `Ctrl+c`    | -                | Quit app                                                                                                                                                                |
+| `s`         | Normal mode      | open settings                                                                                                                                                           |
+| `i`         | Chat             | Focus on 'write message'                                                                                                                                                |
+| `PgUp/PgDn` | Chat             | Page up / down on chat history (fixed, not configurable)                                                                                                                |
+| `Enter`     | Write message    | Send message (configurable)                                                                                                                                             |
+| `Alt+Enter` | Write message    | Insert newline. `Shift+Enter` also works but only on terminals that report modifier keys on Enter (kitty, foot, WezTerm, Alacritty; not GNOME Terminal or a plain TTY). |
+| `Enter`     | Settings         | Select items (use j/k for scrolling)                                                                                                                                    |
+| `r`         | Normal mode      | Force a reconnect when a provider is stuck in the "connection lost" state (e.g. after consecutive Telegram-stream failures)                                             |
+| `/`         | Chat / Chat List | Search for Messages in Chat or Chats in Chat List                                                                                                                       |
+| `g`         | Chat / Chat List | Go to the top of the list                                                                                                                                               |
+| `a`         | Chat / Pop Up    | Press and hold to start audio recording -> release to send. Chat: send audio to chat. Select message: reply to message with audio                                       |
+| `Space`     | Pop Up           | Play/pause media playback in Popup                                                                                                                                      |
+| `<`         | Pop Up           | Seek back                                                                                                                                                               |
+| `>`         | Pop Up           | Seek forward                                                                                                                                                            |
 
 > All keys except `PgUp/PgDn` are configurable in the config file.
 
