@@ -86,6 +86,11 @@ enum UiEvent {
     Resize,
 }
 
+/// Upper bound on backend teardown once the terminal is back. Long enough for
+/// the normal path (a connected provider flushes in milliseconds), short enough
+/// that a wedged one cannot hold the process open.
+const BACKEND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub async fn run(
     config: Config,
     keymap: Keymap,
@@ -93,30 +98,58 @@ pub async fn run(
     open_settings: bool,
 ) -> Result<()> {
     let mut terminal = ratatui::init();
-    // Let the terminal send pasted text as a single bracketed-paste event instead of a stream of
-    // raw keys, so multi-line paste cannot trigger Enter=send mid-paste.
-    std::io::stdout().execute(EnableBracketedPaste)?;
+    // The terminal belongs to the TUI until the restore below, so every exit path
+    // has to undo raw mode and the alt screen — not just the clean one. A failed
+    // setup step or an error out of `run_app` returns through the same path.
+    let app = async {
+        // Let the terminal send pasted text as a single bracketed-paste event instead of a stream of
+        // raw keys, so multi-line paste cannot trigger Enter=send mid-paste.
+        std::io::stdout().execute(EnableBracketedPaste)?;
 
-    // Push-to-talk needs a clean Press→Release lifecycle: report event types
-    // (release/repeat kinds) and disambiguate modified keys as CSI-u sequences.
-    // Terminals that reject these flags keep working via the second-press
-    // fallback in `handle_main_key`.
-    //
-    // TODO: holding the PTT record key on kitty yields a Press stream with no
-    // Release, because `a` is a text key and kitty only reports text keys as
-    // events under REPORT_ALL_KEYS_AS_ESCAPE_CODES (bit 8); sending on release
-    // therefore falls back to the gated second press. Worth checking whether
-    // enabling bit 8 (real key-up finishing) is a worthwhile compat fix.
-    std::io::stdout().execute(PushKeyboardEnhancementFlags(
-        KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-            | KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
-    ))?;
+        // Push-to-talk needs a clean Press→Release lifecycle: report event types
+        // (release/repeat kinds) and disambiguate modified keys as CSI-u sequences.
+        // Terminals that reject these flags keep working via the second-press
+        // fallback in `handle_main_key`.
+        //
+        // TODO: holding the PTT record key on kitty yields a Press stream with no
+        // Release, because `a` is a text key and kitty only reports text keys as
+        // events under REPORT_ALL_KEYS_AS_ESCAPE_CODES (bit 8); sending on release
+        // therefore falls back to the gated second press. Worth checking whether
+        // enabling bit 8 (real key-up finishing) is a worthwhile compat fix.
+        std::io::stdout().execute(PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                | KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+        ))?;
 
-    let result = run_app(&mut terminal, config, keymap, messengers, open_settings).await;
+        run_app(&mut terminal, config, keymap, messengers, open_settings).await
+    }
+    .await;
+
+    // Give the terminal back before anything else, including propagating an
+    // error out of the TUI. A provider that is mid-connect makes `disconnect`
+    // wait for that attempt to finish (up to the transport's own connect
+    // timeout), and holding the screen in raw mode for it leaves a frozen TUI on
+    // Ctrl+C. Shutdown is best-effort from here.
     let _ = std::io::stdout().execute(PopKeyboardEnhancementFlags);
     let _ = std::io::stdout().execute(DisableBracketedPaste);
     ratatui::restore();
-    result
+
+    let mut app = app?;
+
+    // The TUI is de-rendered and the shell is back, so tell the user what the
+    // process is doing: teardown below can still take up to
+    // BACKEND_SHUTDOWN_TIMEOUT, and an idle terminal reads as a hung process.
+    println!("Shutting down...");
+
+    match tokio::time::timeout(BACKEND_SHUTDOWN_TIMEOUT, app.shutdown()).await {
+        Ok(()) => {}
+        Err(_) => warn!(
+            timeout_secs = BACKEND_SHUTDOWN_TIMEOUT.as_secs(),
+            "Backend teardown did not finish in time; exiting anyway"
+        ),
+    }
+
+    Ok(())
 }
 
 fn spawn_signal_listener(tx: mpsc::UnboundedSender<UiEvent>) {
@@ -177,7 +210,7 @@ async fn run_app(
     keymap: Keymap,
     messengers: Vec<MessengerKind>,
     open_settings: bool,
-) -> Result<()> {
+) -> Result<App> {
     let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
 
     // Query the terminal's image protocol once, before the input reader starts
@@ -512,8 +545,9 @@ async fn run_app(
         }
     }
 
-    app.shutdown().await;
-    Ok(())
+    // Shutdown is deliberately left to the caller: it owns the terminal and
+    // must hand it back before this app's backends are torn down.
+    Ok(app)
 }
 
 fn spawn_terminal_reader(tx: mpsc::UnboundedSender<UiEvent>, record_key: KeyEvent) {

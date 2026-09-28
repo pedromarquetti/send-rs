@@ -26,6 +26,10 @@ tokio = { version = "1", features = [
   "sync",
   "time",
   "signal",
+  # `net` for the WhatsApp transport's own DNS + TCP connect. It is already in
+  # the graph via whatsapp-rust's tokio-transport; naming it explicitly states
+  # that we use it directly instead of relying on feature unification.
+  "net",
 ] }
 
 grammers-client = "0.10"
@@ -59,6 +63,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono"] }
 # fix for an ALSA error i was having: 
 # 'ALSA lib pcm.c:8787:(snd_pcm_recover) [error.pcm] underrun occurred' was appearing in progress bar
 tracing-log = "0.2"
+
+# WhatsApp transport (src/backend/whatsapp/transport.rs). All four are already
+# in the tree via whatsapp-rust's tokio-transport, so these add no new
+# downloads — they only make the already-compiled crates directly nameable.
+# tokio-websockets must be the same build the transport uses (its `client` and
+# `rustls-bring-your-own-connector` features come from that dep).
+tokio-websockets = "0.13"
+futures-util = "0.3"
+async-channel = "2"
+http = "1"
 
 rodio = { version = "0.21.1", features = ["tracing"] }
 # rodio 0.21.1 is pinned because 0.22 renamed Sink
