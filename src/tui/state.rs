@@ -1382,16 +1382,22 @@ impl AppState {
     /// A read-only question about what the user can currently see, so the event
     /// loop can ask it before handing the event over: the name is resolved from
     /// the pre-update chat list, which is the row the event would have read
-    /// anyway. The visibility gate is [`ChatState::is_open`], the same method
-    /// that decides whether a message raises an unread badge, so a message can
-    /// never end up unread-but-quiet or notified-but-read.
+    /// anyway.
+    ///
+    /// A message counts as *seen* only when the chat is open **and** the window
+    /// has the OS focus, so looking at the open chat from another workspace
+    /// cannot mute a message the user is not there to read. The two conditions
+    /// deliberately differ: an unfocused window still announces a message in the
+    /// open chat, but [`Self::handle_backend_event`] does not raise an unread
+    /// badge for it, because it is already pushed into the open chat and will be
+    /// on screen when the user comes back.
     pub fn notice_for_message(&self, provider: Provider, message: &Message) -> Option<Notice> {
         let contact_name = self
             .chat_state
             .display_name_for(&message.chat, &message.sender);
-        let is_open = self.chat_state.is_open(&message.chat);
+        let visible = self.focused && self.chat_state.is_open(&message.chat);
 
-        to_notice(message, provider, &contact_name, is_open)
+        to_notice(message, provider, &contact_name, visible)
     }
 
     pub fn handle_backend_event(&mut self, provider: Provider, event: BackendEvent) {
@@ -2737,10 +2743,12 @@ mod tests {
         assert_eq!(notice.body, "dinner at eight");
     }
 
-    /// The event loop asks for a notice and then applies the event; the notice
-    /// and the unread badge must come out the same way, for the same reason.
+    /// The event loop asks for a notice and then applies the event. While the
+    /// window is focused, the two must agree for the same reason: the open chat
+    /// is both unbadged and unannounced. (An unfocused window is the documented
+    /// exception — see `an_unfocused_window_announces_the_open_chat`.)
     #[tokio::test]
-    async fn unread_state_and_notice_state_never_disagree() {
+    async fn unread_state_and_notice_state_never_disagree_while_focused() {
         let mut state = app_state().await;
         state.chat_state.chat_list_state.select(Some(0));
         select_chat(&mut state, 0).await;
@@ -2791,6 +2799,59 @@ mod tests {
             .find(|chat| chat.id == ChatId::Telegram(102))
             .expect("family group is in the chat list");
         assert_eq!(family.unread_count, unread_before);
+    }
+
+    /// The open chat is not a reason to stay quiet when the user is not looking:
+    /// the message is still announced. It is deliberately *not* badged, because
+    /// it is already pushed into the open chat and will be on screen when the
+    /// user comes back — so the two disagree on purpose here.
+    #[tokio::test]
+    async fn an_unfocused_window_announces_the_open_chat() {
+        let mut state = app_state().await;
+        state.chat_state.chat_list_state.select(Some(0));
+        select_chat(&mut state, 0).await;
+
+        let open_chat = state
+            .chat_state
+            .open_chat
+            .as_ref()
+            .expect("a chat is open")
+            .chat
+            .id
+            .clone();
+
+        // Same chat, same message, only the window focus differs.
+        state.set_window_focus(false);
+        let message = inbound(open_chat.clone(), "Alice", "still there?");
+        let notice = state.notice_for_message(Provider::Telegram, &message);
+        state.handle_backend_event(Provider::Telegram, BackendEvent::MessageReceived(message));
+
+        assert_eq!(
+            notice.map(|notice| notice.chat),
+            Some(open_chat.clone()),
+            "a message in the open chat is still announced while the user is elsewhere"
+        );
+
+        let open = state
+            .chat_state
+            .chats
+            .iter()
+            .find(|chat| chat.id == open_chat)
+            .expect("open chat is in the chat list");
+        assert!(
+            !open.unread,
+            "but it must not be badged: it is already in the open chat's history"
+        );
+
+        // Refocusing makes the user able to see it again, so the next message in
+        // that chat goes back to being silent.
+        state.set_window_focus(true);
+        assert!(
+            state
+                .notice_for_message(Provider::Telegram, &inbound(open_chat, "Alice", "back now"))
+                .is_none(),
+            "focused again means the open chat is visible again"
+        );
     }
 
     #[tokio::test]

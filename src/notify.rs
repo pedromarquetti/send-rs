@@ -95,8 +95,16 @@ pub struct Notice {
 
 /// Whether an inbound `message` warrants a notification, and if so what to say.
 ///
-/// The gate is the same test the chat list uses to raise an unread badge, so a
-/// message can never end up unread-but-quiet or notified-but-read.
+/// `visible` is the caller's answer to "is the user looking at this right now":
+/// true only when the chat is open *and* the window has the focus. A visible
+/// message is never announced, because the user is already reading it.
+///
+/// This is deliberately **not** the same test the chat list uses to raise an
+/// unread badge. The badge asks only whether the chat is open, because an open
+/// chat puts the message on screen as soon as the user returns. The notification
+/// also has to consider whether the user is at the terminal at all, so a message
+/// in the open chat is still announced when the window is unfocused — while
+/// staying unbadged, since it is already in the open chat's history.
 ///
 /// `contact_name` is the chat-list name the caller has already resolved. It is
 /// only the *first* choice for the title: in a group chat the sender is just a
@@ -106,11 +114,10 @@ pub fn to_notice(
     message: &Message,
     provider: Provider,
     contact_name: &str,
-    is_open: bool,
+    visible: bool,
 ) -> Option<Notice> {
-    // Our own messages, and the chat the user is reading right now. Same
-    // condition that drives the unread badge.
-    if message.from_me || is_open {
+    // Our own messages, and the ones the user is looking at right now.
+    if message.from_me || visible {
         return None;
     }
 
@@ -443,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn the_open_chat_is_never_notified() {
+    fn a_visible_message_is_never_notified() {
         assert!(
             to_notice(
                 &message(ChatId::Telegram(1), "Alice", "hi"),
@@ -452,7 +459,7 @@ mod tests {
                 true,
             )
             .is_none(),
-            "the user is reading this chat, so no unread badge and no notice"
+            "the user is looking at this chat, so there is nothing to announce"
         );
     }
 

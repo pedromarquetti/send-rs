@@ -68,10 +68,15 @@ types.
   `ChatState`. Push updates are authoritative where available; polling
   (`chat_poll_interval_secs`, `chat_list_sync_secs`) is the fallback.
 - Notifications hang off `BackendEvent::MessageReceived` **only**. `to_notice`
-  rejects the open chat, your own messages and the `Myself` conversation, and
-  the visibility check is the same one the unread badge uses. A new provider
-  therefore gets notifications by emitting that one event — it must not add
-  notification code, and must not notify from a poll or history load.
+  rejects visible messages, your own messages and the `Myself` conversation. A
+  new provider therefore gets notifications by emitting that one event — it must
+  not add notification code, and must not notify from a poll or history load.
+- A message counts as *visible* (hence never announced) only when its chat is
+  open **and** the terminal window has focus — `AppState::focused`, fed by
+  crossterm `FocusGained`/`FocusLost` via `UiEvent::WindowFocused`. The unread
+  badge keys on `is_open` alone; that divergence is deliberate (an unfocused open
+  chat is announced but not badged, since the message is already in the open
+  chat's history). Don't "fix" either gate to match the other.
 
 ## Backend integration docs — read before editing providers
 

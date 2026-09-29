@@ -187,9 +187,10 @@ whatsapp = ""
 
 #### Notifications
 
-New messages in chats you are **not** currently viewing can raise a sound cue
-and/or your OS's own notification. Both are off by default, and every key is
-optional — a config file without a `[notifications]` table stays silent.
+New messages in chats you are **not** currently viewing or if the app is not on
+focus can raise a sound cue and/or your OS's own notification. Both are off by
+default, and every key is optional — a config file without a `[notifications]`
+table stays silent.
 
 | Key                         | Default | Description                                                                                                                                                                                                                                  |
 | --------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -198,26 +199,21 @@ optional — a config file without a `[notifications]` table stays silent.
 | `notifications.debounce_ms` | `1500`  | How long one messenger coalesces a burst of new messages into a single notification. A group that drops 20 messages at once produces one sound _and_ one desktop notification. Use `0` to notify on **every** message.                       |
 | `notifications.sounds`      | `{}`    | Per-messenger sound file, keyed by messenger name (`telegram`, `whatsapp`). **A messenger with no entry plays no sound** — this is how you silence one messenger only. A blank value (`""`) counts as no sound, same as leaving the key out. |
 
-What happens per message: a provider that redelivers a message you already got
-announces it once, and a message in the chat you are currently reading is never
-announced. When a cue really was played, the desktop notification is shown
-silently, so one message makes one noise. A sound file that is missing (or
-unreadable) mutes that messenger's cue only; its desktop notifications still
-arrive.
+> [!NOTE]
+> A cue never interrupts audio: while a voice note is loaded — **including while
+> it is only paused, not playing** — or playing, a cue is **dropped, not
+> queued**, and the voice note keeps its position and stays replayable. A cue
+> dropped this way is not played afterwards, so a busy audio session costs you
+> notifications rather than playback. There is no per-chat mute and no per-chat
+> sound yet.
 
-A cue never interrupts audio: while a voice note is loaded — **including while
-it is only paused, not playing** — or playing, a cue is **dropped, not queued**,
-and the voice note keeps its position and stays replayable. A cue dropped this
-way is not played afterwards, so a busy audio session costs you notifications
-rather than playback. There is no per-chat mute and no per-chat sound yet;
-`notifications.sounds` is keyed per messenger.
-
-Sound files go through the same decoder as the audio popup, so any format that
-plays in the popup plays here too (`wav`, `mp3`, `flac`, `m4a`, `ogg`;
-Opus-in-Ogg is decoded natively). Paths may be absolute or relative to the
-directory you run `senders` from. A path that cannot be read is reported in
-`sender.log` at startup and that messenger is then silent — it is not retried
-per message.
+> [!NOTE]
+> Sound files go through the same decoder as the audio popup, so any format that
+> plays in the popup plays here too (`wav`, `mp3`, `flac`, `m4a`, `ogg`;
+> Opus-in-Ogg is decoded natively). Paths may be absolute or relative to the
+> directory you run `senders` from. A path that cannot be read is reported in
+> `sender.log` at startup and that messenger is then silent — it is not retried
+> per message.
 
 #### Providers
 
