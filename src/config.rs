@@ -1,15 +1,20 @@
 use anyhow::{Context, Result, anyhow, bail};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::{Deserialize, Serialize};
-use std::{fs::create_dir_all, path::PathBuf};
+use std::{
+    collections::HashMap,
+    fs::create_dir_all,
+    path::{Path, PathBuf},
+};
 
-use crate::backend::Chat;
+use crate::backend::{Chat, Provider};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     pub keys: KeymapConfig,
     pub providers: ProvidersConfig,
+    pub notifications: NotificationsConfig,
     pub max_write_lines: usize,
     /// How often (seconds) the TUI polls for new messages in the open chat.
     pub chat_poll_interval_secs: u64,
@@ -25,6 +30,7 @@ impl Default for Config {
         Self {
             keys: KeymapConfig::default(),
             providers: ProvidersConfig::default(),
+            notifications: NotificationsConfig::default(),
             max_write_lines: 5,
             chat_poll_interval_secs: 10,
             sync_update_state_secs: 120,
@@ -51,6 +57,61 @@ pub struct TelegramConfig {
 impl TelegramConfig {
     pub fn has_credentials(&self) -> bool {
         self.api_id != 0 && !self.api_hash.is_empty()
+    }
+}
+
+/// Notification preferences, read from the `[notifications]` table.
+///
+/// Every switch is off and every key is optional by default, so a config file
+/// written before notifications existed keeps loading and keeps quiet.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct NotificationsConfig {
+    pub os: bool,
+    /// Play this messenger's sound file on a new message.
+    pub sound: bool,
+    /// How long one messenger coalesces a burst of new messages into a single
+    /// cue. `0` plays a cue for every message.
+    pub debounce_ms: u64,
+    /// Sound file per messenger, keyed by [`Provider`]. A messenger with no
+    /// entry plays no cue at all. The key is the only messenger-specific value
+    /// in the config, so a new provider needs no new field here.
+    pub sounds: HashMap<Provider, PathBuf>,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            os: false,
+            sound: false,
+            debounce_ms: 1500,
+            sounds: HashMap::new(),
+        }
+    }
+}
+
+impl NotificationsConfig {
+    /// The sound file configured for `provider`, or `None` when that messenger
+    /// has no sound: the key is absent, or the path is blank. Every consumer goes
+    /// through this so "no sound for this messenger" means one thing.
+    // Its consumer lands with the notification cues; the compiler nags to drop
+    // this expectation as soon as that happens. Test builds already allow
+    // dead code (`main.rs`), so the expectation only applies to the binary.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "unused until the notification cues are wired")
+    )]
+    pub fn sound_for(&self, provider: Provider) -> Option<&Path> {
+        let configured = self.sounds.get(&provider)?;
+
+        // A blank entry is how a messenger is muted without deleting its key, so
+        // it means "no sound" exactly like an absent key does.
+        let blank = configured
+            .as_os_str()
+            .to_str()
+            .is_none_or(|raw| raw.trim().is_empty());
+
+        (!blank).then_some(configured.as_path())
     }
 }
 
@@ -418,6 +479,119 @@ mod tests {
         assert!(!config.providers.telegram.enabled);
         assert!(config.providers.whatsapp);
         assert_eq!(config.max_write_lines, 5);
+    }
+
+    #[test]
+    fn notifications_default_to_silent() {
+        let config = Config::default();
+        assert!(!config.notifications.os);
+        assert!(!config.notifications.sound);
+        assert_eq!(config.notifications.debounce_ms, 1500);
+        assert!(config.notifications.sounds.is_empty());
+        assert_eq!(config.notifications.sound_for(Provider::Telegram), None);
+        assert_eq!(config.notifications.sound_for(Provider::WhatsApp), None);
+    }
+
+    #[test]
+    fn config_without_notifications_stays_silent() {
+        // A config file written before notifications existed must keep loading
+        // with every notification switch off, never with a surprise sound.
+        let raw = "max_write_lines = 5\n[providers]\nwhatsapp = true\n";
+        let config: Config = toml::from_str(raw).unwrap();
+        assert!(!config.notifications.os);
+        assert!(!config.notifications.sound);
+        assert_eq!(config.notifications.debounce_ms, 1500);
+        assert!(config.notifications.sound_for(Provider::Telegram).is_none());
+    }
+
+    #[test]
+    fn notifications_round_trip_through_toml() {
+        let mut config = Config::default();
+        config.notifications.os = true;
+        config.notifications.sound = true;
+        config.notifications.debounce_ms = 0;
+        config
+            .notifications
+            .sounds
+            .insert(Provider::Telegram, PathBuf::from("/home/you/sounds/tg.wav"));
+        // A relative path and a blank entry are both values a user can type.
+        config
+            .notifications
+            .sounds
+            .insert(Provider::WhatsApp, PathBuf::from(""));
+
+        let raw = toml::to_string_pretty(&config).unwrap();
+        let back: Config = toml::from_str(&raw).unwrap();
+
+        assert!(back.notifications.os);
+        assert!(back.notifications.sound);
+        assert_eq!(back.notifications.debounce_ms, 0);
+        assert_eq!(
+            back.notifications.sound_for(Provider::Telegram),
+            Some(Path::new("/home/you/sounds/tg.wav"))
+        );
+        assert_eq!(back.notifications.sound_for(Provider::WhatsApp), None);
+        assert_eq!(config.notifications.sounds, back.notifications.sounds);
+    }
+
+    #[test]
+    fn notification_sounds_parse_from_a_hand_written_table() {
+        // Key spelling is the user-facing contract: lowercase provider names.
+        let raw = concat!(
+            "[notifications]\n",
+            "os = true\n",
+            "sound = true\n",
+            "debounce_ms = 250\n",
+            "\n[notifications.sounds]\n",
+            "telegram = \"sounds/tg.wav\"\n",
+            "whatsapp = \"/home/you/sounds/wa.flac\"\n",
+        );
+        let config: Config = toml::from_str(raw).unwrap();
+
+        assert!(config.notifications.os);
+        assert!(config.notifications.sound);
+        assert_eq!(config.notifications.debounce_ms, 250);
+        assert_eq!(
+            config.notifications.sound_for(Provider::Telegram),
+            Some(Path::new("sounds/tg.wav"))
+        );
+        assert_eq!(
+            config.notifications.sound_for(Provider::WhatsApp),
+            Some(Path::new("/home/you/sounds/wa.flac"))
+        );
+    }
+
+    #[test]
+    fn unknown_messenger_sound_key_is_rejected() {
+        // A typo must not silently read as "this messenger has no sound".
+        let raw = "[notifications.sounds]\ntelegarm = \"tg.wav\"\n";
+        assert!(toml::from_str::<Config>(raw).is_err());
+    }
+
+    #[test]
+    fn sound_for_treats_a_blank_path_as_no_sound() {
+        let mut config = Config::default();
+        for blank in ["", " ", "\t"] {
+            config
+                .notifications
+                .sounds
+                .insert(Provider::Telegram, PathBuf::from(blank));
+            assert_eq!(config.notifications.sound_for(Provider::Telegram), None);
+        }
+
+        config.notifications.sounds.clear();
+        assert_eq!(config.notifications.sound_for(Provider::Telegram), None);
+
+        config
+            .notifications
+            .sounds
+            .insert(Provider::Telegram, PathBuf::from("sounds/tg.wav"));
+        assert_eq!(
+            config.notifications.sound_for(Provider::Telegram),
+            Some(Path::new("sounds/tg.wav"))
+        );
+        // Configuring one messenger never configures the other.
+        assert_eq!(config.notifications.sound_for(Provider::WhatsApp), None);
     }
 
     #[test]

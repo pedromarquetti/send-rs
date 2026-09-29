@@ -11,6 +11,7 @@
   - [Configuration](#configuration)
     - [Example `config.toml`:](#example-configtoml)
       - [Top-level options](#top-level-options)
+      - [Notifications](#notifications)
       - [Providers](#providers)
     - [Telegram Setup](#telegram-setup)
     - [WhatsApp Setup](#whatsapp-setup)
@@ -127,6 +128,16 @@ api_hash = "your_api_hash_here"
 
 [providers]
 whatsapp = false
+
+[notifications]
+os = true
+sound = true
+debounce_ms = 1500
+
+[notifications.sounds]
+telegram = "/home/you/sounds/tg.wav"
+# A blank value mutes that messenger only, and deleting the key does the same.
+whatsapp = ""
 ```
 
 > [!NOTE]
@@ -141,6 +152,31 @@ whatsapp = false
 | `chat_poll_interval_secs` | `10`    | Fallback interval (in seconds) for reconciling messages in the **currently open** chat (any provider) when push updates are unavailable. Lower values feel more responsive but use more resources.                                                                                                                                               |
 | `sync_update_state_secs`  | `120`   | Telegram-only. How often (in seconds) the Telegram client persists its internal update-state (pts/qts/seq) to the session file. This does **not** call any Telegram API — it only saves local state so that `catch_up` on restart is faster. I recommend setting a high value, because it does consume Disk IO                                   |
 | `chat_list_sync_secs`     | `10`    | How often (in seconds) the TUI fetches the full chat list from the enabled providers (Telegram and WhatsApp) to detect **unread-count changes across all chats**. This is the mechanism that updates unread indicators on chats you are not currently viewing. Increase this if you notice high CPU usage; decrease it for snappier unread dots. |
+
+#### Notifications
+
+New messages in chats you are **not** currently viewing can raise a sound cue
+and/or your OS's own notification. Both are off by default, and every key is
+optional — a config file without a `[notifications]` table stays silent.
+
+> [!NOTE]
+> The `[notifications]` table is already read and saved, but the sound and OS
+> notification output is wired up in the phases after this one — until then both
+> switches are inert.
+
+| Key                         | Default | Description                                                                                                                                                                                                                                  |
+| --------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `notifications.os`          | `false` | Global on/off switch for the **OS** notification (D-Bus toast / banner). Off means no desktop notification is ever requested, on any platform.                                                                                               |
+| `notifications.sound`       | `false` | Global on/off switch for the **sound cue**. The two switches are independent, so you can run sound-only (no session bus needed) or notifications-only.                                                                                       |
+| `notifications.debounce_ms` | `1500`  | How long one messenger coalesces a burst of new messages into a single cue. A group that drops 20 messages at once plays one sound. Use `0` to play a cue for **every** message.                                                             |
+| `notifications.sounds`      | `{}`    | Per-messenger sound file, keyed by messenger name (`telegram`, `whatsapp`). **A messenger with no entry plays no sound** — this is how you silence one messenger only. A blank value (`""`) counts as no sound, same as leaving the key out. |
+
+Sound files go through the same decoder as the audio popup, so any format that
+plays in the popup plays here too (`wav`, `mp3`, `flac`, `m4a`, `ogg`;
+Opus-in-Ogg is decoded natively). Paths may be absolute or relative to the
+directory you run `senders` from. A path that cannot be read is reported in
+`sender.log` at startup and that messenger is then silent — it is not retried
+per message.
 
 #### Providers
 

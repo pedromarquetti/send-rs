@@ -16,7 +16,8 @@ use crate::{
     config::ProvidersConfig,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
 /// Main struct that defines available Messengers
 pub enum Provider {
     Telegram,
@@ -337,6 +338,8 @@ pub struct Message {
     pub reply_to_id: Option<MessageId>,
 
     /// Set when this message quotes an earlier one (the reply target).
+    /// TODO: Add more context to messages in message list: 
+    /// message item in Chat should show "XXX replied to 'yyy'" instead of "{who} replied"
     pub reply_ctx: Option<ReplyContext>,
     /// Truthy for an optimistic outgoing echo still awaiting confirmation.
     /// When `pending` and `failed` are both false the message is confirmed.
