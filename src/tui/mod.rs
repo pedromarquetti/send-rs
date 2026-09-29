@@ -438,7 +438,21 @@ async fn run_app(
 
                         let rebuild = matches!(backend_event, BackendEvent::Connected);
 
+                        // Asked before the event is consumed: the notice reads
+                        // the pre-update chat list, which is exactly the state
+                        // the event is about to act on. 
+                        let notice = match &backend_event {
+                            BackendEvent::MessageReceived(message) => {
+                                app.state.notice_for_message(provider, message)
+                            }
+                            _ => None,
+                        };
+
                         app.state.handle_backend_event(provider, backend_event);
+
+                        if let Some(notice) = notice {
+                            debug!(?notice, "TUI notification candidate");
+                        }
 
                         // On a newly established connection (e.g. WhatsApp just
                         // paired via QR), refresh the shared chat list so the

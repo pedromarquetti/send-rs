@@ -31,6 +31,7 @@ pub struct ImageWidgetState {
     status: String,
 }
 
+// TODO: implement image caching for faster loading: check if possible
 impl ImageWidgetState {
     /// Spawn the encode worker; `wake` is signalled with `UiEvent::Redraw`
     /// whenever a (re-)encoded frame is ready so the UI repaints promptly.

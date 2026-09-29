@@ -323,6 +323,23 @@ impl ChatState {
             .unwrap_or(false)
     }
 
+    /// The name to show for a chat, given a fallback taken from the message
+    /// sender.
+    pub fn display_name_for(&self, id: &ChatId, sender: &str) -> String {
+        let existing_name = self
+            .chats
+            .iter()
+            .find(|chat| chat.id == *id)
+            .map(|chat| chat.contact_name.as_str())
+            .filter(|name| !name.is_empty() && *name != "Unknown" && *name != "You");
+
+        match existing_name {
+            Some(name) => name.to_string(),
+            None if sender != "Unknown" => sender.to_string(),
+            None => String::new(),
+        }
+    }
+
     pub fn push_incoming(&mut self, message: Message) -> bool {
         if self.is_open(&message.chat)
             && let Some(open) = &mut self.open_chat
@@ -822,6 +839,58 @@ mod tests {
 
         assert!(!state.push_incoming(message(ChatId::Telegram(2))));
         assert_eq!(state.open_chat.as_ref().unwrap().history.len(), 1);
+    }
+
+    #[test]
+    fn display_name_keeps_the_existing_row_name() {
+        let state = ChatState {
+            chats: vec![chat(ChatId::Telegram(1), "Family Group")],
+            ..Default::default()
+        };
+
+        // A sender never renames an existing row, so the group title survives
+        // messages from its members.
+        assert_eq!(
+            state.display_name_for(&ChatId::Telegram(1), "Bob"),
+            "Family Group"
+        );
+    }
+
+    #[test]
+    fn display_name_falls_back_to_the_sender_for_a_new_chat() {
+        let state = ChatState::default();
+
+        assert_eq!(
+            state.display_name_for(&ChatId::Telegram(1), "Bob"),
+            "Bob",
+            "an unlisted chat borrows the sender's name until the backend sends the real title"
+        );
+    }
+
+    #[test]
+    fn display_name_never_returns_a_placeholder() {
+        let state = ChatState {
+            chats: vec![
+                chat(ChatId::Telegram(1), ""),
+                chat(ChatId::Telegram(2), "Unknown"),
+                chat(ChatId::Telegram(3), "You"),
+            ],
+            ..Default::default()
+        };
+
+        for id in 1..=3 {
+            assert_eq!(
+                state.display_name_for(&ChatId::Telegram(id), "Bob"),
+                "Bob",
+                "chat {id}: an unresolvable row name must fall through"
+            );
+        }
+
+        assert_eq!(
+            state.display_name_for(&ChatId::Telegram(4), "Unknown"),
+            "",
+            "an unresolvable sender yields an empty name, never \"Unknown\""
+        );
     }
 
     #[test]

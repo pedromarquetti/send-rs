@@ -13,6 +13,7 @@ use crate::backend::{
     MessengerKind, OutboundMessage, Provider,
 };
 use crate::config::{Config, Keymap};
+use crate::notify::{Notice, to_notice};
 use crate::tui::chat::{ChatState, OpenChat};
 use crate::tui::loading::{LoadingArea, LoadingState};
 use crate::tui::player::PlaybackState;
@@ -1376,6 +1377,23 @@ impl AppState {
         self.finish_loading(LoadingArea::FullScreen);
     }
 
+    /// The notification a new message implies, if it implies one at all.
+    ///
+    /// A read-only question about what the user can currently see, so the event
+    /// loop can ask it before handing the event over: the name is resolved from
+    /// the pre-update chat list, which is the row the event would have read
+    /// anyway. The visibility gate is [`ChatState::is_open`], the same method
+    /// that decides whether a message raises an unread badge, so a message can
+    /// never end up unread-but-quiet or notified-but-read.
+    pub fn notice_for_message(&self, provider: Provider, message: &Message) -> Option<Notice> {
+        let contact_name = self
+            .chat_state
+            .display_name_for(&message.chat, &message.sender);
+        let is_open = self.chat_state.is_open(&message.chat);
+
+        to_notice(message, provider, &contact_name, is_open)
+    }
+
     pub fn handle_backend_event(&mut self, provider: Provider, event: BackendEvent) {
         match event {
             BackendEvent::Connected => {
@@ -1536,25 +1554,14 @@ impl AppState {
                     .map(|chat| chat.unread_count)
                     .unwrap_or(0);
 
-                let chatlist_row = self.chat_state.chats.iter().find(|c| c.id == message.chat);
-                let chatlist_found = chatlist_row.is_some();
-                let existing_name = chatlist_row
-                    .map(|c| c.contact_name.clone())
-                    .filter(|n| !n.is_empty() && n != "Unknown" && n != "You");
-
-                // Messages never rename an existing chat list row: for a group
-                // chat the sender is a member, so the member's name would
-                // clobber the group title on every inbound message. The
-                // backend owns titles (ChatList/ChatUpdated); only genuinely
-                // new chats get a sender-derived fallback so something
-                // renders until the first authoritative list arrives.
-                let contact_name = existing_name.unwrap_or_else(|| {
-                    if message.sender == "Unknown" {
-                        String::new()
-                    } else {
-                        message.sender.clone()
-                    }
-                });
+                let chatlist_found = self
+                    .chat_state
+                    .chats
+                    .iter()
+                    .any(|chat| chat.id == message.chat);
+                let contact_name = self
+                    .chat_state
+                    .display_name_for(&message.chat, &message.sender);
 
                 let mut chat_update = Chat {
                     id: message.chat.clone(),
@@ -2685,6 +2692,105 @@ mod tests {
             .expect("incoming chat remains in chat list");
         assert!(chat.unread);
         assert_eq!(chat.unread_count, 1);
+    }
+
+    /// An inbound message for a chat the user is not reading, built by hand so
+    /// each seam test can vary only what it is about.
+    fn inbound(chat: ChatId, sender: &str, text: &str) -> Message {
+        Message {
+            message_id: "incoming".into(),
+            chat,
+            sender: sender.into(),
+            author_id: None,
+            text: text.into(),
+            timestamp: 0,
+            from_me: false,
+            msg_actions: Vec::new(),
+            media: None,
+            reply_to_id: None,
+            reply_ctx: None,
+            pending: false,
+            failed: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_message_for_a_closed_chat_produces_a_notice() {
+        let mut state = app_state().await;
+        state.chat_state.chat_list_state.select(Some(0));
+        select_chat(&mut state, 0).await;
+
+        // Chat 102 ("Family Group") is a background chat while another one is
+        // open, so this is the message that also raises the unread badge.
+        let notice = state
+            .notice_for_message(
+                Provider::Telegram,
+                &inbound(ChatId::Telegram(102), "Bob", "dinner at eight"),
+            )
+            .expect("a message the user cannot see is worth a notification");
+
+        assert_eq!(notice.provider, Provider::Telegram);
+        assert_eq!(notice.chat, ChatId::Telegram(102));
+        // The chat-list name wins over the sender: in a group the sender is just
+        // a member.
+        assert_eq!(notice.title, "Family Group");
+        assert_eq!(notice.body, "dinner at eight");
+    }
+
+    /// The event loop asks for a notice and then applies the event; the notice
+    /// and the unread badge must come out the same way, for the same reason.
+    #[tokio::test]
+    async fn unread_state_and_notice_state_never_disagree() {
+        let mut state = app_state().await;
+        state.chat_state.chat_list_state.select(Some(0));
+        select_chat(&mut state, 0).await;
+
+        let open_chat = state
+            .chat_state
+            .open_chat
+            .as_ref()
+            .expect("a chat is open")
+            .chat
+            .id
+            .clone();
+
+        // Open chat: no unread badge, no notice.
+        let open_message = inbound(open_chat.clone(), "Alice", "on my way");
+        let open_notice = state.notice_for_message(Provider::Telegram, &open_message);
+        state.handle_backend_event(
+            Provider::Telegram,
+            BackendEvent::MessageReceived(open_message),
+        );
+        assert!(open_notice.is_none());
+        let open = state
+            .chat_state
+            .chats
+            .iter()
+            .find(|chat| chat.id == open_chat)
+            .expect("open chat is in the chat list");
+        assert!(!open.unread);
+
+        // Own message in a closed chat: no unread badge, no notice. The family
+        // group already starts unread in the fixture, so compare the count.
+        let unread_before = state
+            .chat_state
+            .chats
+            .iter()
+            .find(|chat| chat.id == ChatId::Telegram(102))
+            .expect("family group is in the chat list")
+            .unread_count;
+        let mut sent = inbound(ChatId::Telegram(102), "Me", "sent from my laptop");
+        sent.from_me = true;
+        let own_notice = state.notice_for_message(Provider::Telegram, &sent);
+        state.handle_backend_event(Provider::Telegram, BackendEvent::MessageReceived(sent));
+        assert!(own_notice.is_none());
+        let family = state
+            .chat_state
+            .chats
+            .iter()
+            .find(|chat| chat.id == ChatId::Telegram(102))
+            .expect("family group is in the chat list");
+        assert_eq!(family.unread_count, unread_before);
     }
 
     #[tokio::test]
