@@ -90,3 +90,5 @@ opus-pure = "0.2.1"
 # `libasound2-dev` at build time; macOS (CoreAudio) and Windows (WASAPI) need
 # nothing extra. Default features on, no `jack` (optional).
 cpal = "0.16"
+
+arboard = "=3.6.1"

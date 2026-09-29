@@ -491,6 +491,7 @@ fn message_actions_line(msg: &Message) -> Line<'static> {
                 MessageAction::Edit => format!("[{}] Edit", i + 1),
                 MessageAction::Delete => format!("[{}] Delete", i + 1),
                 MessageAction::Retry => format!("[{}] Retry", i + 1),
+                MessageAction::Copy => format!("[{}] Copy", i + 1),
             };
             Span::styled(format!("  {label}"), Style::default().fg(Color::White))
         })

@@ -1478,6 +1478,18 @@ impl App {
                 MessageAction::Retry => {
                     let _ = msg_id;
                 }
+                MessageAction::Copy => {
+                    let Some(message) = self.state.chat_state.find_message(&msg_id).cloned() else {
+                        return;
+                    };
+
+                    if let Err(err) = self.state.copy_to_clipboard(message.text) {
+                        debug!("error copying to clipboard {err}");
+                        self.state.create_popup(PopupKind::Error(format!("{err}")));
+                    }
+                    self.state
+                        .create_popup(PopupKind::Info(String::from("Copied to clipboard!")));
+                }
             }
         }
     }

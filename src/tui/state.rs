@@ -1,4 +1,5 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
+use arboard::Clipboard;
 use ratatui::crossterm::event::KeyEvent;
 use ratatui::style::{Color, Style};
 use ratatui::widgets::ListState;
@@ -150,6 +151,8 @@ pub struct AppState {
     /// second press (send) from the auto-repeat stream on terminals that do not
     /// report event types.
     last_record_key: Option<Instant>,
+
+    clipboard: Option<Clipboard>,
 }
 
 pub struct LoginState {
@@ -198,6 +201,8 @@ impl AppState {
         login_input.set_cursor_line_style(Style::default());
         login_input.set_wrap_mode(WrapMode::WordOrGlyph);
 
+        let clipboard = Clipboard::new().ok();
+
         let mut app = Self {
             mode: Mode::Normal,
             config,
@@ -229,6 +234,7 @@ impl AppState {
             playback: None,
             recording: None,
             last_record_key: None,
+            clipboard,
         };
 
         if let Ok(chat_cache) = Config::load_chats() {
@@ -246,6 +252,16 @@ impl AppState {
 
     pub fn selected_chat_idx(&self) -> Option<usize> {
         self.chat_state.chat_list_state.selected()
+    }
+
+    pub fn copy_to_clipboard(&mut self, msg: String) -> Result<()> {
+        if let Some(clipboard) = &mut self.clipboard {
+            clipboard
+                .set_text(msg)
+                .map_err(|err| anyhow!("arboard err: {err}"))
+        } else {
+            Err(anyhow!("No clipboard provider"))
+        }
     }
 
     /// Record the terminal's window focus. Only [`AppState::focused`] changes:
@@ -4600,5 +4616,28 @@ mod tests {
             Some(&target.message_id),
             "the voice note must quote the popup message"
         );
+    }
+
+    #[tokio::test]
+    async fn copies_text_to_clip() {
+        let clipboard = Clipboard::new().ok();
+        let mut state = app_state().await;
+        state.clipboard = clipboard;
+        let test = String::from("test");
+
+        match state.copy_to_clipboard(test.clone()) {
+            Ok(_) => {
+                let res = state
+                    .clipboard
+                    .expect("Could not get clipboard")
+                    .get_text()
+                    .expect("Could not get_text");
+
+                assert_eq!(res, test);
+            }
+            Err(err) => {
+                panic!("{err}")
+            }
+        };
     }
 }
