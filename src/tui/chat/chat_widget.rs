@@ -13,6 +13,9 @@ use crate::tui::state::Focus;
 
 pub struct ChatWidget<'a> {
     focus: Focus,
+    /// Whether the terminal window has the OS focus. Dims the pane when false,
+    /// without disturbing which pane `focus` points at.
+    focused: bool,
     write: &'a mut TextArea<'static>,
     max_write_lines: usize,
     /// Precomputed bottom-title search bar (empty when no search is active).
@@ -29,8 +32,10 @@ pub struct ChatWidget<'a> {
 }
 
 impl<'a> ChatWidget<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         focus: Focus,
+        focused: bool,
         write: &'a mut TextArea<'static>,
         max_write_lines: usize,
         search_bar: Line<'static>,
@@ -40,6 +45,7 @@ impl<'a> ChatWidget<'a> {
     ) -> Self {
         Self {
             focus,
+            focused,
             write,
             max_write_lines: max_write_lines.max(1),
             search_bar,
@@ -64,13 +70,29 @@ impl StatefulWidget for ChatWidget<'_> {
             .map(|chat| chat.id.tag())
             .unwrap_or_else(|| "ME");
 
-        let border = match self.focus {
-            Focus::Chat | Focus::Write => match tag {
-                "TG" => Style::default().fg(Color::LightBlue),
-                "WA" => Style::default().fg(Color::Green),
-                _ => Style::default().fg(Color::Yellow),
-            },
+        // Provider accent, used to outline the pane that owns the keyboard. The
+        // write box only earns it while the write box itself is focused: having
+        // the chat focused must not light up the compose box as well.
+        let accent = match tag {
+            "TG" => Style::default().fg(Color::LightBlue),
+            "WA" => Style::default().fg(Color::Green),
             _ => Style::default(),
+        };
+        let blurred = Style::default().fg(Color::DarkGray).dim();
+
+        let border = if !self.focused {
+            blurred
+        } else if matches!(self.focus, Focus::Chat | Focus::Write) {
+            accent
+        } else {
+            Style::default()
+        };
+        let write_border = if !self.focused {
+            blurred
+        } else if self.focus == Focus::Write {
+            accent
+        } else {
+            Style::default()
         };
 
         let title: Line<'_> = state
@@ -194,7 +216,11 @@ impl StatefulWidget for ChatWidget<'_> {
                 })
                 .collect();
 
-            let highlight = if self.focus == Focus::Chat {
+            // A blurred window dims the whole list uniformly, so the selection
+            // band is dropped: its colored background would fight the dim.
+            let highlight = if !self.focused {
+                Style::default()
+            } else if self.focus == Focus::Chat {
                 match tag {
                     "TG" => Style::default()
                         .bg(Color::LightBlue)
@@ -259,11 +285,12 @@ impl StatefulWidget for ChatWidget<'_> {
             paragraph.render(msgs_area, buf);
         }
 
-        let write_border = if self.focus == Focus::Write {
-            border
-        } else {
-            Style::default()
-        };
+        // Every message span carries its own color (provider accent, sender
+        // gray, search highlight), so the blur is applied as one patch over the
+        // finished message area instead of per-span.
+        if !self.focused {
+            buf.set_style(msgs_area, blurred);
+        }
 
         let compose_context = state
             .pending_edit
@@ -271,39 +298,21 @@ impl StatefulWidget for ChatWidget<'_> {
             .or(state.pending_reply.as_ref())
             .or_else(|| state.selected_message());
 
-        match compose_context {
-            Some(msg) => {
-                if state.pending_edit.is_some() {
-                    self.write.set_block(
-                        Block::bordered()
-                            .title(format!(" Write - Editing {} ", msg.text))
-                            .border_style(write_border),
-                    );
-                } else if state.pending_reply.is_some() {
-                    self.write.set_block(
-                        Block::bordered()
-                            .title(format!(
-                                " Write - Replying to '{}': {} ",
-                                msg.sender, msg.text
-                            ))
-                            .border_style(write_border),
-                    );
-                } else {
-                    self.write.set_block(
-                        Block::bordered()
-                            .title(" Write ")
-                            .border_style(write_border),
-                    );
-                }
+        let write_title = match compose_context {
+            Some(msg) if state.pending_edit.is_some() => {
+                format!(" Write - Editing {} ", msg.text)
             }
-            None => {
-                self.write.set_block(
-                    Block::bordered()
-                        .title(" Write ")
-                        .border_style(write_border),
-                );
+            Some(msg) if state.pending_reply.is_some() => {
+                format!(" Write - Replying to '{}': {} ", msg.sender, msg.text)
             }
-        }
+            _ => " Write ".to_string(),
+        };
+
+        self.write.set_block(
+            Block::bordered()
+                .title(write_title)
+                .border_style(write_border),
+        );
 
         if let (Some(row), Some((seconds, rms))) = (indicator_area, recording) {
             Paragraph::new(recording_line(seconds, rms, row.width))
@@ -602,7 +611,17 @@ pub(crate) fn format_timestamp(secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{ChatId, MediaKind, MessageMedia};
+    use crate::backend::{Chat, ChatId, MediaKind, MessageMedia};
+    use crate::tui::chat::OpenChat;
+    use ratatui::buffer::Cell;
+    use ratatui::widgets::ListState;
+
+    const PANE: Rect = Rect::new(0, 0, 40, 12);
+    /// The message area spans every row but the three-row write box, inset by
+    /// the chat block border.
+    const MESSAGES: Rect = Rect::new(1, 1, 38, 8);
+    /// Top-left corner cell of the write box border.
+    const WRITE_BORDER: (u16, u16) = (0, 9);
 
     fn message(text: &str) -> Message {
         Message {
@@ -630,6 +649,107 @@ mod tests {
             file_name: None,
         });
         msg
+    }
+
+    /// One Telegram chat, selected and open, holding a single message.
+    fn open_chat_state() -> ChatState {
+        let chat = Chat {
+            id: ChatId::Telegram(1),
+            contact_name: "Alice".into(),
+            last_message_ts: Some(0),
+            status: None,
+            fixed: false,
+            scroll: 0,
+            unread: false,
+            unread_count: 0,
+            verified: false,
+        };
+
+        ChatState {
+            chat_list_state: ListState::default().with_selected(Some(0)),
+            chats: vec![chat.clone()],
+            open_chat: Some(OpenChat {
+                chat,
+                history: vec![message("hello there")],
+                has_more_history: false,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Render the pane with an open chat and return the resulting buffer.
+    fn render_pane(focus: Focus, focused: bool) -> Buffer {
+        let mut state = open_chat_state();
+        let mut write = TextArea::default();
+        let mut buf = Buffer::empty(PANE);
+
+        ChatWidget::new(
+            focus,
+            focused,
+            &mut write,
+            5,
+            Line::default(),
+            None,
+            None,
+            None,
+        )
+        .render(PANE, &mut buf, &mut state);
+
+        buf
+    }
+
+    /// Every written cell of the message area, in row-major order.
+    fn message_cells(buf: &Buffer) -> Vec<&Cell> {
+        MESSAGES
+            .positions()
+            .map(|pos| &buf[pos])
+            .filter(|cell| cell.symbol() != " ")
+            .collect()
+    }
+
+    #[test]
+    fn blurred_window_dims_every_message() {
+        let buf = render_pane(Focus::Chat, false);
+        let cells = message_cells(&buf);
+        assert!(!cells.is_empty(), "the chat must have rendered messages");
+        for cell in &cells {
+            assert_eq!(cell.fg, Color::DarkGray, "cell {:?}", cell.symbol());
+            assert!(cell.modifier.contains(Modifier::DIM), "cell not dim");
+        }
+    }
+
+    #[test]
+    fn focused_window_leaves_messages_alone() {
+        let buf = render_pane(Focus::Chat, true);
+        assert!(
+            message_cells(&buf)
+                .iter()
+                .any(|cell| cell.fg != Color::DarkGray && !cell.modifier.contains(Modifier::DIM))
+        );
+    }
+
+    #[test]
+    fn write_box_is_only_styled_while_it_is_the_focused_pane() {
+        let chat_focused = render_pane(Focus::Chat, true);
+        assert_eq!(
+            chat_focused[WRITE_BORDER].fg,
+            Color::Reset,
+            "focusing the chat must leave the write box unstyled"
+        );
+        assert!(
+            chat_focused[(0, 0)].fg == Color::LightBlue,
+            "the chat pane takes the provider accent instead"
+        );
+
+        let write_focused = render_pane(Focus::Write, true);
+        assert_eq!(write_focused[WRITE_BORDER].fg, Color::LightBlue);
+    }
+
+    #[test]
+    fn blurred_window_dims_the_write_box_border() {
+        let buf = render_pane(Focus::Write, false);
+        assert_eq!(buf[WRITE_BORDER].fg, Color::DarkGray);
+        assert!(buf[WRITE_BORDER].modifier.contains(Modifier::DIM));
     }
 
     #[test]

@@ -10,6 +10,9 @@ pub struct ChatList<'a> {
     chats: Vec<&'a Chat>,
     curr_tag: Option<&'static str>,
     focus: Focus,
+    /// Whether the terminal window has the OS focus. Dims the whole list when
+    /// false, without disturbing which pane `focus` points at.
+    focused: bool,
     search: &'a SearchState,
     /// When set, a spinner is appended to the title bar (the chat list is
     /// already populated and is being re-fetched).
@@ -21,12 +24,14 @@ impl<'a> ChatList<'a> {
         curr_tag: Option<&'static str>,
         chats: Vec<&'a Chat>,
         focus: Focus,
+        focused: bool,
         search: &'a SearchState,
         loading: Option<u8>,
     ) -> Self {
         Self {
             chats,
             focus,
+            focused,
             curr_tag,
             search,
             loading,
@@ -38,7 +43,9 @@ impl StatefulWidget for ChatList<'_> {
     type State = ListState;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
-        let border = if self.focus == Focus::ChatList {
+        let border = if !self.focused {
+            Style::default().fg(Color::DarkGray).dim()
+        } else if self.focus == Focus::ChatList {
             match self.curr_tag {
                 Some("TG") => Style::default().fg(Color::Blue),
                 Some("WA") => Style::default().fg(Color::Green),
@@ -86,7 +93,9 @@ impl StatefulWidget for ChatList<'_> {
                     spans.push(Span::styled("📌 ", Style::default().fg(Color::Yellow)));
                 }
 
-                let name_style = if item.unread {
+                let name_style = if !self.focused {
+                    Style::default().fg(Color::DarkGray).dim()
+                } else if item.unread {
                     Style::default().add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
@@ -119,7 +128,9 @@ impl StatefulWidget for ChatList<'_> {
             })
             .collect();
 
-        let highlight = if self.focus == Focus::ChatList {
+        let highlight = if !self.focused {
+            Style::default().fg(Color::DarkGray).dim()
+        } else if self.focus == Focus::ChatList {
             match self.curr_tag {
                 Some("TG") => Style::default()
                     .bg(Color::Blue)

@@ -1,10 +1,11 @@
 use anyhow::Result;
 use ratatui::crossterm::ExecutableCommand;
 use ratatui::crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyEventState, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
+use ratatui::crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::widgets::{StatefulWidget, Widget};
 use ratatui::{DefaultTerminal, Frame};
@@ -44,6 +45,7 @@ mod status_bar;
 enum UiEvent {
     Key(KeyEvent),
     Paste(String),
+    WindowFocused(bool),
     Shutdown,
     Backend(Provider, BackendEvent),
     /// Wake signal: a background image (re)encode finished; redraw to apply it.
@@ -106,6 +108,9 @@ pub async fn run(
         // raw keys, so multi-line paste cannot trigger Enter=send mid-paste.
         std::io::stdout().execute(EnableBracketedPaste)?;
 
+        std::io::stdout().execute(EnterAlternateScreen)?;
+        std::io::stdout().execute(EnableFocusChange)?;
+
         // Push-to-talk needs a clean Press→Release lifecycle: report event types
         // (release/repeat kinds) and disambiguate modified keys as CSI-u sequences.
         // Terminals that reject these flags keep working via the second-press
@@ -132,6 +137,10 @@ pub async fn run(
     // Ctrl+C. Shutdown is best-effort from here.
     let _ = std::io::stdout().execute(PopKeyboardEnhancementFlags);
     let _ = std::io::stdout().execute(DisableBracketedPaste);
+
+    let _ = std::io::stdout().execute(DisableFocusChange);
+    let _ = std::io::stdout().execute(LeaveAlternateScreen);
+
     ratatui::restore();
 
     let mut app = app?;
@@ -413,6 +422,7 @@ async fn run_app(
                     break;
                 };
                 match event {
+                    UiEvent::WindowFocused(state) => app.state.set_window_focus(state),
                     UiEvent::Key(key) => app.handle_key(key).await,
                     UiEvent::Paste(text) => app.state.handle_paste(text),
                     UiEvent::Shutdown => {
@@ -554,6 +564,18 @@ fn spawn_terminal_reader(tx: mpsc::UnboundedSender<UiEvent>, record_key: KeyEven
     std::thread::spawn(move || {
         loop {
             match event::read() {
+                Ok(Event::FocusGained) => {
+                    debug!("Event::FocusGained");
+                    if tx.send(UiEvent::WindowFocused(true)).is_err() {
+                        break;
+                    }
+                }
+                Ok(Event::FocusLost) => {
+                    debug!("Event::FocusLost");
+                    if tx.send(UiEvent::WindowFocused(false)).is_err() {
+                        break;
+                    }
+                }
                 Ok(Event::Resize(..)) => {
                     if tx.send(UiEvent::Resize).is_err() {
                         break;
@@ -924,6 +946,15 @@ impl App {
         // TODO: add a overlay menu / screen to display all the keymappings
         if key == self.state.keymap.quit {
             self.state.running = false;
+            return;
+        }
+
+        // A key can still be delivered in the gap before the terminal reports
+        // focus (or by a multiplexer that never reports it at all). Ignoring it
+        // keeps a stray keystroke from moving the selection, typing into the
+        // write box or sending a message into a window the user left.
+        if !self.state.focused {
+            debug!("key ignored while the window is unfocused");
             return;
         }
 
@@ -1508,6 +1539,7 @@ impl App {
             self.state.chat_state.get_tag(),
             visible_chats,
             self.state.focus,
+            self.state.focused,
             &self.state.chat_state.search,
             chatlist_loading_frame,
         )
@@ -1543,6 +1575,7 @@ impl App {
 
         ChatWidget::new(
             self.state.focus,
+            self.state.focused,
             &mut self.state.write,
             self.state.config.max_write_lines,
             message_search_bar,

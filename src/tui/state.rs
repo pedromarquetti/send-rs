@@ -85,6 +85,11 @@ pub enum Mode {
 
 /// Common application state shared across pages.
 pub struct AppState {
+    /// Whether the terminal window has the OS focus. Orthogonal to `focus`:
+    /// losing the window never changes which pane owns the keyboard, so the
+    /// same pane (and any open chat / half-typed draft) is still there on
+    /// return.
+    pub focused: bool,
     pub mode: Mode,
     pub config: Config,
     pub keymap: Keymap,
@@ -195,6 +200,7 @@ impl AppState {
         let mut app = Self {
             mode: Mode::Normal,
             config,
+            focused: true,
             keymap,
             messengers,
             settings_state: ListState::default().with_selected(Some(0)),
@@ -239,6 +245,14 @@ impl AppState {
 
     pub fn selected_chat_idx(&self) -> Option<usize> {
         self.chat_state.chat_list_state.selected()
+    }
+
+    /// Record the terminal's window focus. Only [`AppState::focused`] changes:
+    /// the pane focus is deliberately left alone so regaining the window
+    /// returns the user to the same pane (and the same open chat / draft).
+    pub fn set_window_focus(&mut self, focused: bool) {
+        debug!(focused, "window focus change");
+        self.focused = focused;
     }
 
     /// True while the chat-list search UI is engaged and focused.
@@ -698,6 +712,13 @@ impl AppState {
 
     /// Inserts pasted text into the write box if it has focus.
     pub fn handle_paste(&mut self, text: String) {
+        // A paste can still be delivered in the gap before the terminal reports
+        // focus, so drop it rather than typing into a box nobody can see.
+        if !self.focused {
+            debug!("paste ignored while the window is unfocused");
+            return;
+        }
+
         if self.focus == Focus::Write {
             self.write.insert_str(&text);
         }
@@ -1058,6 +1079,10 @@ impl AppState {
                     remaining.as_secs().max(1)
                 ));
             }
+        }
+
+        if !self.focused {
+            return Some("App not in focus!".to_string());
         }
 
         if let Some(status) = self
@@ -2502,6 +2527,52 @@ mod tests {
         state.focus = Focus::Chat;
         state.handle_paste("line one\nline two".into());
         assert_eq!(state.write.lines().to_vec(), vec![String::new()]);
+    }
+
+    #[test]
+    fn paste_is_ignored_while_the_window_is_unfocused() {
+        let mut state = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(app_state());
+        state.focus = Focus::Write;
+        state.set_window_focus(false);
+        state.handle_paste("sneaked in".into());
+        assert_eq!(state.write.lines().to_vec(), vec![String::new()]);
+    }
+
+    #[tokio::test]
+    async fn blur_and_refocus_restore_the_exact_pane_and_open_chat() {
+        let mut state = app_state().await;
+        state.chat_state.chat_list_state.select(Some(0));
+        select_chat(&mut state, 0).await;
+        state.focus = Focus::Write;
+        state.write.insert_str("half-typed draft");
+
+        state.set_window_focus(false);
+        assert!(!state.focused);
+        assert_eq!(
+            state.focus,
+            Focus::Write,
+            "losing the window must not move the pane focus"
+        );
+        assert!(state.chat_state.open_chat.is_some());
+
+        state.set_window_focus(true);
+        assert!(state.focused);
+        assert_eq!(state.focus, Focus::Write);
+        assert!(state.chat_state.open_chat.is_some());
+        assert_eq!(state.write.lines().join("\n"), "half-typed draft");
+    }
+
+    #[tokio::test]
+    async fn status_hint_reports_the_blurred_window() {
+        let mut state = app_state().await;
+        assert_ne!(state.status_hint().as_deref(), Some("App not in focus!"));
+
+        state.set_window_focus(false);
+        assert_eq!(state.status_hint().as_deref(), Some("App not in focus!"));
     }
 
     #[tokio::test]
