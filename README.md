@@ -7,11 +7,12 @@
     - [Linux](#linux)
     - [macOS](#macos)
     - [Windows](#windows)
+    - [Notifications](#notifications)
   - [Features](#features)
   - [Configuration](#configuration)
     - [Example `config.toml`:](#example-configtoml)
       - [Top-level options](#top-level-options)
-      - [Notifications](#notifications)
+      - [Notifications](#notifications-1)
       - [Providers](#providers)
     - [Telegram Setup](#telegram-setup)
     - [WhatsApp Setup](#whatsapp-setup)
@@ -37,7 +38,9 @@ Building needs only the Rust toolchain plus the system audio libraries used for
 **recording** (Playback needs no extra libs — opus-pure decodes Opus in pure
 Rust):
 
-### Linux
+### Requirements for **audio recording**
+
+#### Linux
 
 1. ALSA dev libraries
 
@@ -46,16 +49,45 @@ Rust):
 
 2. `pkg-config` (cpal uses ALSA for input).
 
-### macOS
+#### macOS
 
 - Xcode Command Line Tools — CoreAudio is linked automatically.
 
-### Windows
+#### Windows
 
 None — WASAPI is linked automatically.
 
 At runtime, a working microphone/input device is required to use voice-note
 recording.
+
+### Requirements for OS Notifications
+
+The **OS notification** goes through each platform's own mechanism, and on every
+platform something outside `senders` has to be there to present it:
+
+#### Linux
+
+A D-Bus **session bus** plus a notification daemon that owns
+`org.freedesktop.Notifications` (GNOME, KDE Plasma...). Sendrs uses
+[notify-rust](https://docs.rs/crate/notify-rust/latest) as a notification sender
+crate, check their docs for details. With no session bus, it fails immediately,
+and `senders` logs it in `sender.log` and carries on. Sound cues are unaffected.
+
+#### macOS — the presenting application is identified by the **bundle
+
+identifier of the running process**, so `senders` has to be shipped inside an
+`.app` bundle to be identified correctly. `appname("sender")` is ignored on
+macOS, and an unbundled binary has no bundle identifier, so the notification
+backend falls back to `com.apple.Finder` and a banner is attributed to the wrong
+application. Sound cues are unaffected.
+
+#### Windows
+
+Toasts are attributed to an **AppUserModelID**. `senders` sets none, so the
+notification backend falls back to PowerShell's ID: the toast still appears, but
+grouped under and attributed to PowerShell. A real AUMID means registering a
+Start-menu shortcut, which is an install-time step rather than something the app
+can do for itself.
 
 ## Features
 
@@ -168,11 +200,17 @@ optional — a config file without a `[notifications]` table stays silent.
 
 What happens per message: a provider that redelivers a message you already got
 announces it once, and a message in the chat you are currently reading is never
-announced. A cue never interrupts audio — it is dropped, not queued, while a
-voice note is loaded or playing — and when a cue really was played the desktop
-notification is shown silently, so one message makes one noise. A sound file
-that is missing (or unreadable) mutes that messenger's _cue_ only; its desktop
-notifications still arrive.
+announced. When a cue really was played, the desktop notification is shown
+silently, so one message makes one noise. A sound file that is missing (or
+unreadable) mutes that messenger's cue only; its desktop notifications still
+arrive.
+
+A cue never interrupts audio: while a voice note is loaded — **including while
+it is only paused, not playing** — or playing, a cue is **dropped, not queued**,
+and the voice note keeps its position and stays replayable. A cue dropped this
+way is not played afterwards, so a busy audio session costs you notifications
+rather than playback. There is no per-chat mute and no per-chat sound yet;
+`notifications.sounds` is keyed per messenger.
 
 Sound files go through the same decoder as the audio popup, so any format that
 plays in the popup plays here too (`wav`, `mp3`, `flac`, `m4a`, `ogg`;

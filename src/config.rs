@@ -71,11 +71,14 @@ pub struct NotificationsConfig {
     /// Play this messenger's sound file on a new message.
     pub sound: bool,
     /// How long one messenger coalesces a burst of new messages into a single
-    /// cue. `0` plays a cue for every message.
+    /// notification. The window gates both channels at once, so a burst that
+    /// plays one cue also raises one desktop notification. `0` notifies on
+    /// every message.
     pub debounce_ms: u64,
     /// Sound file per messenger, keyed by [`Provider`]. A messenger with no
-    /// entry plays no cue at all. The key is the only messenger-specific value
-    /// in the config, so a new provider needs no new field here.
+    /// entry plays no cue at all, though its desktop notifications are
+    /// unaffected. The key is the only messenger-specific value in the config,
+    /// so a new provider needs no new field here.
     pub sounds: HashMap<Provider, PathBuf>,
 }
 

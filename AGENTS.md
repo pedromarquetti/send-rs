@@ -37,6 +37,10 @@ types.
 - `src/backend/mock.rs` — `MockMessenger` used by startup mode and tests.
 - `src/config.rs` — keymap parsing, provider config, save/load.
 - `src/main.rs` — logging, config load, provider construction.
+- `src/notify.rs` — `Notice` (what a new message is reduced to: chat name,
+  body, provider), the suppression rules (redelivery dedup, per-messenger
+  cooldown) and the two sinks they dispatch to: cue bytes for the player, and
+  `OsNotifier` for the desktop.
 - `src/tui/mod.rs` — event loop, key dispatch, rendering.
 - `src/tui/state.rs` — `AppState`: focus, selection, drafts, login flow, backend
   events.
@@ -63,6 +67,11 @@ types.
 - Event flow: provider → `BackendEvent` → `AppState::handle_backend_event` →
   `ChatState`. Push updates are authoritative where available; polling
   (`chat_poll_interval_secs`, `chat_list_sync_secs`) is the fallback.
+- Notifications hang off `BackendEvent::MessageReceived` **only**. `to_notice`
+  rejects the open chat, your own messages and the `Myself` conversation, and
+  the visibility check is the same one the unread badge uses. A new provider
+  therefore gets notifications by emitting that one event — it must not add
+  notification code, and must not notify from a poll or history load.
 
 ## Backend integration docs — read before editing providers
 
