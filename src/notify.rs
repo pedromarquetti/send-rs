@@ -12,20 +12,40 @@
 //! rather than derived from it: `ChatId::to_provider` panics for the "Myself"
 //! conversation, which must never be a notification target.
 
-use crate::backend::{ChatId, Message, Provider};
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use tracing::{debug, warn};
+
+use crate::backend::{ChatId, Message, MessageId, Provider};
+use crate::config::NotificationsConfig;
+use crate::tui::PlayKey;
 
 /// Longest title a notice carries, in characters.
 const MAX_TITLE_CHARS: usize = 60;
 /// Longest body a notice carries, in characters.
 const MAX_BODY_CHARS: usize = 140;
+/// How many recently seen messages are remembered for deduplication. Bounded
+/// because a long session would otherwise grow it without limit; far more than
+/// the duplicates any provider actually redelivers.
+const RECENT_IDS: usize = 64;
 
 /// A new message the user cannot currently see, reduced to what a notification
-/// can show. Produced by [`notice_for`], consumed by the notification sinks.
+/// can show. Produced by [`to_notice`], consumed by the notification sinks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
     pub provider: Provider,
     pub chat: ChatId,
+    /// Carries the message's identity so a provider that delivers the same
+    /// message twice cannot notify twice. Opaque and provider-neutral, like
+    /// every other id in the backend layer.
+    pub message_id: MessageId,
+    /// Chat name, else the sender, else the messenger name.
     pub title: String,
+    /// The message text, else a label for its media. Empty when the message
+    /// carries neither (a service message with no text): a titled notification
+    /// with no body is still meaningful, and the sound cue ignores it anyway.
     pub body: String,
 }
 
@@ -90,6 +110,7 @@ pub fn to_notice(
     Some(Notice {
         provider,
         chat: message.chat.clone(),
+        message_id: message.message_id.clone(),
         title: truncated(title, MAX_TITLE_CHARS),
         body: truncated(&body, MAX_BODY_CHARS),
     })
@@ -102,10 +123,118 @@ fn truncated(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
 
+/// Turns notices into notification cues, applying the suppression rules.
+///
+/// Suppression lives here rather than in the audio worker on purpose: it keeps
+/// `AppState` about *policy* ("a background message yields a notice") and the
+/// player about *sound*, with no shared state between them. A cue that is
+/// dropped is a `debug!` line, never a popup and never a counter.
+pub struct Notifier {
+    /// The global sound switch. A messenger also needs its own entry in
+    /// `sounds`: a messenger absent from it is muted.
+    sound: bool,
+    /// Cue bytes per messenger, read once at construction.
+    sounds: HashMap<Provider, Arc<[u8]>>,
+    /// How long one messenger stays quiet after cueing. Zero cues on every
+    /// message.
+    debounce: Duration,
+    /// Recently cued messages, oldest first. Providers redeliver messages
+    /// (WhatsApp emits `MessageReceived` even for a duplicate it has already
+    /// stored), so the same id arriving twice must notify once.
+    recent: VecDeque<PlayKey>,
+    /// When each messenger last cued.
+    last_cue: HashMap<Provider, Instant>,
+}
+
+impl Notifier {
+    /// Read every configured sound file once, so a typo'd path is one log line
+    /// at startup instead of a failed read per incoming message. An unreadable
+    /// path mutes that messenger and nothing else.
+    pub fn new(config: &NotificationsConfig) -> Self {
+        let mut sounds = HashMap::new();
+
+        for provider in Provider::all() {
+            let provider = *provider;
+            // Absent or blank is the same thing: this messenger is silent.
+            let Some(path) = config.sound_for(provider) else {
+                continue;
+            };
+
+            match std::fs::read(path) {
+                Ok(bytes) => {
+                    debug!(?provider, bytes = bytes.len(), "notification sound loaded");
+                    sounds.insert(provider, Arc::from(bytes.into_boxed_slice()));
+                }
+                Err(err) => warn!(
+                    ?provider,
+                    path = %path.display(),
+                    error = %err,
+                    "notification sound could not be read; this messenger will be silent"
+                ),
+            }
+        }
+
+        Self {
+            sound: config.sound,
+            sounds,
+            debounce: Duration::from_millis(config.debounce_ms),
+            recent: VecDeque::new(),
+            last_cue: HashMap::new(),
+        }
+    }
+
+    /// The cue to play for `notice`, or `None` if this message stays silent.
+    ///
+    /// `now` is passed in rather than read here so the cooldown is testable
+    /// without sleeping.
+    pub fn cue(&mut self, notice: &Notice, now: Instant) -> Option<Arc<[u8]>> {
+        if !self.sound {
+            return None;
+        }
+
+        // No file for this messenger: muted, whether that means the user never
+        // configured one or the file could not be read.
+        let bytes = self.sounds.get(&notice.provider)?.clone();
+
+        let key = PlayKey {
+            chat: notice.chat.clone(),
+            message_id: notice.message_id.clone(),
+        };
+
+        // Remember the id *before* the cooldown check, so a message suppressed
+        // by the cooldown is still deduplicated: a redelivery of it must not
+        // sneak a cue through once the window closes.
+        if self.recent.contains(&key) {
+            debug!(?key, "notification suppressed: message already announced");
+            return None;
+        }
+
+        self.recent.push_back(key);
+
+        if self.recent.len() > RECENT_IDS {
+            self.recent.pop_front();
+        }
+
+        if let Some(last) = self.last_cue.get(&notice.provider)
+            && now.duration_since(*last) < self.debounce
+        {
+            debug!(
+                ?notice.provider,
+                "notification suppressed: inside the per-messenger cooldown"
+            );
+            return None;
+        }
+
+        self.last_cue.insert(notice.provider, now);
+        Some(bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::backend::{MediaKind, MessageId, MessageMedia};
+    use std::path::{Path, PathBuf};
 
     /// An inbound text message. Tests only vary what a notice is meant to react
     /// to, so everything else is fixed.
@@ -130,6 +259,38 @@ mod tests {
     fn with_media(mut message: Message, media: MessageMedia) -> Message {
         message.media = Some(media);
         message
+    }
+
+    /// An inbound message with an explicit id, for the deduplication rules.
+    fn message_from(chat: ChatId, id: &str) -> Message {
+        let mut message = message(chat, "Alice", "hi");
+        message.message_id = MessageId::from(id);
+        message
+    }
+
+    /// The repo's own one-second wav, standing in for a user's sound file.
+    fn tone_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tui/player/engine/fixtures/tone.wav")
+    }
+
+    fn notifier(sound: bool, debounce_ms: u64, sounds: &[(Provider, PathBuf)]) -> Notifier {
+        Notifier::new(&NotificationsConfig {
+            os: false,
+            sound,
+            debounce_ms,
+            sounds: sounds.iter().map(|(p, path)| (*p, path.clone())).collect(),
+        })
+    }
+
+    fn notice_for(chat: ChatId, id: &str) -> Notice {
+        notice_from(Provider::Telegram, chat, id)
+    }
+
+    fn notice_from(provider: Provider, chat: ChatId, id: &str) -> Notice {
+        let notice = to_notice(&message_from(chat, id), provider, "Alice", false)
+            .expect("a background message is worth a notice");
+        assert_eq!(notice.provider, provider);
+        notice
     }
 
     #[test]
@@ -291,5 +452,182 @@ mod tests {
         assert_eq!(notice.body.chars().count(), MAX_BODY_CHARS);
         assert_eq!(notice.title.chars().count(), MAX_TITLE_CHARS);
         assert!(notice.body.chars().all(|c| c == 'á'));
+    }
+
+    #[test]
+    fn the_sound_switch_mutes_every_messenger() {
+        let mut notifier = notifier(false, 0, &[(Provider::Telegram, tone_path())]);
+
+        assert!(
+            notifier
+                .cue(&notice_for(ChatId::Telegram(1), "a"), Instant::now())
+                .is_none(),
+            "sound = false must silence a configured messenger too"
+        );
+    }
+
+    #[test]
+    fn a_messenger_without_a_sound_file_is_muted() {
+        let mut notifier = notifier(true, 0, &[(Provider::Telegram, tone_path())]);
+
+        assert!(
+            notifier
+                .cue(
+                    &notice_from(Provider::WhatsApp, ChatId::Telegram(1), "a"),
+                    Instant::now()
+                )
+                .is_none(),
+            "a messenger with no configured sound stays silent"
+        );
+        assert!(
+            notifier
+                .cue(
+                    &notice_from(Provider::Telegram, ChatId::Telegram(2), "b"),
+                    Instant::now()
+                )
+                .is_some(),
+            "one messenger's sound must not depend on another's"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_sound_file_mutes_only_its_own_messenger() {
+        let mut notifier = notifier(
+            true,
+            0,
+            &[
+                (
+                    Provider::Telegram,
+                    PathBuf::from("/nonexistent/sender/tone.wav"),
+                ),
+                (Provider::WhatsApp, tone_path()),
+            ],
+        );
+
+        assert!(
+            notifier
+                .cue(&notice_for(ChatId::Telegram(1), "a"), Instant::now())
+                .is_none(),
+            "a path that could not be read leaves that messenger silent"
+        );
+    }
+
+    #[test]
+    fn a_redelivered_message_cues_once() {
+        let mut notifier = notifier(true, 0, &[(Provider::Telegram, tone_path())]);
+        let now = Instant::now();
+
+        assert!(
+            notifier
+                .cue(&notice_for(ChatId::Telegram(1), "dup"), now)
+                .is_some(),
+            "the first delivery announces"
+        );
+        assert!(
+            notifier
+                .cue(&notice_for(ChatId::Telegram(1), "dup"), now)
+                .is_none(),
+            "providers redeliver messages; the second copy must stay silent"
+        );
+    }
+
+    #[test]
+    fn a_burst_within_the_window_collapses_to_one_cue() {
+        let mut notifier = notifier(true, 1500, &[(Provider::Telegram, tone_path())]);
+        let start = Instant::now();
+
+        assert!(
+            notifier
+                .cue(&notice_for(ChatId::Telegram(1), "a"), start)
+                .is_some()
+        );
+        for (n, id) in ["b", "c", "d"].iter().enumerate() {
+            let at = start + Duration::from_millis(200 * (n as u64 + 1));
+            assert!(
+                notifier
+                    .cue(&notice_for(ChatId::Telegram(1), id), at)
+                    .is_none(),
+                "a group dump must not become a cue storm"
+            );
+        }
+
+        // Past the window, a new message is news again.
+        assert!(
+            notifier
+                .cue(
+                    &notice_for(ChatId::Telegram(1), "e"),
+                    start + Duration::from_millis(1500)
+                )
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_zero_window_cues_every_message() {
+        let mut notifier = notifier(true, 0, &[(Provider::Telegram, tone_path())]);
+        let now = Instant::now();
+
+        for id in ["a", "b", "c"] {
+            assert!(
+                notifier
+                    .cue(&notice_for(ChatId::Telegram(1), id), now)
+                    .is_some(),
+                "debounce_ms = 0 opts out of coalescing"
+            );
+        }
+    }
+
+    #[test]
+    fn the_window_is_per_messenger() {
+        let mut notifier = notifier(
+            true,
+            1500,
+            &[
+                (Provider::Telegram, tone_path()),
+                (Provider::WhatsApp, tone_path()),
+            ],
+        );
+        let now = Instant::now();
+
+        let whatsapp = notice_from(Provider::WhatsApp, ChatId::Telegram(2), "wa");
+
+        assert!(
+            notifier
+                .cue(&notice_for(ChatId::Telegram(1), "tg"), now)
+                .is_some()
+        );
+        assert!(
+            notifier.cue(&whatsapp, now).is_some(),
+            "Telegram's cue must not consume WhatsApp's window"
+        );
+        assert!(
+            notifier
+                .cue(&notice_for(ChatId::Telegram(3), "tg2"), now)
+                .is_none(),
+            "Telegram is still inside its own window"
+        );
+    }
+
+    #[test]
+    fn the_remembered_ids_are_bounded() {
+        let mut notifier = notifier(true, 0, &[(Provider::Telegram, tone_path())]);
+        let now = Instant::now();
+
+        for n in 0..=RECENT_IDS {
+            let id = format!("m{n}");
+            assert!(
+                notifier
+                    .cue(&notice_for(ChatId::Telegram(1), &id), now)
+                    .is_some()
+            );
+        }
+
+        // The very first id has been pushed out of the ring, so a redelivery of
+        // it is treated as new rather than growing the ring forever.
+        assert!(
+            notifier
+                .cue(&notice_for(ChatId::Telegram(1), "m0"), now)
+                .is_some()
+        );
     }
 }

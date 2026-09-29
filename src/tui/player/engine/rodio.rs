@@ -279,6 +279,10 @@ impl Timing {
 pub struct RodioEngine {
     stream: Option<OutputStream>,
     sink: Option<Sink>,
+    /// The notification cue's own sink, on the *same* mixer as the media sink.
+    /// A second sink is what guarantees the session's sink, position and
+    /// retained bytes are physically untouched by a cue.
+    cue_sink: Option<Sink>,
     current: Option<Loaded>,
     bytes: Option<Vec<u8>>,
     timing: Timing,
@@ -289,6 +293,10 @@ pub struct RodioEngine {
     headless: bool,
     #[cfg(test)]
     virtual_output: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
+    /// The cue's counterpart to `virtual_output`: a headless cue sink is
+    /// standalone too, so it needs its own drain thread.
+    #[cfg(test)]
+    cue_virtual_output: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
 }
 
 impl Default for RodioEngine {
@@ -296,6 +304,7 @@ impl Default for RodioEngine {
         Self {
             stream: None,
             sink: None,
+            cue_sink: None,
             current: None,
             bytes: None,
             timing: Timing::default(),
@@ -304,6 +313,8 @@ impl Default for RodioEngine {
             headless: false,
             #[cfg(test)]
             virtual_output: None,
+            #[cfg(test)]
+            cue_virtual_output: None,
         }
     }
 }
@@ -322,6 +333,14 @@ impl RodioEngine {
     #[cfg(test)]
     fn stop_virtual_output(&mut self) {
         if let Some((done, drain)) = self.virtual_output.take() {
+            done.store(true, Ordering::Relaxed);
+            let _ = drain.join();
+        }
+    }
+
+    #[cfg(test)]
+    fn stop_cue_virtual_output(&mut self) {
+        if let Some((done, drain)) = self.cue_virtual_output.take() {
             done.store(true, Ordering::Relaxed);
             let _ = drain.join();
         }
@@ -477,10 +496,71 @@ impl MediaEngine for RodioEngine {
 
         self.sink.take();
         self.stream.take();
+        // The cue sink rides this stream's mixer, so it dies with it.
+        self.cue_sink.take();
+        #[cfg(test)]
+        self.stop_cue_virtual_output();
         self.current = None;
         self.bytes = None;
         self.timing.stop();
         self.status = PlayState::Stopped;
+    }
+
+    fn is_busy(&self) -> bool {
+        // A session that reached EOF has no `current` and is not playing, so it
+        // is idle here: the user is listening to nothing, and a cue must not
+        // cost them the replay.
+        self.current.is_some() || self.status == PlayState::Playing
+    }
+
+    fn play_cue(&mut self, bytes: &[u8]) -> Result<(), String> {
+        // The gate comes before the decode: a cue during playback is dropped,
+        // never queued. A cue deferred behind a long voice note fires at an
+        // arbitrary moment, which is worse than silence.
+        if self.is_busy() {
+            debug!("notification cue dropped: a media session is loaded or playing");
+            return Ok(());
+        }
+
+        let decoded = decode(bytes)?;
+
+        // Reclaim the previous cue's sink rather than appending to it: a rodio
+        // sink keeps finished sources queued, so reusing one would grow without
+        // bound. This is the bounded tail — no second poller, the sink goes when
+        // the next cue arrives.
+        self.cue_sink = None;
+
+        #[cfg(test)]
+        if self.headless {
+            self.stop_cue_virtual_output();
+            let (sink, output) = Sink::new();
+            self.cue_virtual_output = Some(drain_in_real_time(output));
+            sink.append(decoded.source);
+            sink.play();
+            self.cue_sink = Some(sink);
+            debug!("notification cue playing");
+            return Ok(());
+        }
+
+        // The mixer lives on the stream, so a cue arriving before any media
+        // playback has to open the output device itself. `open_output` also
+        // (re)creates the media sink, which stays idle: `status()` only inspects
+        // it while a session is playing.
+        if self.stream.is_none() {
+            self.open_output()?;
+        }
+
+        let Some(stream) = &self.stream else {
+            return Err("the audio output has no mixer for the notification cue".to_string());
+        };
+
+        let sink = Sink::connect_new(stream.mixer());
+        sink.append(decoded.source);
+        sink.play();
+        self.cue_sink = Some(sink);
+        debug!("notification cue playing");
+
+        Ok(())
     }
 
     fn position(&self) -> f64 {
@@ -768,5 +848,138 @@ mod tests {
         engine.play();
         assert_eq!(engine.status(), PlayState::Stopped);
         assert_eq!(engine.position(), 0.0);
+    }
+
+    #[test]
+    fn a_cue_on_an_idle_engine_plays_without_becoming_a_session() {
+        let mut engine = RodioEngine::headless();
+        assert!(!engine.is_busy());
+
+        engine
+            .play_cue(TONE_WAV)
+            .expect("an idle engine plays the cue");
+
+        // The cue is audible: its sink drains and empties on the virtual output.
+        wait_until(Duration::from_secs(3), || {
+            engine.cue_sink.as_ref().is_some_and(rodio::Sink::empty)
+        });
+
+        // ...and completely invisible to the session the UI mirrors.
+        assert_eq!(engine.status(), PlayState::Stopped);
+        assert_eq!(engine.position(), 0.0);
+        assert_eq!(engine.duration(), 0.0);
+        assert!(engine.current.is_none());
+        assert!(engine.bytes.is_none());
+    }
+
+    #[test]
+    fn a_cue_never_disturbs_a_loaded_session() {
+        let mut engine = RodioEngine::headless();
+
+        engine.load(VOICE_OGG).unwrap();
+        engine.seek(1.0);
+        assert!(engine.is_busy(), "a loaded session counts as busy");
+
+        // Dropped, not queued — and reported as a success, because dropping is
+        // the intended behaviour rather than a failure.
+        engine
+            .play_cue(TONE_WAV)
+            .expect("a busy engine drops the cue");
+        assert!(
+            engine.cue_sink.is_none(),
+            "a dropped cue must not be queued"
+        );
+
+        // The session is exactly as it was: the bytes that make the space bar
+        // replay a finished voice note, the position, and the status.
+        assert_eq!(engine.status(), PlayState::Paused);
+        assert!((engine.position() - 1.0).abs() < 0.05);
+        assert!(engine.bytes.is_some(), "the replayable bytes must survive");
+        assert!(engine.current.is_some());
+    }
+
+    #[test]
+    fn a_cue_never_interrupts_playback() {
+        let mut engine = RodioEngine::headless();
+
+        engine.load(VOICE_OGG).unwrap();
+        engine.play();
+        wait_until(Duration::from_secs(3), || engine.position() > 0.05);
+        assert_eq!(engine.status(), PlayState::Playing);
+
+        let before = engine.position();
+        engine
+            .play_cue(TONE_WAV)
+            .expect("a playing engine drops the cue");
+
+        assert!(engine.cue_sink.is_none());
+        assert_eq!(engine.status(), PlayState::Playing);
+        // The voice note kept going rather than being replaced or restarted.
+        assert!(
+            engine.position() >= before,
+            "the session position must not move backwards"
+        );
+    }
+
+    #[test]
+    fn a_cue_after_eof_still_leaves_the_session_replayable() {
+        let mut engine = RodioEngine::headless();
+
+        engine.load(VOICE_OGG).unwrap();
+        engine.play();
+        wait_until(Duration::from_secs(5), || {
+            engine.status() == PlayState::Stopped
+        });
+
+        // EOF: nothing is playing, the session is finished but its bytes are
+        // retained. This is the one non-busy state with a session attached, and
+        // the space bar must still replay it afterwards.
+        assert!(!engine.is_busy());
+        let eof_position = engine.position();
+
+        engine
+            .play_cue(TONE_WAV)
+            .expect("a finished session does not block a cue");
+        wait_until(Duration::from_secs(3), || {
+            engine.cue_sink.as_ref().is_some_and(rodio::Sink::empty)
+        });
+
+        assert!(
+            (engine.position() - eof_position).abs() < 0.05,
+            "the cue must not move the finished session's position"
+        );
+        assert!(engine.bytes.is_some());
+
+        engine.play();
+        assert_eq!(
+            engine.status(),
+            PlayState::Playing,
+            "the voice note must still be replayable after a cue"
+        );
+    }
+
+    #[test]
+    fn a_cue_with_undecodable_bytes_reports_an_error() {
+        let mut engine = RodioEngine::headless();
+
+        // Not busy, so the bytes are actually decoded and the failure surfaces.
+        let err = engine
+            .play_cue(b"definitely not audio")
+            .expect_err("garbage must not be reported as a played cue");
+        assert!(err.contains("decode") || err.contains("audio"), "got {err}");
+        assert_eq!(engine.status(), PlayState::Stopped);
+    }
+
+    #[test]
+    fn a_second_cue_replaces_the_finished_cue_sink() {
+        let mut engine = RodioEngine::headless();
+
+        engine.play_cue(TONE_WAV).unwrap();
+        let first = engine.cue_sink.as_ref().map(|s| s.len());
+        engine.play_cue(TONE_WAV).unwrap();
+
+        // A fresh sink, not a queue growing inside the old one.
+        assert_eq!(engine.cue_sink.as_ref().map(|s| s.len()), first);
+        assert_eq!(engine.status(), PlayState::Stopped);
     }
 }

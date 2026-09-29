@@ -16,6 +16,9 @@ pub struct ChatWidget<'a> {
     /// Whether the terminal window has the OS focus. Dims the pane when false,
     /// without disturbing which pane `focus` points at.
     focused: bool,
+    // BUG: i can't seem to use kitty's unicode_input anymore
+    // map --allow-fallback=shifted,ascii ctrl+. kitten unicode_input --tab=name
+    // this was working...
     write: &'a mut TextArea<'static>,
     max_write_lines: usize,
     /// Precomputed bottom-title search bar (empty when no search is active).

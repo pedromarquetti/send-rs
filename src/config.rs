@@ -94,13 +94,6 @@ impl NotificationsConfig {
     /// The sound file configured for `provider`, or `None` when that messenger
     /// has no sound: the key is absent, or the path is blank. Every consumer goes
     /// through this so "no sound for this messenger" means one thing.
-    // Its consumer lands with the notification cues; the compiler nags to drop
-    // this expectation as soon as that happens. Test builds already allow
-    // dead code (`main.rs`), so the expectation only applies to the binary.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "unused until the notification cues are wired")
-    )]
     pub fn sound_for(&self, provider: Provider) -> Option<&Path> {
         let configured = self.sounds.get(&provider)?;
 

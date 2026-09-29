@@ -21,11 +21,15 @@ use crate::backend::{
 };
 use crate::config::{Config, Keymap};
 use crate::helpers::available_message_actions;
+use crate::notify::Notifier;
 use crate::tui::chat::chat_list::ChatList;
 use crate::tui::chat::chat_widget::ChatWidget;
 use crate::tui::image::ImageWidgetState;
 use crate::tui::loading::{LoadingArea, LoadingWidget};
-use crate::tui::player::{PlayKey, PlayState, PlaybackState, Player, RodioEngine};
+// Re-exported so the notifier can key its deduplication on the same message
+// identity the player uses, without reaching into a private module.
+pub use crate::tui::player::PlayKey;
+use crate::tui::player::{PlayState, PlaybackState, Player, RodioEngine};
 use crate::tui::popup::{AudioPopup, ImagePopup, PopupKind};
 use crate::tui::settings::Settings;
 use crate::tui::state::{AppState, AudioAction, Focus, Mode, Screen};
@@ -440,7 +444,7 @@ async fn run_app(
 
                         // Asked before the event is consumed: the notice reads
                         // the pre-update chat list, which is exactly the state
-                        // the event is about to act on. 
+                        // the event is about to act on.
                         let notice = match &backend_event {
                             BackendEvent::MessageReceived(message) => {
                                 app.state.notice_for_message(provider, message)
@@ -450,8 +454,12 @@ async fn run_app(
 
                         app.state.handle_backend_event(provider, backend_event);
 
-                        if let Some(notice) = notice {
-                            debug!(?notice, "TUI notification candidate");
+                        if let Some(notice) = notice
+                            && let Some(cue) = app.notifier.cue(&notice, Instant::now())
+                        {
+                            // Non-blocking, and the engine drops the cue if the
+                            // user is listening to something.
+                            app.player.cue(cue);
                         }
 
                         // On a newly established connection (e.g. WhatsApp just
@@ -628,6 +636,7 @@ struct App {
     state: AppState,
     picker: Picker,
     player: Player,
+    notifier: Notifier,
     tx: mpsc::UnboundedSender<UiEvent>,
     chat_load_task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -641,10 +650,14 @@ impl App {
         picker: Picker,
         tx: mpsc::UnboundedSender<UiEvent>,
     ) -> Self {
+        // Built from the config before it is handed to the state: the sound
+        // files are read once, here, not on the first message.
+        let notifier = Notifier::new(&config.notifications);
         Self {
             state: AppState::new(config, keymap, messengers, open_settings).await,
             picker,
             player: Player::new(|| Box::new(RodioEngine::default()), tx.clone()),
+            notifier,
             tx,
             chat_load_task: None,
         }

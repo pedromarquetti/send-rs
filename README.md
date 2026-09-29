@@ -159,11 +159,6 @@ New messages in chats you are **not** currently viewing can raise a sound cue
 and/or your OS's own notification. Both are off by default, and every key is
 optional — a config file without a `[notifications]` table stays silent.
 
-> [!NOTE]
-> The `[notifications]` table is already read and saved, but the sound and OS
-> notification output is wired up in the phases after this one — until then both
-> switches are inert.
-
 | Key                         | Default | Description                                                                                                                                                                                                                                  |
 | --------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `notifications.os`          | `false` | Global on/off switch for the **OS** notification (D-Bus toast / banner). Off means no desktop notification is ever requested, on any platform.                                                                                               |
