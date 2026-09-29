@@ -76,7 +76,7 @@ recording.
 - [x] Audio playback
 - [ ] Send images - TODO: check if possible: send images + "paste to send"
 - [x] Send audio
-- [ ] Support for notifications
+- [x] Support for notifications
 - [x] Ordered chat list - All chats, ordered by pinned/most recent.
 - [ ] Dedicated chatlist for each provider
 - [x] Chat List/Message search.
@@ -163,8 +163,16 @@ optional — a config file without a `[notifications]` table stays silent.
 | --------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `notifications.os`          | `false` | Global on/off switch for the **OS** notification (D-Bus toast / banner). Off means no desktop notification is ever requested, on any platform.                                                                                               |
 | `notifications.sound`       | `false` | Global on/off switch for the **sound cue**. The two switches are independent, so you can run sound-only (no session bus needed) or notifications-only.                                                                                       |
-| `notifications.debounce_ms` | `1500`  | How long one messenger coalesces a burst of new messages into a single cue. A group that drops 20 messages at once plays one sound. Use `0` to play a cue for **every** message.                                                             |
+| `notifications.debounce_ms` | `1500`  | How long one messenger coalesces a burst of new messages into a single notification. A group that drops 20 messages at once produces one sound _and_ one desktop notification. Use `0` to notify on **every** message.                       |
 | `notifications.sounds`      | `{}`    | Per-messenger sound file, keyed by messenger name (`telegram`, `whatsapp`). **A messenger with no entry plays no sound** — this is how you silence one messenger only. A blank value (`""`) counts as no sound, same as leaving the key out. |
+
+What happens per message: a provider that redelivers a message you already got
+announces it once, and a message in the chat you are currently reading is never
+announced. A cue never interrupts audio — it is dropped, not queued, while a
+voice note is loaded or playing — and when a cue really was played the desktop
+notification is shown silently, so one message makes one noise. A sound file
+that is missing (or unreadable) mutes that messenger's _cue_ only; its desktop
+notifications still arrive.
 
 Sound files go through the same decoder as the audio popup, so any format that
 plays in the popup plays here too (`wav`, `mp3`, `flac`, `m4a`, `ogg`;

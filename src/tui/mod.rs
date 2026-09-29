@@ -10,6 +10,7 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::widgets::{StatefulWidget, Widget};
 use ratatui::{DefaultTerminal, Frame};
 use ratatui_image::picker::{Picker, ProtocolType};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, MissedTickBehavior};
@@ -21,7 +22,7 @@ use crate::backend::{
 };
 use crate::config::{Config, Keymap};
 use crate::helpers::available_message_actions;
-use crate::notify::Notifier;
+use crate::notify::{DesktopNotifier, Notifier};
 use crate::tui::chat::chat_list::ChatList;
 use crate::tui::chat::chat_widget::ChatWidget;
 use crate::tui::image::ImageWidgetState;
@@ -454,12 +455,31 @@ async fn run_app(
 
                         app.state.handle_backend_event(provider, backend_event);
 
-                        if let Some(notice) = notice
-                            && let Some(cue) = app.notifier.cue(&notice, Instant::now())
-                        {
-                            // Non-blocking, and the engine drops the cue if the
-                            // user is listening to something.
-                            app.player.cue(cue);
+                        if let Some(notice) = notice {
+                            let dispatch = app.notifier.dispatch(&notice, Instant::now());
+                            // One message, one noise: a desktop notification
+                            // only stays silent if we really did play a cue.
+                            let played_cue = dispatch.cue.is_some();
+
+                            if let Some(desktop) = dispatch.os {
+                                // Showing a notification is a blocking round
+                                // trip to the session bus, so it must not run
+                                // on the event loop. The result is logged and
+                                // dropped: a failed toast is not worth
+                                // interrupting the user for.
+                                let notice = notice.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    if let Err(error) = desktop.notify(&notice, played_cue) {
+                                        warn!(%error, "OS notification failed");
+                                    }
+                                });
+                            }
+
+                            if let Some(cue) = dispatch.cue {
+                                // Non-blocking, and the engine drops the cue if
+                                // the user is listening to something.
+                                app.player.cue(cue);
+                            }
                         }
 
                         // On a newly established connection (e.g. WhatsApp just
@@ -652,7 +672,7 @@ impl App {
     ) -> Self {
         // Built from the config before it is handed to the state: the sound
         // files are read once, here, not on the first message.
-        let notifier = Notifier::new(&config.notifications);
+        let notifier = Notifier::new(&config.notifications, Arc::new(DesktopNotifier));
         Self {
             state: AppState::new(config, keymap, messengers, open_settings).await,
             picker,
