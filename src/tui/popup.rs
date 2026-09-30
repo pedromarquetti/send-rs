@@ -1,11 +1,12 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Clear, Paragraph};
+use std::fmt::Debug;
 use std::time::Instant;
 
 use crate::backend::{Message, MessageAction};
 use crate::helpers::{calc_height, popup_area, wrap_text};
 use crate::tui::chat::chat_widget::format_timestamp;
-use crate::tui::image::{ImageWidget, ImageWidgetState};
+use crate::tui::image::{ImageWidget, ImageWidgetState, VideoWidget, VideoWidgetState};
 use crate::tui::player::{PlayState, PlaybackState};
 use crate::tui::state::PopupState;
 
@@ -18,6 +19,10 @@ pub enum PopupKind {
     Message(Message),
     Image(ImagePopup),
     Audio(AudioPopup),
+    // Opened by the later wiring phase; each video item below carries its own
+    // `allow(dead_code)` until then.
+    #[allow(dead_code)]
+    Video(VideoPopup),
     Question(String),
 }
 
@@ -26,7 +31,7 @@ pub struct ImagePopup {
     pub view: ImageWidgetState,
 }
 
-impl std::fmt::Debug for ImagePopup {
+impl Debug for ImagePopup {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ImagePopup")
             .field("msg", &self.msg)
@@ -47,9 +52,35 @@ pub struct AudioPopup {
     pub error_note: Option<String>,
 }
 
-impl std::fmt::Debug for AudioPopup {
+impl Debug for AudioPopup {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AudioPopup")
+            .field("msg", &self.msg)
+            .field("playback", &self.playback)
+            .field("error_note", &self.error_note)
+            .finish()
+    }
+}
+
+/// Video playback popup. `view` is the frame viewport fed by the engine's
+/// latest-frame slot; `playback` is the per-frame mirror of the live session,
+/// exactly as in [`AudioPopup`].
+#[allow(dead_code)]
+pub struct VideoPopup {
+    pub msg: Message,
+    pub view: VideoWidgetState,
+    pub playback: Option<PlaybackState>,
+    /// As in [`AudioPopup`]: no ffmpeg on the system, an undecodable
+    /// container, a download that never arrived.
+    pub error_note: Option<String>,
+}
+
+// `VideoWidgetState` is not `Debug`, hence the manual impl rather than a
+// derive, mirroring `ImagePopup`/`AudioPopup`.
+#[allow(dead_code)]
+impl Debug for VideoPopup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VideoPopup")
             .field("msg", &self.msg)
             .field("playback", &self.playback)
             .field("error_note", &self.error_note)
@@ -368,26 +399,7 @@ impl StatefulWidget for &mut PopUp {
 
                 let mut content_lines: Vec<Line> = Vec::new();
 
-                let (status_icon, elapsed, duration, ratio) = match playback {
-                    Some(p) if p.status == PlayState::Error => ("⚠", p.position, p.duration, 0.0),
-                    Some(p) => {
-                        let now = Instant::now();
-                        let pos = p.display_position(now);
-                        let ratio = if p.duration > 0.0 {
-                            (pos / p.duration).clamp(0.0, 1.0)
-                        } else {
-                            0.0
-                        };
-                        let icon = match p.status {
-                            PlayState::Playing => "▶",
-                            PlayState::Paused | PlayState::Stopped => "⏸",
-                            PlayState::Loading => "…",
-                            PlayState::Error => "⚠",
-                        };
-                        (icon, pos, p.duration, ratio)
-                    }
-                    None => ("…", 0.0, 0.0, 0.0),
-                };
+                let (status_icon, elapsed, duration, ratio) = playback_status(playback.as_ref());
 
                 let progress = progress_strip(ratio, content_width);
 
@@ -462,7 +474,155 @@ impl StatefulWidget for &mut PopUp {
                 Paragraph::new(hint).render(split[1], buf);
                 Paragraph::new(options_line).render(split[2], buf);
             }
+
+            #[allow(dead_code)]
+            PopupKind::Video(VideoPopup {
+                msg,
+                view,
+                playback,
+                error_note,
+            }) => {
+                let max_width = area.width.saturating_sub(2);
+                let width = ((area.width as u32 * 9 / 10) as u16)
+                    .clamp(30.min(max_width), max_width.max(30));
+
+                let mut block = Block::bordered()
+                    .title(format!(
+                        " {} {} ",
+                        msg.sender,
+                        format_timestamp(msg.timestamp)
+                    ))
+                    .border_style(border_style);
+
+                block = match error_note {
+                    Some(note) => block.title_bottom(format!(" ⚠ {note} ")),
+                    None => block,
+                };
+
+                let caption_lines: Vec<Line> = msg
+                    .media
+                    .as_ref()
+                    .and_then(|media| media.caption.clone())
+                    .filter(|caption| !caption.trim().is_empty())
+                    .map(|caption| {
+                        caption
+                            .lines()
+                            .flat_map(|line| {
+                                wrap_text(line, width.saturating_sub(2) as usize)
+                                    .into_iter()
+                                    .map(|chunk| Line::from(Span::raw(chunk)))
+                                    .collect::<Vec<_>>()
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                // The frame viewport gets whatever is left after the four
+                // fixed rows below (status, progress, actions, hint) and the
+                // caption, so a long caption shrinks the video rather than
+                // pushing the fixed rows off the popup. `MIN_VIDEO_ROWS`
+                // matters: sizing the popup to exactly `6 + caption_rows`
+                // would leave the frame nothing to draw.
+                const FIXED_ROWS: usize = 4;
+                const MIN_VIDEO_ROWS: usize = 3;
+
+                let max_height = ((area.height as u32 * 9 / 10) as u16)
+                    .min(area.height.saturating_sub(1))
+                    .max(8);
+                let caption_budget = max_height
+                    .saturating_sub(2 + FIXED_ROWS as u16 + MIN_VIDEO_ROWS as u16)
+                    as usize;
+                let caption_rows = caption_lines.len().min(caption_budget);
+
+                let popup_height = max_height
+                    .min((2 + FIXED_ROWS + MIN_VIDEO_ROWS + caption_rows) as u16)
+                    .max(8);
+                let popup_area = popup_area(area, width, popup_height);
+
+                Clear.render(popup_area, buf);
+                Widget::render(&block, popup_area, buf);
+
+                let inner = popup_area.inner(Margin {
+                    vertical: 1,
+                    horizontal: 1,
+                });
+
+                let split = Layout::vertical([
+                    Constraint::Fill(1),
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                    Constraint::Length(caption_rows as u16),
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                ])
+                .split(inner);
+
+                VideoWidget.render(split[0], buf, view);
+
+                let (status_icon, elapsed, duration, ratio) = playback_status(playback.as_ref());
+
+                let duration_label = if duration > 0.0 {
+                    format_duration(duration)
+                } else {
+                    "--:--".to_string()
+                };
+
+                Paragraph::new(Line::from(Span::styled(
+                    format!(
+                        "  {status_icon} Video · {} / {duration_label}",
+                        format_duration(elapsed)
+                    ),
+                    border_style.add_modifier(Modifier::BOLD),
+                )))
+                .render(split[1], buf);
+
+                Paragraph::new(progress_strip(ratio, width.saturating_sub(2) as usize))
+                    .render(split[2], buf);
+
+                // Scrolls independently of the frame viewport above it, so
+                // long captions stay readable without moving the video.
+                state.scroll_idx = state
+                    .scroll_idx
+                    .min(caption_lines.len().saturating_sub(caption_rows));
+
+                Paragraph::new(caption_lines)
+                    .scroll((state.scroll_idx as u16, 0))
+                    .render(split[3], buf);
+
+                Paragraph::new(message_actions_line(msg)).render(split[4], buf);
+
+                Paragraph::new(Line::from(Span::styled(
+                    "  space ▸ play/pause   < ▸ -5s   > ▸ +5s   esc ▸ close".to_string(),
+                    Style::default().fg(Color::DarkGray),
+                )))
+                .render(split[5], buf);
+            }
         }
+    }
+}
+
+/// Transport icon, displayed elapsed seconds, duration and progress ratio for
+/// a playback session. Shared by the audio and video popups so the two status
+/// lines cannot drift apart.
+fn playback_status(playback: Option<&PlaybackState>) -> (&'static str, f64, f64, f64) {
+    match playback {
+        Some(p) if p.status == PlayState::Error => ("⚠", p.position, p.duration, 0.0),
+        Some(p) => {
+            let pos = p.display_position(Instant::now());
+            let ratio = if p.duration > 0.0 {
+                (pos / p.duration).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let icon = match p.status {
+                PlayState::Playing => "▶",
+                PlayState::Paused | PlayState::Stopped => "⏸",
+                PlayState::Loading => "…",
+                PlayState::Error => "⚠",
+            };
+            (icon, pos, p.duration, ratio)
+        }
+        None => ("…", 0.0, 0.0, 0.0),
     }
 }
 

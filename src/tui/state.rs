@@ -1802,13 +1802,16 @@ mod tests {
     use crate::backend::mock::MockMessenger;
     use crate::backend::{MediaKind, Message, MessageAction, MessageId, MessageMedia, Messenger};
     use crate::config::KeymapConfig;
-    use crate::tui::image::ImageWidgetState;
+    use crate::tui::image::{ImageWidgetState, VideoWidgetState};
     use crate::tui::player::{PlayKey, PlayState, PlaybackState};
-    use crate::tui::popup::{AudioPopup, ImagePopup, PopUp};
+    use crate::tui::popup::{AudioPopup, ImagePopup, PopUp, VideoPopup};
     use ratatui::buffer::Buffer;
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
     use ratatui::layout::Rect;
     use ratatui::widgets::StatefulWidget;
+    use ratatui_image::picker::Picker;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
     use tokio::sync::broadcast;
 
     impl AppState {
@@ -4174,6 +4177,54 @@ mod tests {
         msg
     }
 
+    fn video_message(caption: &str) -> Message {
+        let mut msg = image_message();
+        msg.message_id = MessageId::from("video-1");
+        msg.media = Some(MessageMedia {
+            kind: MediaKind::Video,
+            caption: Some(caption.into()),
+            file_name: Some("clip.mp4".into()),
+        });
+        msg.msg_actions = vec![MessageAction::Reply, MessageAction::Delete];
+        msg
+    }
+
+    /// A popup whose video viewport has no frames yet, so the widget renders
+    /// its placeholder instead of an image protocol.
+    fn video_popup(
+        msg: Message,
+        playback: Option<PlaybackState>,
+        error_note: Option<String>,
+    ) -> PopupState {
+        let frames = Arc::new(Mutex::new(None));
+        let (wake, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let view = VideoWidgetState::new(frames, Picker::halfblocks(), wake);
+
+        PopupState {
+            popup_type: PopupKind::Video(VideoPopup {
+                msg,
+                view,
+                playback,
+                error_note,
+            }),
+            prev_focus: Focus::Chat,
+            scroll_idx: 0,
+        }
+    }
+
+    fn video_playback(status: PlayState, position: f64, duration: f64) -> PlaybackState {
+        PlaybackState {
+            source: PlayKey {
+                chat: ChatId::Myself,
+                message_id: MessageId::from("video-1"),
+            },
+            status,
+            position,
+            duration,
+            updated_at: Instant::now(),
+        }
+    }
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::from(code)
     }
@@ -4271,6 +4322,152 @@ mod tests {
         assert!(rendered.contains("00:12"), "elapsed time missing");
         assert!(rendered.contains("00:15"), "duration missing");
         assert!(rendered.contains("Reply"), "action bar missing");
+    }
+
+    #[tokio::test]
+    async fn video_popup_is_ninety_percent_and_centred() {
+        let mut popup = video_popup(
+            video_message("clip"),
+            Some(video_playback(PlayState::Playing, 3.0, 12.0)),
+            None,
+        );
+
+        let area = Rect::new(0, 0, 100, 30);
+        let mut buf = Buffer::empty(area);
+        let tag = app_state().await.chat_state.get_tag().unwrap_or("");
+        (&mut PopUp::new(tag)).render(area, &mut buf, &mut popup);
+
+        // The popup border is the outermost non-blank cell on each edge; the
+        // 90% clamp plus centring must leave a margin all the way round.
+        let blank = |x: u16, y: u16| buf[(x, y)].symbol() == " ";
+        let left = (0..area.width)
+            .find(|&x| (0..area.height).any(|y| !blank(x, y)))
+            .unwrap();
+        let right = (0..area.width)
+            .rev()
+            .find(|&x| (0..area.height).any(|y| !blank(x, y)))
+            .unwrap();
+        let top = (0..area.height)
+            .find(|&y| (0..area.width).any(|x| !blank(x, y)))
+            .unwrap();
+        let bottom = (0..area.height)
+            .rev()
+            .find(|&y| (0..area.width).any(|x| !blank(x, y)))
+            .unwrap();
+
+        assert_eq!(left, 5, "width clamped to 90% leaves a 5 column margin");
+        assert_eq!(right - left + 1, 90, "popup is not 90% of the width");
+        assert_eq!(right, 94);
+        assert!(top >= 1 && bottom <= 28, "popup not vertically centred");
+    }
+
+    #[tokio::test]
+    async fn video_popup_renders_progress_actions_and_hints() {
+        let mut popup = video_popup(
+            video_message("clip"),
+            Some(video_playback(PlayState::Playing, 3.0, 12.0)),
+            None,
+        );
+
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        let tag = app_state().await.chat_state.get_tag().unwrap_or("");
+        (&mut PopUp::new(tag)).render(area, &mut buf, &mut popup);
+
+        let rendered: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(
+            rendered.contains("Video · 00:03 / 00:12"),
+            "status line missing"
+        );
+        assert!(rendered.contains('█'), "progress strip missing");
+        assert!(rendered.contains("Reply"), "action bar missing");
+        assert!(rendered.contains("Delete"), "action bar missing delete");
+        assert!(rendered.contains("space ▸ play/pause"), "hint line missing");
+        assert!(rendered.contains("esc ▸ close"), "hint line missing close");
+    }
+
+    #[tokio::test]
+    async fn video_popup_caption_wraps_and_is_clipped_to_its_rows() {
+        // Deliberately far more caption than the popup can show, with a
+        // numbered word per token so the visible slice is identifiable.
+        let words: Vec<String> = (1..=300).map(|i| format!("w{i:03}")).collect();
+        let caption = words.join(" ");
+        let mut popup = video_popup(
+            video_message(&caption),
+            Some(video_playback(PlayState::Paused, 2.0, 12.0)),
+            None,
+        );
+
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        let tag = app_state().await.chat_state.get_tag().unwrap_or("");
+        (&mut PopUp::new(tag)).render(area, &mut buf, &mut popup);
+
+        let rendered: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(rendered.contains("w001"), "caption start missing");
+        assert!(
+            !rendered.contains("w300"),
+            "caption overflowed its reserved rows: the tail should be clipped"
+        );
+
+        // The fixed rows survive the long caption, and the frame viewport keeps
+        // its minimum height instead of collapsing to nothing.
+        assert!(rendered.contains("Reply"), "action bar was squeezed out");
+        assert!(rendered.contains("esc ▸ close"), "hint was squeezed out");
+        assert!(rendered.contains("⏸ Video · 00:02 / 00:12"), "status lost");
+        assert!(rendered.contains('█'), "progress strip was squeezed out");
+        assert!(
+            rendered.contains("Loading"),
+            "frame viewport collapsed to zero rows under a long caption"
+        );
+
+        // Scrolling past the caption's end clamps to the last full screen of
+        // text, so the tail is drawn instead of the viewport going blank.
+        popup.scroll_idx = 99;
+        (&mut PopUp::new(tag)).render(area, &mut buf, &mut popup);
+        let scrolled: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(
+            scrolled.contains("w300"),
+            "caption tail lost when over-scrolled (clamped to {})",
+            popup.scroll_idx
+        );
+    }
+
+    #[tokio::test]
+    async fn paused_video_without_duration_shows_icon_and_unknown_time() {
+        let mut popup = video_popup(
+            video_message("clip"),
+            Some(video_playback(PlayState::Paused, 0.0, 0.0)),
+            None,
+        );
+
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        let tag = app_state().await.chat_state.get_tag().unwrap_or("");
+        (&mut PopUp::new(tag)).render(area, &mut buf, &mut popup);
+
+        let rendered: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(
+            rendered.contains("⏸ Video · 00:00 / --:--"),
+            "paused icon or unknown duration missing: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn video_popup_renders_error_note_in_bottom_border() {
+        let mut popup = video_popup(
+            video_message("clip"),
+            Some(video_playback(PlayState::Error, 0.0, 0.0)),
+            Some("no ffmpeg on PATH".into()),
+        );
+
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        let tag = app_state().await.chat_state.get_tag().unwrap_or("");
+        (&mut PopUp::new(tag)).render(area, &mut buf, &mut popup);
+
+        let rendered: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(rendered.contains("no ffmpeg on PATH"), "error note missing");
     }
 
     #[tokio::test]
