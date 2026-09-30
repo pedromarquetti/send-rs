@@ -19,6 +19,7 @@
     - [Telegram (grammers / Telegram protocol)](#telegram-grammers-telegram-protocol)
     - [WhatsApp (whatsapp-rust / WhatsApp Web protocol)](#whatsapp-whatsapp-rust-whatsapp-web-protocol)
   - [Built with](#built-with)
+  - [Demo](#demo)
   - [Inspirations](#inspirations)
 
 <!--toc:end-->
@@ -253,6 +254,19 @@ libraries already support but senders has not wired up yet are not listed here.
 1. [grammers - Telegram/Rust integration](https://codeberg.org/Lonami/grammers)
 1. [whatsapp-rust](https://github.com/oxidezap/whatsapp-rust)
 1. [ratatui](https://ratatui.rs/)
+
+## Demo
+
+<details>
+  <summary>Screenshots of the app in Mock mode</summary>
+<img width="50%" alt="Message Popup" src="https://github.com/user-attachments/assets/536c518c-0819-4969-bb8f-bfc293e27942" />
+<img width="50%" alt="Replying to message" src="https://github.com/user-attachments/assets/7f4387c3-9fbd-4172-bd58-f34a49c9147a" />
+<img width="50%" alt="Editing Message" src="https://github.com/user-attachments/assets/c59dcaa5-b2a8-4296-9e2a-d8bdcf947f12" />
+<img width="50%"  alt="Recording Audio" src="https://github.com/user-attachments/assets/e1407344-cb0e-4365-a495-6646632d025d" />
+<img width="50%"  alt="Playing recorded audio" src="https://github.com/user-attachments/assets/5a07d0c1-db52-4be9-9994-50ad31a0382d" />
+  
+</details>
+
 
 ## Inspirations
 
