@@ -1173,8 +1173,13 @@ impl AppState {
         }
 
         // --- Enabling ---
-        // Verify API credentials exist
-        if !provider.has_credentials(&self.config.providers) {
+        // Verify API credentials exist (mock providers don't need credentials)
+        let is_mock = matches!(
+            self.provider_to_messenger(provider),
+            Some(MessengerKind::Mock(_, _))
+        );
+
+        if !is_mock && !provider.has_credentials(&self.config.providers) {
             self.create_popup(PopupKind::Error(format!(
                 "{}: configure credentials in config.toml first",
                 provider.name(),
@@ -1195,6 +1200,8 @@ impl AppState {
                     t.set_enabled(true);
                     m
                 }
+
+                MessengerKind::Mock(_, _) => m,
                 #[cfg(test)]
                 MessengerKind::Stub(_, _) => m,
             },

@@ -10,18 +10,43 @@ mod tui;
 
 use anyhow::Result;
 use backend::MessengerKind;
+use clap::Parser;
 use tracing::{error, info};
 
 use crate::{
-    backend::{telegram::TelegramMessenger, whatsapp::WhatsAppMessenger},
+    backend::{mock::MockMessenger, telegram::TelegramMessenger, whatsapp::WhatsAppMessenger},
     config::Config,
 };
 
-// TODO: Add:
-// 1 - Mock flag so the user can test the app without actually using wp/tg
-// 2 - Add screenshots
+/// Command-line arguments
+#[derive(Parser, Debug)]
+#[command(name = "sendrs", version, about = "Unified WhatsApp + Telegram TUI")]
+struct Args {
+    /// Run with mock providers (no credentials needed, demo data only)
+    #[arg(long, short)]
+    mock: bool,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+
+    // In mock mode, isolate config to a temp directory so we never touch
+    // the user's real config.toml, chats.json, session DBs, or wa.db.
+    if args.mock {
+        let mock_config_dir =
+            std::env::temp_dir().join(format!("senders-mock-{}", std::process::id()));
+
+        std::fs::create_dir_all(&mock_config_dir)?;
+
+        Config::set_config_dir_override(mock_config_dir.clone())?;
+
+        info!(
+            "Mock mode: using isolated config dir {}",
+            mock_config_dir.display()
+        );
+    }
+
     let log_path = dirs::data_local_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("sender")
@@ -76,7 +101,7 @@ async fn main() -> Result<()> {
     info!("stderr is not redirected on Windows: audio diagnostics may reach the console");
 
     let first_boot = !config::Config::exists();
-    let config = config::Config::load()?.unwrap_or_default();
+    let mut config = config::Config::load()?.unwrap_or_default();
     let keymap = config.keys.parse()?;
 
     if first_boot {
@@ -87,66 +112,82 @@ async fn main() -> Result<()> {
 
     let mut messengers: Vec<MessengerKind> = Vec::new();
 
-    // Initialize Telegram only when it is enabled or configured. A configured
-    // but disabled account is retained so it can be enabled or authenticated
-    // from settings; disabled providers are still excluded from chat loading.
-    // Dialogs are fetched lazily on first chat-list sync; per-chat operations
-    // self-heal against a cold dialog cache.
-    let telegram = &config.providers.telegram;
-    if telegram.enabled || telegram.has_credentials() {
-        if !telegram.has_credentials() {
-            info!("Telegram is enabled but has no credentials, skipping");
+    if args.mock {
+        // Mock mode: only initialize mock providers, skip real ones entirely.
+        // This gives a clean demo experience without credentials.
+        info!("Mock mode: initializing mock providers");
+
+        let tg_mock = MockMessenger::new("Telegram");
+        tg_mock.spawn_incoming_messages();
+        messengers.push(MessengerKind::Mock(backend::Provider::Telegram, tg_mock));
+
+        let wa_mock = MockMessenger::new("WhatsApp");
+        wa_mock.spawn_incoming_messages();
+        messengers.push(MessengerKind::Mock(backend::Provider::WhatsApp, wa_mock));
+
+        config.providers.telegram.enabled = true;
+        config.providers.whatsapp = true;
+    } else {
+        // normal, non-mock run
+        let telegram = &config.providers.telegram;
+        if telegram.enabled || telegram.has_credentials() {
+            if !telegram.has_credentials() {
+                info!("Telegram is enabled but has no credentials, skipping");
+            } else {
+                let session_dir = Config::user_config_dir()?;
+                match TelegramMessenger::new(
+                    session_dir,
+                    telegram.api_id,
+                    &telegram.api_hash,
+                    config.sync_update_state_secs,
+                    telegram.enabled,
+                )
+                .await
+                {
+                    Ok(tg) => {
+                        info!("Telegram messenger initialized");
+                        messengers.push(MessengerKind::Telegram(tg));
+                    }
+                    Err(e) => {
+                        error!("Telegram init failed: {e}");
+                    }
+                }
+            }
         } else {
-            let session_dir = Config::user_config_dir()?;
-            match TelegramMessenger::new(
-                session_dir,
-                telegram.api_id,
-                &telegram.api_hash,
-                config.sync_update_state_secs,
-                telegram.enabled,
-            )
-            .await
-            {
-                Ok(tg) => {
-                    info!("Telegram messenger initialized");
-                    messengers.push(MessengerKind::Telegram(tg));
+            info!("Telegram: disabled and not configured, skipping");
+        }
+
+        // Initialize WhatsApp when it is enabled. Unlike Telegram, WhatsApp pairing
+        // is event-driven (QR code), so the messenger is constructed unconditionally
+        // when enabled and the bot is started on first TUI subscription.
+        {
+            let whatsapp_path = Config::user_config_dir()?.join("wa.db");
+
+            if let Some(parent) = whatsapp_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+
+            match WhatsAppMessenger::new(whatsapp_path.to_string_lossy().to_string()).await {
+                Ok(wa) => {
+                    info!("WhatsApp messenger initialized");
+                    // Start the transport only when enabled; a disabled provider
+                    // stays inert (no connection, no QR) until the user enables it.
+                    if config.providers.whatsapp {
+                        wa.start();
+                    } else {
+                        info!("WhatsApp: enabled=false, keeping provider inactive");
+                    }
+                    messengers.push(MessengerKind::WhatsApp(wa));
                 }
                 Err(e) => {
-                    error!("Telegram init failed: {e}");
+                    error!("WhatsApp init failed: {e}");
                 }
-            }
-        }
-    } else {
-        info!("Telegram: disabled and not configured, skipping");
-    }
-
-    // Initialize WhatsApp when it is enabled. Unlike Telegram, WhatsApp pairing
-    // is event-driven (QR code), so the messenger is constructed unconditionally
-    // when enabled and the bot is started on first TUI subscription.
-    {
-        let whatsapp_path = Config::user_config_dir()?.join("wa.db");
-
-        if let Some(parent) = whatsapp_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-
-        match WhatsAppMessenger::new(whatsapp_path.to_string_lossy().to_string()).await {
-            Ok(wa) => {
-                info!("WhatsApp messenger initialized");
-                // Start the transport only when enabled; a disabled provider
-                // stays inert (no connection, no QR) until the user enables it.
-                if config.providers.whatsapp {
-                    wa.start();
-                } else {
-                    info!("WhatsApp: enabled=false, keeping provider inactive");
-                }
-                messengers.push(MessengerKind::WhatsApp(wa));
-            }
-            Err(e) => {
-                error!("WhatsApp init failed: {e}");
             }
         }
     }
 
-    tui::run(config, keymap, messengers, first_boot).await
+    // In mock mode we don't want to open settings on first boot; land in the chat list.
+    let open_settings = first_boot && !args.mock;
+
+    tui::run(config, keymap, messengers, open_settings).await
 }

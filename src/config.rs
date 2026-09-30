@@ -225,8 +225,25 @@ pub struct Keymap {
 #[cfg(test)]
 static TEST_CONFIG_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
+/// Optional override for the config directory (e.g. for `--mock` mode).
+/// Must be set before any call to `user_config_dir()`; typically set once
+/// in `main()` before initializing the runtime.
+static CONFIG_DIR_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
 impl Config {
+    /// Sets a custom config directory for the process. Returns `Err` if
+    /// already set. Intended for one-time initialization in `main()`.
+    pub fn set_config_dir_override(dir: PathBuf) -> Result<(), anyhow::Error> {
+        CONFIG_DIR_OVERRIDE
+            .set(dir)
+            .map_err(|_| anyhow::anyhow!("config dir override already set"))
+    }
+
     pub fn user_config_dir() -> Result<PathBuf> {
+        if let Some(dir) = CONFIG_DIR_OVERRIDE.get() {
+            return Ok(dir.clone());
+        }
+
         #[cfg(test)]
         {
             if let Some(dir) = TEST_CONFIG_DIR.get() {

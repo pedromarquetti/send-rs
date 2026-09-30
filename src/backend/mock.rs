@@ -2,8 +2,10 @@ use crate::helpers::now;
 
 use super::{
     BackendError, BackendEvent, Chat, ChatId, MediaKind, Message, MessageAction, MessageId,
-    MessageMedia, Messenger, MessengerKind, Provider, ReplyContext,
+    MessageMedia, Messenger, ReplyContext,
 };
+#[cfg(test)]
+use super::{MessengerKind, Provider};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

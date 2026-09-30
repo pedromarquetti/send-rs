@@ -1,5 +1,4 @@
-/// The mock provider is used only by tests: it must not ship in the binary.
-#[cfg(test)]
+/// The mock provider is used for testing and demo mode.
 pub mod mock;
 pub mod telegram;
 pub mod whatsapp;
@@ -12,8 +11,7 @@ use tokio::sync::broadcast;
 use whatsapp_rust::Jid;
 
 use crate::{
-    backend::{telegram::TelegramMessenger, whatsapp::WhatsAppMessenger},
-    config::ProvidersConfig,
+    backend::{mock::MockMessenger, telegram::TelegramMessenger, whatsapp::WhatsAppMessenger}, config::ProvidersConfig,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -536,6 +534,7 @@ pub trait Messenger: Send + Sync {
 pub enum MessengerKind {
     Telegram(TelegramMessenger),
     WhatsApp(WhatsAppMessenger),
+    Mock(Provider, MockMessenger),
     #[cfg(test)]
     Stub(Provider, Box<dyn Messenger>),
 }
@@ -545,6 +544,7 @@ impl Clone for MessengerKind {
         match self {
             Self::Telegram(m) => Self::Telegram(m.clone()),
             Self::WhatsApp(m) => Self::WhatsApp(m.clone()),
+            Self::Mock(p, m) => Self::Mock(*p, m.clone()),
             #[cfg(test)]
             Self::Stub(..) => panic!("MessengerKind::Stub is not cloneable"),
         }
@@ -556,6 +556,7 @@ macro_rules! delegate_match {
         match $self {
             Self::Telegram(m) => m.$name($($args),*).await,
             Self::WhatsApp(m) => m.$name($($args),*).await,
+            Self::Mock(_, m) => m.$name($($args),*).await,
             #[cfg(test)]
             Self::Stub(_, m) => m.$name($($args),*).await,
         }
@@ -564,6 +565,7 @@ macro_rules! delegate_match {
         match $self {
             Self::Telegram(m) => m.$name($($args),*),
             Self::WhatsApp(m) => m.$name($($args),*),
+            Self::Mock(_, m) => m.$name($($args),*),
             #[cfg(test)]
             Self::Stub(_, m) => m.$name($($args),*),
         }
@@ -603,6 +605,7 @@ impl MessengerKind {
         match self {
             Self::Telegram(_) => Provider::Telegram,
             Self::WhatsApp(_) => Provider::WhatsApp,
+            Self::Mock(p, _) => *p,
             #[cfg(test)]
             Self::Stub(provider, _) => *provider,
         }
