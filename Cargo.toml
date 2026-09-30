@@ -93,3 +93,11 @@ opus-pure = "0.2.1"
 cpal = "0.16"
 
 arboard = "=3.6.1"
+
+# Video decoding shells out to `ffmpeg`/`ffprobe` rather than linking a
+# decoder, but the clip still has to live in a *seekable* file: `-ss` before
+# `-i` is a fast keyframe seek and a pipe cannot seek. `tempfile` owns that
+# scratch file (created 0600) and unlinks it when the engine forgets the
+# session, so there is no hand-rolled name/pid bookkeeping and nothing to
+# clean up on a panic.
+tempfile = "3"

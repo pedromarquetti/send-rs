@@ -228,15 +228,16 @@ struct Loaded {
 
 /// Engine-authoritative playback clock. While `playing_since` is set the
 /// position is extrapolated on demand, so `position()` never needs a sink
-/// round-trip.
+/// round-trip. Shared with the video engine, which has no sink but the same
+/// play/pause/seek/stop transitions.
 #[derive(Debug, Default)]
-struct Timing {
+pub(super) struct Timing {
     position: f64,
     playing_since: Option<Instant>,
 }
 
 impl Timing {
-    fn current(&self, duration: f64) -> f64 {
+    pub(super) fn current(&self, duration: f64) -> f64 {
         let mut position = self.position;
         if let Some(since) = self.playing_since {
             position += since.elapsed().as_secs_f64();
@@ -247,21 +248,21 @@ impl Timing {
         position
     }
 
-    fn play(&mut self) {
+    pub(super) fn play(&mut self) {
         self.playing_since = Some(Instant::now());
     }
 
-    fn pause(&mut self, duration: f64) {
+    pub(super) fn pause(&mut self, duration: f64) {
         self.position = self.current(duration);
         self.playing_since = None;
     }
 
-    fn seek(&mut self, position: f64, playing: bool) {
+    pub(super) fn seek(&mut self, position: f64, playing: bool) {
         self.position = position;
         self.playing_since = playing.then(Instant::now);
     }
 
-    fn stop(&mut self) {
+    pub(super) fn stop(&mut self) {
         self.position = 0.0;
         self.playing_since = None;
     }
