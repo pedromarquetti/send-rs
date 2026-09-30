@@ -7,7 +7,7 @@ use crate::helpers::now;
 
 use super::convert::message_actions;
 use super::ids::fold_lid_key;
-use super::media::wa_media_ref;
+use super::media::{ref_media_type, wa_media_ref};
 use super::state::{SharedState, WhatsAppState};
 use super::sync::{
     CdnFields, find_peer_chat, merge_lid_duplicates, outbound_media_message, presence_keys,
@@ -522,7 +522,7 @@ impl Messenger for WhatsAppMessenger {
 
         // The persisted CDN reference covers media from earlier sessions too;
         // nothing here holds or caches the media bytes themselves. A missing
-        // ref means the message predates audio ref capture (no HistorySync has
+        // ref means the message predates ref capture (no HistorySync has
         // re-delivered it yet), NOT a download problem.
         let media_ref = self
             .state
@@ -549,12 +549,10 @@ impl Messenger for WhatsAppMessenger {
         };
 
         // The reference records which media kind it came from so the right
-        // `MediaType` decrypts the stream (audio and image use different keys).
-        let media_type = match r.kind {
-            MediaKind::Image => MediaType::Image,
-            MediaKind::Audio { .. } => MediaType::Audio,
-            // No other kind is ever stored in `media_refs`.
-            _ => return Ok(None),
+        // `MediaType` decrypts the stream (audio, image and video use
+        // different keys).
+        let Some(media_type) = ref_media_type(&r.kind) else {
+            return Ok(None);
         };
 
         let params = DownloadParams::encrypted(

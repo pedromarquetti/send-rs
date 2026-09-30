@@ -34,10 +34,11 @@ pub(super) struct WhatsAppState {
     /// So basically, Stanza == Message
     pub(super) by_stanza_id: HashMap<String, (ChatId, MessageId)>,
 
-    /// CDN references for image messages, keyed by stanza id. Persisted with
-    /// the cache so images from earlier sessions still download after a
-    /// restart (the raw `wa::Message` itself is not deserializable). No media
-    /// bytes are ever stored — only the fields that fetch them on demand.
+    /// CDN references for image, video and audio messages, keyed by stanza id.
+    /// Persisted with the cache so that media from earlier sessions still
+    /// downloads after a restart (the raw `wa::Message` itself is not
+    /// deserializable). No media bytes are ever stored — only the fields that
+    /// fetch them on demand.
     ///  TODO: this may contain image hashes, we need to fix file permissions: currently, in
     /// linux, everyone can read send-rs files!
     /// BUG: fix file permission for the app

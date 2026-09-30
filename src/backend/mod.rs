@@ -11,7 +11,8 @@ use tokio::sync::broadcast;
 use whatsapp_rust::Jid;
 
 use crate::{
-    backend::{mock::MockMessenger, telegram::TelegramMessenger, whatsapp::WhatsAppMessenger}, config::ProvidersConfig,
+    backend::{mock::MockMessenger, telegram::TelegramMessenger, whatsapp::WhatsAppMessenger},
+    config::ProvidersConfig,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]

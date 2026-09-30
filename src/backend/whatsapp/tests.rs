@@ -5,6 +5,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast};
 use whatsapp_rust::prelude::{Jid, MessageBuilderExt, MessageInfo, wa};
+use whatsapp_rust::wacore::download::MediaType;
 use whatsapp_rust::wacore::types::message::EditAttribute;
 
 use super::convert::{
@@ -12,7 +13,7 @@ use super::convert::{
     to_senders_msg,
 };
 use super::ids::{canonical_chat_id, fold_lid_key, own_chat_id};
-use super::media::{MediaRef, handle_wa_media, wa_media_ref};
+use super::media::{MediaRef, handle_wa_media, ref_media_type, wa_media_ref};
 use super::state::{SharedState, WhatsAppState};
 use super::sync::{
     CdnFields, handle_history_sync, outbound_media_message, presence_label,
@@ -1521,6 +1522,58 @@ fn audio_media_ref_extracts_cdn_fields_for_voice_notes() {
         ..Default::default()
     };
     assert!(wa_media_ref(&no_key).is_none());
+}
+
+#[test]
+fn video_media_ref_extracts_cdn_fields_and_skips_incomplete_videos() {
+    let clip = wa::Message {
+        video_message: MessageField::some(wa::message::VideoMessage {
+            direct_path: Some("/v/t62.7166-24/11111_2222/mp4".into()),
+            media_key: Some(vec![0, 1, 2, 3]),
+            file_sha256: Some(vec![4, 5, 6, 7]),
+            file_enc_sha256: Some(vec![8, 9, 10, 11]),
+            file_length: Some(8192),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let r = wa_media_ref(&clip).expect("complete video yields a ref");
+    assert_eq!(r.kind, MediaKind::Video);
+    assert_eq!(r.direct_path, "/v/t62.7166-24/11111_2222/mp4");
+    assert_eq!(r.media_key, vec![0, 1, 2, 3]);
+    assert_eq!(r.file_sha256, vec![4, 5, 6, 7]);
+    assert_eq!(r.file_enc_sha256, vec![8, 9, 10, 11]);
+    assert_eq!(r.file_length, 8192);
+
+    // A video missing its direct path cannot be re-downloaded by reference.
+    let no_path = wa::Message {
+        video_message: MessageField::some(wa::message::VideoMessage {
+            media_key: Some(vec![0, 1, 2, 3]),
+            file_length: Some(8192),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert!(wa_media_ref(&no_path).is_none());
+}
+
+#[test]
+fn a_stored_video_ref_downloads_as_a_video() {
+    // The ref's kind decides the `MediaType` that decrypts the stream, and
+    // the kinds use different CDN keys.
+    assert_eq!(ref_media_type(&MediaKind::Video), Some(MediaType::Video));
+    assert_eq!(ref_media_type(&MediaKind::Image), Some(MediaType::Image));
+    assert_eq!(
+        ref_media_type(&MediaKind::Audio {
+            duration_secs: Some(1),
+            is_voice: true,
+            waveform: None,
+        }),
+        Some(MediaType::Audio),
+    );
+    // Kinds that are never captured into `media_refs` have nothing to fetch.
+    assert_eq!(ref_media_type(&MediaKind::Sticker), None);
+    assert_eq!(ref_media_type(&MediaKind::Document), None);
 }
 
 #[test]
