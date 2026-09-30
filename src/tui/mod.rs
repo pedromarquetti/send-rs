@@ -33,7 +33,7 @@ pub use crate::tui::player::PlayKey;
 use crate::tui::player::{PlayState, PlaybackState, Player, RodioEngine};
 use crate::tui::popup::{AudioPopup, ImagePopup, PopupKind};
 use crate::tui::settings::Settings;
-use crate::tui::state::{AppState, AudioAction, Focus, Mode, Screen};
+use crate::tui::state::{AppState, Focus, MediaAction, Mode, Screen};
 use crate::tui::status_bar::StatusBarWidget;
 
 mod chat;
@@ -1382,10 +1382,10 @@ impl App {
 
         let km = self.state.keymap.clone();
 
-        // Playback controls only apply while an audio popup is open. Read here
+        // Playback controls only apply while a media popup is open. Read here
         // (before borrowing `pop_up` mutably); after a dismissal `pop_up` is
         // gone, so the match below returns before the action can leak.
-        let audio_action = self.state.audio_controls(&key, &km);
+        let media_action = self.state.media_controls(&key, &km);
 
         let popup = match self.state.pop_up.as_mut() {
             Some(p) => p,
@@ -1400,9 +1400,9 @@ impl App {
             popup.scroll_idx = popup.scroll_idx.saturating_add(1);
         }
 
-        if let Some(action) = audio_action {
+        if let Some(action) = media_action {
             match action {
-                AudioAction::PlayPause => {
+                MediaAction::PlayPause => {
                     let playing = self
                         .state
                         .playback
@@ -1414,7 +1414,7 @@ impl App {
                         self.player.play();
                     }
                 }
-                AudioAction::Seek { delta_secs } => {
+                MediaAction::Seek { delta_secs } => {
                     debug!("Seeking {delta_secs}");
                     self.player.seek_by(f64::from(delta_secs));
                 }

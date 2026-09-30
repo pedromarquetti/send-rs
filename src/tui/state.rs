@@ -174,11 +174,11 @@ pub struct PopupState {
     pub scroll_idx: usize,
 }
 
-/// A control decided from a key press on the audio popup. The TUI maps it to
-/// `Player` commands; it is a plain value so the mapping is unit-testable
+/// A control decided from a key press on a media (playback) popup. The TUI maps
+/// it to `Player` commands; it is a plain value so the mapping is unit-testable
 /// without a player worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AudioAction {
+pub enum MediaAction {
     PlayPause,
     Seek { delta_secs: i32 },
 }
@@ -483,25 +483,26 @@ impl AppState {
         }
     }
 
-    /// Map a key to an audio-popup control. Returns `None` when the popup on
-    /// screen is not an Audio popup or the key is not bound. `seek_back` /
-    /// `seek_forward` are compared by `KeyCode` only: terminals disagree on
-    /// whether `<`/`>` arrive with a shift modifier.
-    pub fn audio_controls(&self, key: &KeyEvent, keymap: &Keymap) -> Option<AudioAction> {
-        let audio_open = self
+    /// Map a key to a media-popup control. Returns `None` when the popup on
+    /// screen is not a media popup (today: an Audio popup) or the key is not
+    /// bound. `seek_back` / `seek_forward` are compared by `KeyCode` only:
+    /// terminals disagree on whether `<`/`>` arrive with a shift modifier.
+    pub fn media_controls(&self, key: &KeyEvent, keymap: &Keymap) -> Option<MediaAction> {
+        let media_open = self
             .pop_up
             .as_ref()
             .is_some_and(|p| matches!(p.popup_type, PopupKind::Audio(_)));
-        if !audio_open {
+
+        if !media_open {
             return None;
         }
 
         if *key == keymap.play_pause {
-            Some(AudioAction::PlayPause)
+            Some(MediaAction::PlayPause)
         } else if key.code == keymap.seek_back.code {
-            Some(AudioAction::Seek { delta_secs: -5 })
+            Some(MediaAction::Seek { delta_secs: -5 })
         } else if key.code == keymap.seek_forward.code {
-            Some(AudioAction::Seek { delta_secs: 5 })
+            Some(MediaAction::Seek { delta_secs: 5 })
         } else {
             None
         }
@@ -4178,7 +4179,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn audio_controls_are_scoped_to_the_audio_popup() {
+    async fn media_controls_are_scoped_to_the_audio_popup() {
         let mut state = app_state().await;
         let km = KeymapConfig::default().parse().unwrap();
 
@@ -4188,19 +4189,19 @@ mod tests {
             error_note: None,
         }));
         assert_eq!(
-            state.audio_controls(&key(KeyCode::Char(' ')), &km),
-            Some(AudioAction::PlayPause)
+            state.media_controls(&key(KeyCode::Char(' ')), &km),
+            Some(MediaAction::PlayPause)
         );
         assert_eq!(
-            state.audio_controls(&key(KeyCode::Char('<')), &km),
-            Some(AudioAction::Seek { delta_secs: -5 })
+            state.media_controls(&key(KeyCode::Char('<')), &km),
+            Some(MediaAction::Seek { delta_secs: -5 })
         );
         assert_eq!(
-            state.audio_controls(&key(KeyCode::Char('>')), &km),
-            Some(AudioAction::Seek { delta_secs: 5 })
+            state.media_controls(&key(KeyCode::Char('>')), &km),
+            Some(MediaAction::Seek { delta_secs: 5 })
         );
         assert_eq!(
-            state.audio_controls(&key(KeyCode::Char('x')), &km),
+            state.media_controls(&key(KeyCode::Char('x')), &km),
             None,
             "unbound keys map to no action"
         );
@@ -4208,7 +4209,7 @@ mod tests {
         // Without an Audio popup on screen the same keys must not map.
         state.dismiss_popup();
         state.create_popup(PopupKind::Info("hello".into()));
-        assert_eq!(state.audio_controls(&key(KeyCode::Char(' ')), &km), None);
+        assert_eq!(state.media_controls(&key(KeyCode::Char(' ')), &km), None);
     }
 
     #[tokio::test]
