@@ -124,7 +124,7 @@ pub fn to_notice(
     // The "Myself" conversation mirrors what the user sends from their phone.
     // Those arrive as inbound messages (`from_me == false`), so pinging the user
     // for their own typing would be pure noise.
-    if message.chat == ChatId::Myself {
+    if message.chat_id == ChatId::Myself {
         return None;
     }
 
@@ -160,7 +160,7 @@ pub fn to_notice(
 
     Some(Notice {
         provider,
-        chat: message.chat.clone(),
+        chat: message.chat_id.clone(),
         message_id: message.message_id.clone(),
         title: truncated(title, MAX_TITLE_CHARS),
         body: truncated(&body, MAX_BODY_CHARS),
@@ -340,7 +340,7 @@ mod tests {
     fn message(chat: ChatId, sender: &str, text: &str) -> Message {
         Message {
             message_id: MessageId::from("1"),
-            chat,
+            chat_id: chat,
             sender: sender.into(),
             author_id: None,
             text: text.into(),

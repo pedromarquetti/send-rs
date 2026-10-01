@@ -19,9 +19,6 @@ pub enum PopupKind {
     Message(Message),
     Image(ImagePopup),
     Audio(AudioPopup),
-    // Opened by the later wiring phase; each video item below carries its own
-    // `allow(dead_code)` until then.
-    #[allow(dead_code)]
     Video(VideoPopup),
     Question(String),
 }
@@ -65,7 +62,6 @@ impl Debug for AudioPopup {
 /// Video playback popup. `view` is the frame viewport fed by the engine's
 /// latest-frame slot; `playback` is the per-frame mirror of the live session,
 /// exactly as in [`AudioPopup`].
-#[allow(dead_code)]
 pub struct VideoPopup {
     pub msg: Message,
     pub view: VideoWidgetState,
@@ -77,7 +73,6 @@ pub struct VideoPopup {
 
 // `VideoWidgetState` is not `Debug`, hence the manual impl rather than a
 // derive, mirroring `ImagePopup`/`AudioPopup`.
-#[allow(dead_code)]
 impl Debug for VideoPopup {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VideoPopup")
@@ -96,15 +91,22 @@ impl Default for PopupKind {
 
 #[derive(Default)]
 pub struct PopUp {
-    curr_messenger: &'static str,
+    msgr_tag: &'static str,
 }
 
 impl PopUp {
-    pub fn new(curr_messenger: &'static str) -> Self {
-        Self { curr_messenger }
+    pub fn new(msgr_tag: &'static str) -> Self {
+        Self { msgr_tag }
     }
 
-    pub fn handle_data_render(&self, data: &String, area: Rect, buf: &mut Buffer, block: Block) {
+    pub fn handle_data_render(
+        &self,
+        data: &String,
+        area: Rect,
+        buf: &mut Buffer,
+        block: Block,
+        text_style: Style,
+    ) {
         let width = 80.min(area.width.saturating_sub(4));
         let content_width = width.saturating_sub(2) as usize;
         let msg = format!("{data}\n\nPress ESC to close");
@@ -124,7 +126,7 @@ impl PopUp {
                 }
             })
             .collect();
-        let paragraph = Paragraph::new(lines).block(block);
+        let paragraph = Paragraph::new(lines).block(block).style(text_style);
         Clear.render(popup_area, buf);
         Widget::render(paragraph, popup_area, buf);
     }
@@ -137,10 +139,23 @@ impl StatefulWidget for &mut PopUp {
         let width = 80.min(area.width.saturating_sub(4));
         let content_width = width.saturating_sub(2) as usize;
 
-        let border_style = match self.curr_messenger {
-            "TG" => Style::default().fg(Color::Blue),
-            "WA" => Style::default().fg(Color::Green),
-            _ => Style::default(),
+        let text_style = {
+            if !state.focused {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default()
+            }
+        };
+        let border_style = {
+            if !state.focused {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                match self.msgr_tag {
+                    "TG" => Style::default().fg(Color::Blue),
+                    "WA" => Style::default().fg(Color::Green),
+                    _ => Style::default(),
+                }
+            }
         };
 
         match &mut state.popup_type {
@@ -153,13 +168,12 @@ impl StatefulWidget for &mut PopUp {
 
                 Clear.render(popup_area, buf);
 
-                let block = Block::bordered()
-                    .title(" ? ")
-                    .border_style(Style::default().fg(Color::Gray).bg(Color::Black));
+                let block = Block::bordered().title(" ? ").border_style(border_style);
 
                 let options: Vec<Span> = vec![Span::from(" [1] Yes "), Span::from(" [2] No ")];
 
                 Paragraph::new(format!("{data}\n\n{}", Line::from(options)))
+                    .style(text_style)
                     .scroll((state.scroll_idx as u16, 0))
                     .block(block.clone())
                     .render(popup_area, buf);
@@ -169,25 +183,26 @@ impl StatefulWidget for &mut PopUp {
                 let block = Block::bordered()
                     .title(" Error ")
                     .border_style(Style::default().fg(Color::Red).bg(Color::Black));
-                self.handle_data_render(data, area, buf, block);
+                self.handle_data_render(data, area, buf, block, text_style);
             }
 
             PopupKind::Info(data) => {
                 let block = Block::bordered()
                     .title(" Info ")
                     .border_style(Style::default().fg(Color::LightBlue).bg(Color::Black));
-                self.handle_data_render(data, area, buf, block);
+                self.handle_data_render(data, area, buf, block, text_style);
             }
 
             PopupKind::Warn(data) => {
                 let block = Block::bordered()
                     .title(" Warning ")
                     .border_style(Style::default().fg(Color::Yellow).bg(Color::Black));
-                self.handle_data_render(data, area, buf, block);
+                self.handle_data_render(data, area, buf, block, text_style);
             }
 
             PopupKind::Message(msg) => {
                 let block = Block::bordered()
+                    .style(text_style)
                     .title(" Message ")
                     .border_style(border_style);
 
@@ -313,11 +328,12 @@ impl StatefulWidget for &mut PopUp {
                     .min(total_lines.saturating_sub(viewport_height));
 
                 let paragraph = Paragraph::new(content_lines)
+                    .style(text_style)
                     .scroll((state.scroll_idx as u16, 0))
                     .block(block);
                 paragraph.render(popup_area, buf);
 
-                let options_paragraph = Paragraph::new(options_line);
+                let options_paragraph = Paragraph::new(options_line).style(text_style);
                 options_paragraph.render(split[2], buf);
             }
 
@@ -335,6 +351,7 @@ impl StatefulWidget for &mut PopUp {
                 Clear.render(popup_area, buf);
 
                 let block = Block::bordered()
+                    .style(text_style)
                     .title(format!(
                         " {} {} ",
                         msg.sender,
@@ -385,6 +402,7 @@ impl StatefulWidget for &mut PopUp {
                 error_note,
             }) => {
                 let block = Block::bordered()
+                    .style(text_style)
                     .title(format!(
                         " {} {} ",
                         msg.sender,
@@ -471,11 +489,13 @@ impl StatefulWidget for &mut PopUp {
                     Style::default().fg(Color::DarkGray),
                 ));
 
-                Paragraph::new(hint).render(split[1], buf);
-                Paragraph::new(options_line).render(split[2], buf);
+                Paragraph::new(hint).style(text_style).render(split[1], buf);
+                Paragraph::new(options_line)
+                    .style(text_style)
+                    .render(split[2], buf);
             }
 
-            #[allow(dead_code)]
+            // #[allow(dead_code)]
             PopupKind::Video(VideoPopup {
                 msg,
                 view,
@@ -487,6 +507,7 @@ impl StatefulWidget for &mut PopUp {
                     .clamp(30.min(max_width), max_width.max(30));
 
                 let mut block = Block::bordered()
+                    .style(text_style)
                     .title(format!(
                         " {} {} ",
                         msg.sender,
@@ -499,45 +520,39 @@ impl StatefulWidget for &mut PopUp {
                     None => block,
                 };
 
-                let caption_lines: Vec<Line> = msg
+                // One caption row, like the image popup: the frame viewport is
+                // the point of this popup and gets everything the caption and
+                // the fixed lines below do not need. The caption is truncated
+                // to the width with an ellipsis so it reads as cut rather than
+                // as the whole message.
+                let caption_line = msg
                     .media
                     .as_ref()
                     .and_then(|media| media.caption.clone())
                     .filter(|caption| !caption.trim().is_empty())
                     .map(|caption| {
-                        caption
-                            .lines()
-                            .flat_map(|line| {
-                                wrap_text(line, width.saturating_sub(2) as usize)
-                                    .into_iter()
-                                    .map(|chunk| Line::from(Span::raw(chunk)))
-                                    .collect::<Vec<_>>()
-                            })
-                            .collect()
+                        let mut chunks =
+                            wrap_text(&caption, width.saturating_sub(2) as usize).into_iter();
+                        let head = chunks.next().unwrap_or_default();
+
+                        match chunks.next() {
+                            // `wrap_text` already ellipsises an overlong word.
+                            Some(_) if !head.ends_with('…') => format!("{head}…"),
+                            Some(_) => head,
+                            None => head,
+                        }
                     })
-                    .unwrap_or_default();
+                    .map(|caption| Line::from(Span::raw(caption)));
 
-                // The frame viewport gets whatever is left after the four
-                // fixed rows below (status, progress, actions, hint) and the
-                // caption, so a long caption shrinks the video rather than
-                // pushing the fixed rows off the popup. `MIN_VIDEO_ROWS`
-                // matters: sizing the popup to exactly `6 + caption_rows`
-                // would leave the frame nothing to draw.
-                const FIXED_ROWS: usize = 4;
-                const MIN_VIDEO_ROWS: usize = 3;
-
+                // The video is the whole point of this popup, so the popup takes
+                // the full 90% height. Sizing it to its content instead (which is
+                // what the image popup does) pins the frame at a couple of rows
+                // however large the terminal is.
                 let max_height = ((area.height as u32 * 9 / 10) as u16)
                     .min(area.height.saturating_sub(1))
                     .max(8);
-                let caption_budget = max_height
-                    .saturating_sub(2 + FIXED_ROWS as u16 + MIN_VIDEO_ROWS as u16)
-                    as usize;
-                let caption_rows = caption_lines.len().min(caption_budget);
 
-                let popup_height = max_height
-                    .min((2 + FIXED_ROWS + MIN_VIDEO_ROWS + caption_rows) as u16)
-                    .max(8);
-                let popup_area = popup_area(area, width, popup_height);
+                let popup_area = popup_area(area, width, max_height);
 
                 Clear.render(popup_area, buf);
                 Widget::render(&block, popup_area, buf);
@@ -551,7 +566,7 @@ impl StatefulWidget for &mut PopUp {
                     Constraint::Fill(1),
                     Constraint::Length(1),
                     Constraint::Length(1),
-                    Constraint::Length(caption_rows as u16),
+                    Constraint::Length(1),
                     Constraint::Length(1),
                     Constraint::Length(1),
                 ])
@@ -579,17 +594,15 @@ impl StatefulWidget for &mut PopUp {
                 Paragraph::new(progress_strip(ratio, width.saturating_sub(2) as usize))
                     .render(split[2], buf);
 
-                // Scrolls independently of the frame viewport above it, so
-                // long captions stay readable without moving the video.
-                state.scroll_idx = state
-                    .scroll_idx
-                    .min(caption_lines.len().saturating_sub(caption_rows));
+                // The caption keeps its single row whatever its length, so the
+                // frame above never moves and scrolling it is not wired up yet.
+                if let Some(caption_line) = caption_line {
+                    Paragraph::new(caption_line).render(split[3], buf);
+                }
 
-                Paragraph::new(caption_lines)
-                    .scroll((state.scroll_idx as u16, 0))
-                    .render(split[3], buf);
-
-                Paragraph::new(message_actions_line(msg)).render(split[4], buf);
+                Paragraph::new(message_actions_line(msg))
+                    .style(text_style)
+                    .render(split[4], buf);
 
                 Paragraph::new(Line::from(Span::styled(
                     "  space ▸ play/pause   < ▸ -5s   > ▸ +5s   esc ▸ close".to_string(),
@@ -653,7 +666,7 @@ fn message_actions_line(msg: &Message) -> Line<'static> {
                 MessageAction::Retry => format!("[{}] Retry", i + 1),
                 MessageAction::Copy => format!("[{}] Copy", i + 1),
             };
-            Span::styled(format!("  {label}"), Style::default().fg(Color::White))
+            Span::from(format!("  {label}"))
         })
         .collect();
 

@@ -319,7 +319,7 @@ pub enum OutboundMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub message_id: MessageId,
-    pub chat: ChatId,
+    pub chat_id: ChatId,
     pub sender: String,
     /// The author's raw provider-specific id (e.g. a WhatsApp participant LID).
     /// Opaque to the UI; used to route per-author protocol actions such as

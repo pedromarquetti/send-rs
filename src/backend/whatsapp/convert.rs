@@ -75,7 +75,7 @@ pub(super) fn to_senders_msg(
 
     Message {
         message_id: stanza_id.into(),
-        chat,
+        chat_id: chat,
         sender,
         author_id: Some(info.source.sender.to_string()),
         text,

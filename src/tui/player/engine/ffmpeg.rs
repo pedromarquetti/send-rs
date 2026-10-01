@@ -38,11 +38,17 @@ use crate::tui::player::{MediaEngine, PlayState};
 /// Terminal frame rates are far below 12 fps, so decoding a 60 fps source at
 /// 60 fps only burns CPU on frames nobody sees. Also the fallback when a
 /// container does not declare a frame rate.
-const MAX_FPS: f64 = 12.0;
+/// NOTE: increasing this actually improved video playback, maybe we should confirm again if this
+/// makes any difference
+const MAX_FPS: f64 = 60.0;
 
 /// Bound on the decode width. The widget fits every frame to the popup area
 /// afterwards, so decoding a 4K source at full size would only cost time.
 const MAX_WIDTH: u32 = 1280;
+
+/// How long `load` waits for the poster frame's decode before giving up and
+/// leaving the popup on its placeholder.
+const POSTER_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The `ffprobe` command that reports the first video stream's geometry.
 ///
@@ -89,6 +95,7 @@ fn decode_args(path: &Path, position: f64, width: u32, height: u32, fps: f64) ->
 
     args.push("-i".into());
     args.push(path.as_os_str().to_os_string());
+    // BUG: this is making the video not have audio, refactor this
     args.push("-an".into());
     args.push("-sn".into());
     args.push("-vf".into());
@@ -257,6 +264,42 @@ impl FfmpegEngine {
         }
     }
 
+    /// Decode a single frame at the start into the slot, then stop.
+    ///
+    /// `load` deliberately does not start playback, and nothing else decodes
+    /// before the first `play`, so without this the popup would sit on its
+    /// "Loading video…" placeholder until the user pressed space — the frame
+    /// has to be on screen *before* playback starts, not as a side effect of it.
+    /// The timing clock is left stopped, so the session still reports paused at
+    /// zero and the space bar begins playback from the top.
+    fn preroll_poster_frame(&mut self) {
+        let Some(path) = self.temp.as_ref().map(|temp| temp.path().to_path_buf()) else {
+            return;
+        };
+
+        if let Err(err) = self.spawn_decode(&path, 0.0) {
+            // Leave the session paused and let the popup keep showing its
+            // placeholder; the first `play` retries and surfaces the error.
+            warn!(error = %err, "video poster frame could not be decoded");
+            self.kill_decode();
+            return;
+        }
+
+        let deadline = Instant::now() + POSTER_FRAME_TIMEOUT;
+        while Instant::now() < deadline {
+            if self.frame_slot.try_lock().is_ok_and(|slot| slot.is_some()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        // Whether the frame arrived or not, the decode is torn down here: this
+        // exists to seed the slot, not to run.
+        self.kill_decode();
+
+        debug!("video poster frame ready, still paused at the start");
+    }
+
     /// Kill the running decode and wait for its reader thread, if any.
     fn kill_decode(&mut self) {
         if let Some(mut child) = self.child.take() {
@@ -422,6 +465,9 @@ impl MediaEngine for FfmpegEngine {
         self.duration = duration;
         self.timing.stop();
         self.status = PlayState::Paused;
+
+        // Seed the slot so the popup can show a frame while still paused.
+        self.preroll_poster_frame();
 
         Ok(duration)
     }

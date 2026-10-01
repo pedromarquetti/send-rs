@@ -18,7 +18,7 @@ use crate::notify::{Notice, to_notice};
 use crate::tui::chat::{ChatState, OpenChat};
 use crate::tui::loading::{LoadingArea, LoadingState};
 use crate::tui::player::PlaybackState;
-use crate::tui::popup::{AudioPopup, ImagePopup, PopupKind};
+use crate::tui::popup::{AudioPopup, ImagePopup, PopupKind, VideoPopup};
 use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +142,12 @@ pub struct AppState {
     /// Latest player report for the active audio session (`None` = no session).
     pub playback: Option<PlaybackState>,
 
+    /// Same as [`Self::playback`] for the video session. Kept separate so an
+    /// audio and a video session can never overwrite each other's snapshot;
+    /// the active engine is chosen by which popup is open, and a report is
+    /// routed by matching [`PlaybackState::source`].
+    pub video: Option<PlaybackState>,
+
     /// An in-flight push-to-talk voice-note recording, if active.
     /// Visible to the TUI module so dispatch tests can install a take without
     /// opening a real mic.
@@ -172,6 +178,7 @@ pub struct PopupState {
     pub popup_type: PopupKind,
     prev_focus: Focus,
     pub scroll_idx: usize,
+    pub focused: bool,
 }
 
 /// A control decided from a key press on a media (playback) popup. The TUI maps
@@ -232,6 +239,7 @@ impl AppState {
             provider_connected: HashSet::new(),
             loading: None,
             playback: None,
+            video: None,
             recording: None,
             last_record_key: None,
             clipboard,
@@ -441,6 +449,7 @@ impl AppState {
             popup_type,
             prev_focus: self.focus,
             scroll_idx: 0,
+            focused: self.focused,
         });
         self.focus = Focus::Popup;
     }
@@ -450,29 +459,33 @@ impl AppState {
             self.focus = popup.prev_focus;
         }
 
-        // Closing any popup ends the audio session: no position is retained,
+        // Closing any popup ends the media session: no position is retained,
         // so reopening starts from a fresh fetch + fresh engine load. Clearing
         // here also makes `apply_playback_state`'s guard drop any late reports.
         self.playback = None;
+        self.video = None;
     }
 
-    /// The message a Message/Image/Audio popup quotes, when it can be replied
-    /// to (confirmed, not pending/failed). The record key over such a popup
-    /// starts a voice-note reply to it.
+    /// The message a Message/Image/Audio/Video popup quotes, when it can be
+    /// replied to (confirmed, not pending/failed). The record key over such a
+    /// popup starts a voice-note reply to it.
     pub fn reply_recording_target(&self) -> Option<MessageId> {
         let popup = self.pop_up.as_ref()?;
         let msg = match &popup.popup_type {
             PopupKind::Message(msg)
             | PopupKind::Image(ImagePopup { msg, .. })
-            | PopupKind::Audio(AudioPopup { msg, .. }) => msg,
+            | PopupKind::Audio(AudioPopup { msg, .. })
+            | PopupKind::Video(VideoPopup { msg, .. }) => msg,
             _ => return None,
         };
         (!msg.pending && !msg.failed).then(|| msg.message_id.clone())
     }
 
-    /// Apply a player report for the audio session. Reports are dropped unless
-    /// a session for the same message is active, so events racing with a
-    /// dismissed popup can never resurrect stale playback state.
+    /// Apply a player report. It is routed to whichever slot holds a session
+    /// for the same message, so an audio and a video session can both be live
+    /// and each report updates only its own snapshot. A report matching neither
+    /// slot is dropped, so events racing with a dismissed popup can never
+    /// resurrect stale playback state.
     pub fn apply_playback_state(&mut self, incoming: PlaybackState) {
         if self
             .playback
@@ -480,18 +493,24 @@ impl AppState {
             .is_some_and(|current| current.source == incoming.source)
         {
             self.playback = Some(incoming);
+        } else if self
+            .video
+            .as_ref()
+            .is_some_and(|current| current.source == incoming.source)
+        {
+            self.video = Some(incoming);
         }
     }
 
     /// Map a key to a media-popup control. Returns `None` when the popup on
-    /// screen is not a media popup (today: an Audio popup) or the key is not
+    /// screen is not a media popup (an Audio or Video popup) or the key is not
     /// bound. `seek_back` / `seek_forward` are compared by `KeyCode` only:
     /// terminals disagree on whether `<`/`>` arrive with a shift modifier.
     pub fn media_controls(&self, key: &KeyEvent, keymap: &Keymap) -> Option<MediaAction> {
         let media_open = self
             .pop_up
             .as_ref()
-            .is_some_and(|p| matches!(p.popup_type, PopupKind::Audio(_)));
+            .is_some_and(|p| matches!(p.popup_type, PopupKind::Audio(_) | PopupKind::Video(_)));
 
         if !media_open {
             return None;
@@ -812,7 +831,7 @@ impl AppState {
         match send_result {
             Ok(confirmed) => {
                 let sent_ts = confirmed.timestamp;
-                let sent_chat_id = confirmed.chat.clone();
+                let sent_chat_id = confirmed.chat_id.clone();
 
                 self.chat_state.upsert_chat(Chat {
                     id: sent_chat_id,
@@ -967,7 +986,7 @@ impl AppState {
                 self.chat_state.drafts.remove(&draft.chat);
 
                 let sent_ts = confirmed.timestamp;
-                let sent_chat_id = confirmed.chat.clone();
+                let sent_chat_id = confirmed.chat_id.clone();
 
                 self.chat_state.upsert_chat(Chat {
                     id: sent_chat_id,
@@ -1418,8 +1437,8 @@ impl AppState {
     pub fn notice_for_message(&self, provider: Provider, message: &Message) -> Option<Notice> {
         let contact_name = self
             .chat_state
-            .display_name_for(&message.chat, &message.sender);
-        let visible = self.focused && self.chat_state.is_open(&message.chat);
+            .display_name_for(&message.chat_id, &message.sender);
+        let visible = self.focused && self.chat_state.is_open(&message.chat_id);
 
         to_notice(message, provider, &contact_name, visible)
     }
@@ -1580,7 +1599,7 @@ impl AppState {
                     .chat_state
                     .chats
                     .iter()
-                    .find(|chat| chat.id == message.chat)
+                    .find(|chat| chat.id == message.chat_id)
                     .map(|chat| chat.unread_count)
                     .unwrap_or(0);
 
@@ -1588,13 +1607,13 @@ impl AppState {
                     .chat_state
                     .chats
                     .iter()
-                    .any(|chat| chat.id == message.chat);
+                    .any(|chat| chat.id == message.chat_id);
                 let contact_name = self
                     .chat_state
-                    .display_name_for(&message.chat, &message.sender);
+                    .display_name_for(&message.chat_id, &message.sender);
 
                 let mut chat_update = Chat {
-                    id: message.chat.clone(),
+                    id: message.chat_id.clone(),
                     contact_name: contact_name.clone(),
                     last_message_ts: Some(message.timestamp),
                     ..Default::default()
@@ -1616,12 +1635,12 @@ impl AppState {
                 }
 
                 if is_open {
-                    self.chat_state.mark_read(&message.chat);
+                    self.chat_state.mark_read(&message.chat_id);
                 }
 
                 let text_preview: String = message.text.chars().take(60).collect();
                 debug!(
-                    chat = ?message.chat,
+                    chat = ?message.chat_id,
                     from_me = message.from_me,
                     is_open,
                     chatlist_found,
@@ -1631,17 +1650,17 @@ impl AppState {
                 );
 
                 if !message.from_me && !is_open {
-                    debug!(chat = ?message.chat, "TUI set unread");
+                    debug!(chat = ?message.chat_id, "TUI set unread");
                 }
 
                 if !chatlist_found {
-                    debug!(chat = ?message.chat, "TUI MessageReceived: inserted chat list entry from push event");
+                    debug!(chat = ?message.chat_id, "TUI MessageReceived: inserted chat list entry from push event");
                 }
             }
 
             BackendEvent::MessageUpdated(message) => {
                 self.chat_state.update_message(message.clone());
-                self.refresh_chat_list_timestamp(&message.chat);
+                self.refresh_chat_list_timestamp(&message.chat_id);
             }
 
             BackendEvent::MessageDeleted { chat, message_ids } => {
@@ -2161,7 +2180,7 @@ mod tests {
         let older = vec![
             Message {
                 message_id: "older-1".into(),
-                chat: chat_id.clone(),
+                chat_id: chat_id.clone(),
                 sender: "Alice".into(),
                 author_id: None,
                 text: "older still".into(),
@@ -2177,7 +2196,7 @@ mod tests {
             // A duplicate of an already-cached message must be filtered away.
             Message {
                 message_id: first_existing,
-                chat: chat_id.clone(),
+                chat_id: chat_id.clone(),
                 sender: "Alice".into(),
                 author_id: None,
                 text: "duplicate".into(),
@@ -2270,7 +2289,7 @@ mod tests {
             &other_id,
             Ok(vec![Message {
                 message_id: "stale".into(),
-                chat: other_id.clone(),
+                chat_id: other_id.clone(),
                 sender: "Alice".into(),
                 author_id: None,
                 text: "for another chat".into(),
@@ -2660,7 +2679,7 @@ mod tests {
 
         assert_eq!(
             state.chat_state.open_chat.as_ref().unwrap().history.len(),
-            4
+            5
         );
         assert!(!state.chat_state.chats[0].unread);
         assert_eq!(state.chat_state.chats[0].unread_count, 0);
@@ -2669,7 +2688,7 @@ mod tests {
             Provider::Telegram,
             BackendEvent::MessageReceived(Message {
                 message_id: "incoming".into(),
-                chat: ChatId::Telegram(103),
+                chat_id: ChatId::Telegram(103),
                 sender: "Alice".into(),
                 author_id: None,
                 text: "breaking".into(),
@@ -2686,7 +2705,7 @@ mod tests {
 
         assert_eq!(
             state.chat_state.open_chat.as_ref().unwrap().history.len(),
-            5
+            6
         );
         assert_eq!(state.chat_state.chats[0].last_message_ts, Some(1000));
         assert!(!state.chat_state.chats[0].unread);
@@ -2702,7 +2721,7 @@ mod tests {
             Provider::Telegram,
             BackendEvent::MessageReceived(Message {
                 message_id: "incoming".into(),
-                chat: ChatId::Telegram(101),
+                chat_id: ChatId::Telegram(101),
                 sender: "Alice".into(),
                 author_id: None,
                 text: "hi".into(),
@@ -2732,7 +2751,7 @@ mod tests {
     fn inbound(chat: ChatId, sender: &str, text: &str) -> Message {
         Message {
             message_id: "incoming".into(),
-            chat,
+            chat_id: chat,
             sender: sender.into(),
             author_id: None,
             text: text.into(),
@@ -2965,7 +2984,7 @@ mod tests {
             Provider::Telegram,
             BackendEvent::MessageReceived(Message {
                 message_id: "new-chat".into(),
-                chat: ChatId::Telegram(999),
+                chat_id: ChatId::Telegram(999),
                 sender: "New contact".into(),
                 author_id: None,
                 text: "hello there".into(),
@@ -3002,7 +3021,7 @@ mod tests {
             Provider::Telegram,
             BackendEvent::MessageReceived(Message {
                 message_id: "g-1".into(),
-                chat: ChatId::Telegram(777),
+                chat_id: ChatId::Telegram(777),
                 sender: "A Member".into(),
                 author_id: None,
                 text: "updated".into(),
@@ -3042,7 +3061,7 @@ mod tests {
             Provider::Telegram,
             BackendEvent::MessageReceived(Message {
                 message_id: "transient".into(),
-                chat: ChatId::Telegram(4242),
+                chat_id: ChatId::Telegram(4242),
                 sender: "Unknown".into(),
                 author_id: None,
                 text: "system ping".into(),
@@ -3332,7 +3351,7 @@ mod tests {
                 Some(Err(err)) => Err(err),
                 _ => Ok(Message {
                     message_id: "stub-sent".into(),
-                    chat: chat.clone(),
+                    chat_id: chat.clone(),
                     sender: "You".into(),
                     author_id: None,
                     text,
@@ -3703,7 +3722,7 @@ mod tests {
             },
             history: vec![Message {
                 message_id: "m".into(),
-                chat: ChatId::Telegram(1),
+                chat_id: ChatId::Telegram(1),
                 sender: "Sender".into(),
                 author_id: None,
                 text: "hello".into(),
@@ -3836,7 +3855,7 @@ mod tests {
             },
             history: vec![Message {
                 message_id: "m".into(),
-                chat: ChatId::Telegram(1),
+                chat_id: ChatId::Telegram(1),
                 sender: "Sender".into(),
                 author_id: None,
                 text: "hello".into(),
@@ -3911,7 +3930,7 @@ mod tests {
             &ChatId::Telegram(4),
             &[Message {
                 message_id: "poll".into(),
-                chat: ChatId::Telegram(4),
+                chat_id: ChatId::Telegram(4),
                 sender: "Dave".into(),
                 author_id: None,
                 text: "new".into(),
@@ -4044,7 +4063,7 @@ mod tests {
     fn image_message() -> Message {
         Message {
             message_id: "img-1".into(),
-            chat: ChatId::Myself,
+            chat_id: ChatId::Myself,
             sender: "Maria".into(),
             author_id: None,
             text: String::new(),
@@ -4076,7 +4095,7 @@ mod tests {
         match &popup.popup_type {
             PopupKind::Image(ImagePopup { msg, .. }) => {
                 assert_eq!(msg.message_id, MessageId::from("img-1"));
-                assert_eq!(msg.chat, ChatId::Myself);
+                assert_eq!(msg.chat_id, ChatId::Myself);
             }
             other => panic!("expected Image popup, got {other:?}"),
         }
@@ -4092,6 +4111,7 @@ mod tests {
             }),
             prev_focus: Focus::Chat,
             scroll_idx: 0,
+            focused: true,
         };
         if let PopupKind::Image(image_popup) = &mut popup.popup_type {
             image_popup.view.set_image(
@@ -4189,26 +4209,35 @@ mod tests {
         msg
     }
 
-    /// A popup whose video viewport has no frames yet, so the widget renders
+    /// A video popup whose viewport has no frames yet, so the widget renders
     /// its placeholder instead of an image protocol.
+    fn video_popup_kind(
+        msg: Message,
+        playback: Option<PlaybackState>,
+        error_note: Option<String>,
+    ) -> PopupKind {
+        let frames = Arc::new(Mutex::new(None));
+        let (wake, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let view = VideoWidgetState::new(frames, Picker::halfblocks(), wake);
+
+        PopupKind::Video(VideoPopup {
+            msg,
+            view,
+            playback,
+            error_note,
+        })
+    }
+
     fn video_popup(
         msg: Message,
         playback: Option<PlaybackState>,
         error_note: Option<String>,
     ) -> PopupState {
-        let frames = Arc::new(Mutex::new(None));
-        let (wake, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let view = VideoWidgetState::new(frames, Picker::halfblocks(), wake);
-
         PopupState {
-            popup_type: PopupKind::Video(VideoPopup {
-                msg,
-                view,
-                playback,
-                error_note,
-            }),
+            popup_type: video_popup_kind(msg, playback, error_note),
             prev_focus: Focus::Chat,
             scroll_idx: 0,
+            focused: false,
         }
     }
 
@@ -4230,7 +4259,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn media_controls_are_scoped_to_the_audio_popup() {
+    async fn apply_playback_state_routes_to_the_slot_owning_the_session() {
+        let mut state = app_state().await;
+        let audio = PlayKey {
+            chat: ChatId::Telegram(1),
+            message_id: MessageId::from("audio-9"),
+        };
+        let video = PlayKey {
+            chat: ChatId::Telegram(1),
+            message_id: MessageId::from("video-9"),
+        };
+        let report = |source: PlayKey, position| PlaybackState {
+            source,
+            status: PlayState::Playing,
+            position,
+            duration: 5.0,
+            updated_at: Instant::now(),
+        };
+
+        // Both sessions live at once; each report updates only its own slot.
+        state.playback = Some(report(audio.clone(), 1.0));
+        state.video = Some(report(video.clone(), 1.0));
+
+        state.apply_playback_state(report(video.clone(), 4.0));
+        assert_eq!(state.video.as_ref().unwrap().position, 4.0);
+        assert_eq!(
+            state.playback.as_ref().unwrap().position,
+            1.0,
+            "a video report must not disturb the audio slot"
+        );
+
+        state.apply_playback_state(report(audio.clone(), 3.0));
+        assert_eq!(state.playback.as_ref().unwrap().position, 3.0);
+        assert_eq!(state.video.as_ref().unwrap().position, 4.0);
+
+        // A report matching neither slot is dropped.
+        let mut state = state;
+        state.apply_playback_state(report(
+            PlayKey {
+                chat: ChatId::Telegram(1),
+                message_id: MessageId::from("gone"),
+            },
+            9.0,
+        ));
+        assert_eq!(state.playback.as_ref().unwrap().position, 3.0);
+        assert_eq!(state.video.as_ref().unwrap().position, 4.0);
+
+        // Closing any popup ends both sessions.
+        state.dismiss_popup();
+        assert!(state.playback.is_none());
+        assert!(state.video.is_none());
+    }
+
+    #[tokio::test]
+    async fn media_controls_are_scoped_to_media_popups() {
         let mut state = app_state().await;
         let km = KeymapConfig::default().parse().unwrap();
 
@@ -4257,10 +4339,26 @@ mod tests {
             "unbound keys map to no action"
         );
 
-        // Without an Audio popup on screen the same keys must not map.
+        // Without a media popup on screen the same keys must not map.
         state.dismiss_popup();
         state.create_popup(PopupKind::Info("hello".into()));
         assert_eq!(state.media_controls(&key(KeyCode::Char(' ')), &km), None);
+
+        // A Video popup is a media popup too, so the transport keys apply.
+        state.dismiss_popup();
+        state.create_popup(video_popup_kind(video_message("clip"), None, None));
+        assert_eq!(
+            state.media_controls(&key(KeyCode::Char(' ')), &km),
+            Some(MediaAction::PlayPause)
+        );
+        assert_eq!(
+            state.media_controls(&key(KeyCode::Char('<')), &km),
+            Some(MediaAction::Seek { delta_secs: -5 })
+        );
+        assert_eq!(
+            state.media_controls(&key(KeyCode::Char('>')), &km),
+            Some(MediaAction::Seek { delta_secs: 5 })
+        );
     }
 
     #[tokio::test]
@@ -4310,6 +4408,7 @@ mod tests {
             }),
             prev_focus: Focus::Chat,
             scroll_idx: 0,
+            focused: false,
         };
 
         let area = Rect::new(0, 0, 80, 24);
@@ -4386,9 +4485,60 @@ mod tests {
         assert!(rendered.contains("esc ▸ close"), "hint line missing close");
     }
 
+    /// Height of the video frame viewport, derived from where the vertically
+    /// centred placeholder landed: `placeholder_row = top + (height - 1) / 2`.
+    fn frame_viewport_rows(buf: &Buffer, area: Rect, popup_top: u16) -> u16 {
+        let placeholder_row = (0..area.height)
+            .find(|y| (0..area.width).any(|x| buf[(x, *y)].symbol() == "L"))
+            .expect("the loading placeholder should be drawn");
+
+        2 * (placeholder_row - popup_top - 1) + 1
+    }
+
     #[tokio::test]
-    async fn video_popup_caption_wraps_and_is_clipped_to_its_rows() {
-        // Deliberately far more caption than the popup can show, with a
+    async fn video_popup_frame_viewport_grows_with_the_terminal() {
+        let render_at = |height: u16| {
+            let mut popup = video_popup(
+                video_message("clip"),
+                Some(video_playback(PlayState::Paused, 0.0, 12.0)),
+                None,
+            );
+            let area = Rect::new(0, 0, 80, height);
+            let mut buf = Buffer::empty(area);
+            (&mut PopUp::new("")).render(area, &mut buf, &mut popup);
+
+            // The popup is centred, so measure from its own left border column
+            // and top row rather than the screen edges.
+            let left = (0..area.width)
+                .find(|&x| (0..area.height).any(|y| buf[(x, y)].symbol() != " "))
+                .expect("popup was rendered");
+            let popup_top = (0..area.height)
+                .find(|&y| buf[(left, y)].symbol() != " ")
+                .expect("popup was rendered");
+            let popup_height = (0..area.height)
+                .filter(|y| buf[(left, *y)].symbol() != " ")
+                .count() as u16;
+
+            // A short caption must not shrink the popup: it takes the full 90%
+            // and the frame gets every row the fixed lines do not.
+            assert_eq!(popup_height, area.height * 9 / 10, "popup is not 90% tall");
+            frame_viewport_rows(&buf, area, popup_top)
+        };
+
+        let short = render_at(24);
+        let tall = render_at(50);
+
+        assert!(short >= 8, "frame viewport collapsed at 24 rows: {short}");
+        assert!(tall >= 30, "frame viewport is tiny at 50 rows: {tall}");
+        assert!(
+            tall > short * 2,
+            "frame viewport did not grow with the terminal: {short} -> {tall}"
+        );
+    }
+
+    #[tokio::test]
+    async fn video_popup_caption_is_one_ellipsised_row() {
+        // Deliberately far more caption than a single row can hold, with a
         // numbered word per token so the visible slice is identifiable.
         let words: Vec<String> = (1..=300).map(|i| format!("w{i:03}")).collect();
         let caption = words.join(" ");
@@ -4403,33 +4553,45 @@ mod tests {
         let tag = app_state().await.chat_state.get_tag().unwrap_or("");
         (&mut PopUp::new(tag)).render(area, &mut buf, &mut popup);
 
+        // One row, ellipsised, exactly like the image popup's caption.
+        let caption_row: String = buf
+            .content
+            .chunks(area.width as usize)
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+            .find(|row| row.contains("w001"))
+            .expect("caption start is not on screen");
+        assert!(
+            caption_row.contains('…'),
+            "caption was not ellipsised: {caption_row:?}"
+        );
+        assert!(!caption_row.contains('\n'));
+
         let rendered: String = buf.content.iter().map(|c| c.symbol()).collect();
-        assert!(rendered.contains("w001"), "caption start missing");
         assert!(
             !rendered.contains("w300"),
-            "caption overflowed its reserved rows: the tail should be clipped"
+            "the caption spilled past its single row"
         );
 
-        // The fixed rows survive the long caption, and the frame viewport keeps
-        // its minimum height instead of collapsing to nothing.
+        // The fixed rows survive the long caption, and the frame viewport is
+        // unaffected by it.
         assert!(rendered.contains("Reply"), "action bar was squeezed out");
         assert!(rendered.contains("esc ▸ close"), "hint was squeezed out");
         assert!(rendered.contains("⏸ Video · 00:02 / 00:12"), "status lost");
         assert!(rendered.contains('█'), "progress strip was squeezed out");
         assert!(
             rendered.contains("Loading"),
-            "frame viewport collapsed to zero rows under a long caption"
+            "frame viewport collapsed under a long caption"
         );
 
-        // Scrolling past the caption's end clamps to the last full screen of
-        // text, so the tail is drawn instead of the viewport going blank.
+        // Scrolling is not wired up for the video caption yet, so the caption
+        // must not move when the popup scrolls.
         popup.scroll_idx = 99;
+        let mut buf = Buffer::empty(area);
         (&mut PopUp::new(tag)).render(area, &mut buf, &mut popup);
         let scrolled: String = buf.content.iter().map(|c| c.symbol()).collect();
         assert!(
-            scrolled.contains("w300"),
-            "caption tail lost when over-scrolled (clamped to {})",
-            popup.scroll_idx
+            scrolled.contains("w001"),
+            "the single caption row scrolled away"
         );
     }
 
@@ -4473,6 +4635,7 @@ mod tests {
     #[tokio::test]
     async fn audio_popup_renders_error_note_in_bottom_border() {
         let mut popup = PopupState {
+            focused: false,
             popup_type: PopupKind::Audio(AudioPopup {
                 msg: audio_message(),
                 error_note: Some("download failed: WA not found".into()),
@@ -4511,6 +4674,7 @@ mod tests {
             }),
             prev_focus: Focus::Chat,
             scroll_idx: 0,
+            focused: false,
         };
         let area = Rect::new(0, 0, 80, 24);
         let mut buf = Buffer::empty(area);

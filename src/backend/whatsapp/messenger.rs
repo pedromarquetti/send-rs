@@ -668,7 +668,7 @@ impl Messenger for WhatsAppMessenger {
 
         let sent = Message {
             message_id: result.message_id.clone().into(),
-            chat: chat.clone(),
+            chat_id: chat.clone(),
             sender: "You".into(),
             author_id: None,
             text: text_content,

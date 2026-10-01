@@ -7,6 +7,7 @@ use tracing::{debug, error, warn};
 
 mod engine;
 
+pub use engine::FfmpegEngine;
 pub use engine::RodioEngine;
 
 use super::UiEvent;

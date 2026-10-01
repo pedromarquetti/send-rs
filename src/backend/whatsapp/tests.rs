@@ -50,7 +50,7 @@ fn msg_info(chat: &Jid, sender: &Jid, push_name: &str, id: &str, from_me: bool) 
 fn build_msg(id: &str, text: &str, chat: &ChatId, from_me: bool) -> Message {
     Message {
         message_id: MessageId(id.to_string()),
-        chat: chat.clone(),
+        chat_id: chat.clone(),
         sender: "Alice".into(),
         author_id: None,
         text: text.to_string(),
@@ -527,7 +527,7 @@ fn upsert_self_chat_is_named_myself() {
 fn upsert_from_message_names_self_chat_myself() {
     let msg = Message {
         message_id: "s-1".into(),
-        chat: ChatId::jid_to_chat_id("15551234567@s.whatsapp.net"),
+        chat_id: ChatId::jid_to_chat_id("15551234567@s.whatsapp.net"),
         sender: "You".into(),
         text: "hello myself".into(),
         timestamp: 1,
@@ -1057,7 +1057,7 @@ fn normalize_inbound_detects_from_me_and_unknown() {
     assert_eq!(msg.sender, "Alice");
     assert!(!msg.from_me);
     assert_eq!(
-        msg.chat,
+        msg.chat_id,
         ChatId::WhatsApp("15551234567@s.whatsapp.net".to_string())
     );
     assert!(msg.msg_actions.contains(&MessageAction::Reply));
@@ -1384,7 +1384,7 @@ async fn cached_voice_note_gains_a_media_ref_on_resync() {
     // such messages, so they stayed unfetchable (the ⚠ popup state).
     let cached = Message {
         message_id: MessageId("wa-cached-audio".into()),
-        chat: ChatId::WhatsApp(chat_id.to_string()),
+        chat_id: ChatId::WhatsApp(chat_id.to_string()),
         sender: "Alice".into(),
         author_id: None,
         text: String::new(),
@@ -1844,7 +1844,7 @@ fn outbound_audio_round_trips_through_disk_cache() {
 
     let msg = Message {
         message_id: MessageId("stanza-99".into()),
-        chat: chat.clone(),
+        chat_id: chat.clone(),
         sender: "You".into(),
         author_id: None,
         text: "Audio, click to show".into(),

@@ -154,7 +154,7 @@ mod tests {
     fn sample_message(from_me: bool, pending: bool, failed: bool) -> Message {
         Message {
             message_id: MessageId::from("msg-1"),
-            chat: ChatId::Myself,
+            chat_id: ChatId::Myself,
             sender: if from_me { "You".into() } else { "Them".into() },
             author_id: None,
             text: "hello".to_string(),

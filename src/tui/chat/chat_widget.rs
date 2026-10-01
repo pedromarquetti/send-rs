@@ -359,7 +359,7 @@ fn message_lines(
     max_lines: Option<usize>,
     needle: Option<&str>,
 ) -> Vec<Line<'static>> {
-    let tag = message.chat.tag();
+    let tag = message.chat_id.tag();
     let sender = if message.from_me {
         "You".to_string()
     } else {
@@ -629,7 +629,7 @@ mod tests {
     fn message(text: &str) -> Message {
         Message {
             message_id: "m".into(),
-            chat: ChatId::Telegram(1),
+            chat_id: ChatId::Telegram(1),
             sender: "Alice".into(),
             author_id: None,
             text: text.into(),

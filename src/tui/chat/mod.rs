@@ -341,7 +341,7 @@ impl ChatState {
     }
 
     pub fn push_incoming(&mut self, message: Message) -> bool {
-        if self.is_open(&message.chat)
+        if self.is_open(&message.chat_id)
             && let Some(open) = &mut self.open_chat
         {
             // Dedup by id: a sent message may arrive both via our optimistic
@@ -773,7 +773,7 @@ mod tests {
     fn message_with_id(chat: ChatId, id: &str, timestamp: i64) -> Message {
         Message {
             message_id: id.into(),
-            chat,
+            chat_id: chat,
             sender: "Sender".into(),
             author_id: None,
             text: "hello".into(),

@@ -105,7 +105,6 @@ impl StatefulWidget for ImageWidget {
 }
 
 /// Marker widget; all state lives in [`VideoWidgetState`].
-#[allow(dead_code)]
 pub struct VideoWidget;
 
 /// Per-popup state for rendering a decoded video frame with `ratatui-image`.
@@ -117,7 +116,6 @@ pub struct VideoWidget;
 /// displayed frame keeps drawing for the whole encode window instead of the
 /// viewport blanking once per frame. Drop the state to stop the worker (the
 /// channel sender closes and the thread exits).
-#[allow(dead_code)]
 pub struct VideoWidgetState {
     /// The engine's "latest frame wins" slot.
     frames: Arc<Mutex<Option<DynamicImage>>>,
@@ -136,7 +134,6 @@ pub struct VideoWidgetState {
     status: String,
 }
 
-#[allow(dead_code)]
 impl VideoWidgetState {
     /// Spawn the encode worker; `wake` is signalled with `UiEvent::Redraw`
     /// whenever a frame is ready so the UI repaints promptly.
@@ -152,17 +149,19 @@ impl VideoWidgetState {
             while let Ok((mut protocol, size)) = jobs.recv() {
                 protocol.resize_encode(&Resize::Fit(None), size);
 
-                // A failed encode holds nothing drawable, so it is reported as
-                // a miss rather than shown; the next frame tries again.
-                let failed = protocol
-                    .last_encoding_result()
-                    .is_some_and(|result| result.is_err());
+                // Only a protocol that actually reported `Ok(())` holds
+                // drawable pixels. A zero-width or zero-height target makes
+                // `resize_encode` return without recording a result at all, so
+                // treating that as success would blank the viewport and leave
+                // the status text up forever; treat it as a miss and keep the
+                // last good frame.
+                let encoded = matches!(protocol.last_encoding_result(), Some(Ok(())));
 
-                if failed {
-                    debug!("video frame encode failed");
+                if !encoded {
+                    debug!(?size, "video frame encode produced no pixels");
                 }
 
-                let _ = result_tx.send((!failed).then_some(protocol));
+                let _ = result_tx.send(encoded.then_some(protocol));
                 let _ = wake.send(UiEvent::Redraw);
             }
         });
@@ -186,7 +185,6 @@ impl VideoWidgetState {
     }
 }
 
-#[allow(dead_code)]
 impl StatefulWidget for VideoWidget {
     type State = VideoWidgetState;
 

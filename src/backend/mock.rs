@@ -80,7 +80,7 @@ impl MockMessenger {
                 n += 1;
                 let msg = Message {
                     message_id: format!("mock-{name}-incoming-{n}").into(),
-                    chat: chat.clone(),
+                    chat_id: chat.clone(),
                     sender: format!("{name} Mock"),
                     author_id: None,
                     text: format!("simulated incoming message #{n}"),
@@ -236,7 +236,7 @@ impl Messenger for MockMessenger {
         });
         let msg = Message {
             message_id: format!("mock-outgoing-{}", state.outgoing_seq).into(),
-            chat: chat.clone(),
+            chat_id: chat.clone(),
             sender: "You".into(),
             author_id: None,
             text: text.clone(),
@@ -378,7 +378,7 @@ impl MockMessenger {
             state.outgoing_seq += 1;
             let msg = Message {
                 message_id: format!("mock-echo-{}", state.outgoing_seq).into(),
-                chat: chat.clone(),
+                chat_id: chat.clone(),
                 sender: sender.clone(),
                 author_id: None,
                 text: text.clone(),
@@ -491,6 +491,14 @@ fn mock_data(name: &'static str) -> MockData {
                 caption: Some("voice note".into()),
                 file_name: Some("voice.ogg".into()),
             });
+            // Video has no fixture bytes: `media_bytes` yields `Ok(None)` so
+            // the popup exercises its graceful-degradation path.
+            let mut clip = message("tg-7", &ALICE_ID, "Alice", "", false);
+            clip.media = Some(MessageMedia {
+                kind: MediaKind::Video,
+                caption: Some("clip".into()),
+                file_name: Some("clip.mp4".into()),
+            });
             history.insert(
                 ALICE_ID.clone(),
                 vec![
@@ -498,6 +506,7 @@ fn mock_data(name: &'static str) -> MockData {
                     message("tg-4", &ALICE_ID, "You", "ok, see you", true),
                     photo,
                     voice,
+                    clip,
                 ],
             );
             MockData {
@@ -618,7 +627,7 @@ fn long_history(chat: ChatId) -> Vec<Message> {
 fn message(id: &str, chat: &ChatId, sender: &str, text: &str, from_me: bool) -> Message {
     Message {
         message_id: id.into(),
-        chat: chat.clone(),
+        chat_id: chat.clone(),
         sender: sender.into(),
         author_id: None,
         text: text.into(),
@@ -757,7 +766,9 @@ mod tests {
         let echoed = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 match rx.recv().await {
-                    Ok(BackendEvent::MessageReceived(msg)) if !msg.from_me && msg.chat == echo => {
+                    Ok(BackendEvent::MessageReceived(msg))
+                        if !msg.from_me && msg.chat_id == echo =>
+                    {
                         break msg;
                     }
                     Ok(_) => continue,
@@ -813,7 +824,9 @@ mod tests {
         let echoed = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 match rx.recv().await {
-                    Ok(BackendEvent::MessageReceived(msg)) if !msg.from_me && msg.chat == echo => {
+                    Ok(BackendEvent::MessageReceived(msg))
+                        if !msg.from_me && msg.chat_id == echo =>
+                    {
                         break msg;
                     }
                     Ok(_) => continue,
@@ -875,6 +888,18 @@ mod tests {
         );
         assert!(bytes.len() > 44);
         assert_eq!(bytes, fixture_wav_bytes());
+    }
+
+    #[tokio::test]
+    async fn media_bytes_returns_none_for_video_message() {
+        let mock = MockMessenger::new("Telegram");
+        assert!(
+            mock.media_bytes(&ALICE_ID, &MessageId::from("tg-7"))
+                .await
+                .unwrap()
+                .is_none(),
+            "video has no fixture bytes, so the popup must degrade gracefully"
+        );
     }
 
     #[tokio::test]

@@ -1,3 +1,4 @@
+use ::image::DynamicImage;
 use anyhow::Result;
 use ratatui::crossterm::ExecutableCommand;
 use ratatui::crossterm::event::{
@@ -12,7 +13,7 @@ use ratatui::{DefaultTerminal, Frame};
 use ratatui_image::picker::{Picker, ProtocolType};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tokio::time::{Duration, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 
@@ -25,13 +26,13 @@ use crate::helpers::available_message_actions;
 use crate::notify::{DesktopNotifier, Notifier};
 use crate::tui::chat::chat_list::ChatList;
 use crate::tui::chat::chat_widget::ChatWidget;
-use crate::tui::image::ImageWidgetState;
+use crate::tui::image::{ImageWidgetState, VideoWidgetState};
 use crate::tui::loading::{LoadingArea, LoadingWidget};
 // Re-exported so the notifier can key its deduplication on the same message
 // identity the player uses, without reaching into a private module.
 pub use crate::tui::player::PlayKey;
-use crate::tui::player::{PlayState, PlaybackState, Player, RodioEngine};
-use crate::tui::popup::{AudioPopup, ImagePopup, PopupKind};
+use crate::tui::player::{FfmpegEngine, PlayState, PlaybackState, Player, RodioEngine};
+use crate::tui::popup::{AudioPopup, ImagePopup, PopupKind, VideoPopup};
 use crate::tui::settings::Settings;
 use crate::tui::state::{AppState, Focus, MediaAction, Mode, Screen};
 use crate::tui::status_bar::StatusBarWidget;
@@ -86,7 +87,17 @@ enum UiEvent {
         message_id: MessageId,
         result: Result<Option<Vec<u8>>, BackendError>,
     },
-    /// Snapshot of the audio session from the player worker; applied by
+    /// Result of a backgrounded `Messenger::media_bytes` fetch for the video
+    /// popup; bytes are handed to the video player worker (guarded by the
+    /// popup still showing that message).
+    /// BUG: check video rotation logic: landscape videos are not being shown as such, all videos
+    /// are being rendered as portrait
+    VideoMedia {
+        chat: ChatId,
+        message_id: MessageId,
+        result: Result<Option<Vec<u8>>, BackendError>,
+    },
+    /// Snapshot of the active session from a player worker; applied by
     /// `AppState::apply_playback_state` (a no-op if no session is active for
     /// that message).
     PlaybackState(PlaybackState),
@@ -585,6 +596,11 @@ async fn run_app(
                         message_id,
                         result,
                     } => app.apply_audio_media(chat, message_id, result).await,
+                    UiEvent::VideoMedia {
+                        chat,
+                        message_id,
+                        result,
+                    } => app.apply_video_media(chat, message_id, result).await,
                     UiEvent::PlaybackState(playback) => {
                         app.state.apply_playback_state(playback);
                     }
@@ -656,6 +672,11 @@ struct App {
     state: AppState,
     picker: Picker,
     player: Player,
+    /// The video engine writes each decoded frame into this slot; the video
+    /// popup's widget holds a clone and picks it up at draw time, so the
+    /// engine never has to hand a frame back (D6).
+    video_frames: Arc<Mutex<Option<DynamicImage>>>,
+    video_player: Player,
     notifier: Notifier,
     tx: mpsc::UnboundedSender<UiEvent>,
     chat_load_task: Option<tokio::task::JoinHandle<()>>,
@@ -673,10 +694,23 @@ impl App {
         // Built from the config before it is handed to the state: the sound
         // files are read once, here, not on the first message.
         let notifier = Notifier::new(&config.notifications, Arc::new(DesktopNotifier));
+
+        // One slot, cloned into the engine factory and later into the popup's
+        // widget, so decoded frames flow engine -> widget without a round trip.
+        let video_frames = Arc::new(Mutex::new(None));
+        let engine_frames = Arc::clone(&video_frames);
+        let engine_wake = tx.clone();
+        let video_player = Player::new(
+            move || Box::new(FfmpegEngine::new(engine_frames, engine_wake)),
+            tx.clone(),
+        );
+
         Self {
             state: AppState::new(config, keymap, messengers, open_settings).await,
             picker,
             player: Player::new(|| Box::new(RodioEngine::default()), tx.clone()),
+            video_frames,
+            video_player,
             notifier,
             tx,
             chat_load_task: None,
@@ -762,11 +796,11 @@ impl App {
 
     fn open_image_popup(&mut self, msg: Message) {
         debug!("Opening image for {:?}", msg.message_id);
-        let Some(messenger) = self.state.chat_owner(&msg.chat).cloned() else {
+        let Some(messenger) = self.state.chat_owner(&msg.chat_id).cloned() else {
             return;
         };
 
-        let chat = msg.chat.clone();
+        let chat = msg.chat_id.clone();
         let message_id = msg.message_id.clone();
 
         self.state.create_popup(PopupKind::Image(ImagePopup {
@@ -800,7 +834,7 @@ impl App {
         };
 
         // Only apply if the popup still shows the same message.
-        if image_popup.msg.chat != chat || image_popup.msg.message_id != message_id {
+        if image_popup.msg.chat_id != chat || image_popup.msg.message_id != message_id {
             return;
         }
 
@@ -844,7 +878,7 @@ impl App {
     ) {
         let same_target = match self.state.pop_up.as_ref().map(|p| &p.popup_type) {
             Some(PopupKind::Audio(AudioPopup { msg, .. })) => {
-                msg.chat == chat && msg.message_id == message_id
+                msg.chat_id == chat && msg.message_id == message_id
             }
             _ => false,
         };
@@ -894,11 +928,11 @@ impl App {
 
     fn open_audio_popup(&mut self, msg: Message) {
         debug!("Opening audio for {:?}", msg.message_id);
-        let Some(messenger) = self.state.chat_owner(&msg.chat).cloned() else {
+        let Some(messenger) = self.state.chat_owner(&msg.chat_id).cloned() else {
             return;
         };
 
-        let chat = msg.chat.clone();
+        let chat = msg.chat_id.clone();
         let message_id = msg.message_id.clone();
 
         // Seed the session so early worker reports are accepted by
@@ -944,30 +978,140 @@ impl App {
         });
     }
 
-    /// Dismiss the current popup, stopping an active audio session. Closing the
-    /// audio popup must silence playback and drop its state so reopening starts
-    /// from a fresh fetch (no position is retained).
+    fn open_video_popup(&mut self, msg: Message) {
+        debug!("Opening video for {:?}", msg.message_id);
+        let Some(messenger) = self.state.chat_owner(&msg.chat_id).cloned() else {
+            return;
+        };
+
+        let chat = msg.chat_id.clone();
+        let message_id = msg.message_id.clone();
+
+        // Seed the session so early worker reports are accepted by
+        // `apply_playback_state`'s same-source guard, which routes to this slot.
+        self.state.video = Some(PlaybackState {
+            source: PlayKey {
+                chat: chat.clone(),
+                message_id: message_id.clone(),
+            },
+            status: PlayState::Loading,
+            position: 0.0,
+            duration: 0.0,
+            updated_at: Instant::now(),
+        });
+
+        self.state.create_popup(PopupKind::Video(VideoPopup {
+            msg,
+            view: VideoWidgetState::new(
+                Arc::clone(&self.video_frames),
+                self.picker.clone(),
+                self.tx.clone(),
+            ),
+            playback: None,
+            error_note: None,
+        }));
+
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = messenger.media_bytes(&chat, &message_id).await;
+
+            let _ = tx.send(UiEvent::VideoMedia {
+                chat,
+                message_id,
+                result,
+            });
+        });
+    }
+
+    async fn apply_video_media(
+        &mut self,
+        chat: ChatId,
+        message_id: MessageId,
+        result: Result<Option<Vec<u8>>, BackendError>,
+    ) {
+        let same_target = match self.state.pop_up.as_ref().map(|p| &p.popup_type) {
+            Some(PopupKind::Video(VideoPopup { msg, .. })) => {
+                msg.chat_id == chat && msg.message_id == message_id
+            }
+            _ => false,
+        };
+
+        if !same_target {
+            return;
+        }
+
+        let source = PlayKey { chat, message_id };
+
+        // Same split as audio: `Ok(None)` is the provider having no bytes yet,
+        // `Err` is a genuine download/decrypt failure. Both become a note in
+        // the popup's bottom border plus an `Error` snapshot, so the transport
+        // line shows ⚠ instead of pretending playback is possible.
+        let note = match result {
+            Ok(Some(bytes)) => {
+                debug!(chat = ?source.chat, msg = %source.message_id, "Video media loaded, awaiting play");
+                // Load only; playback starts on the first space press, so
+                // opening a video never starts decoding unasked.
+                self.video_player.load(source, bytes);
+                return;
+            }
+            Ok(None) => {
+                warn!(chat = ?source.chat, msg = %source.message_id, "No video media available");
+                "video not available yet — waiting on WhatsApp history re-sync".to_string()
+            }
+            Err(e) => {
+                error!(chat = ?source.chat, msg = %source.message_id, error = %e, "Video media download failed");
+                format!("download failed: {e}")
+            }
+        };
+
+        if let Some(popup) = self.state.pop_up.as_mut()
+            && let PopupKind::Video(video) = &mut popup.popup_type
+        {
+            // The border note and the placeholder both say it; the note is
+            // what the user reads first.
+            video.view.set_error(note.clone());
+            video.error_note = Some(note);
+        }
+
+        self.state.video = Some(PlaybackState {
+            source,
+            status: PlayState::Error,
+            position: 0.0,
+            duration: 0.0,
+            updated_at: Instant::now(),
+        });
+    }
+
+    /// Dismiss the current popup, stopping an active media session. Closing an
+    /// audio or video popup must silence playback and drop its state so
+    /// reopening starts from a fresh fetch (no position is retained).
     fn dismiss_popup(&mut self) {
-        let was_audio = self
-            .state
-            .pop_up
-            .as_ref()
-            .is_some_and(|p| matches!(p.popup_type, PopupKind::Audio(_)));
+        // Read before the popup is dropped below.
+        let popup_type = self.state.pop_up.as_ref().map(|p| &p.popup_type);
+
+        let was_audio = popup_type.is_some_and(|p| matches!(p, PopupKind::Audio(_)));
+        let was_video = popup_type.is_some_and(|p| matches!(p, PopupKind::Video(_)));
+
+        // `AppState::dismiss_popup` clears the stored playback snapshot.
+        // TODO: check the memory storage/usage of media when rendering a popup:
+        // Memory is apparently not being freed on dismiss
+        // toggling play/pause is consuming (increasing?) mem usage
+        self.state.dismiss_popup();
 
         if was_audio {
             debug!("audio popup dismissed, stopping playback");
-        }
-
-        // `AppState::dismiss_popup` clears the stored playback snapshot.
-        self.state.dismiss_popup();
-        if was_audio {
             self.player.stop();
+        }
+        if was_video {
+            debug!("video popup dismissed, stopping playback");
+            self.video_player.stop();
         }
     }
 
     async fn shutdown(&mut self) {
         self.cancel_chat_load();
         self.player.stop();
+        self.video_player.stop();
 
         for messenger in &mut self.state.messengers {
             if let Err(err) = messenger.disconnect().await {
@@ -1318,9 +1462,9 @@ impl App {
                     let mut msg = msg.clone();
                     if msg.reply_ctx.is_none()
                         && msg.reply_to_id.is_some()
-                        && let Some(messenger) = self.state.chat_owner(&msg.chat)
+                        && let Some(messenger) = self.state.chat_owner(&msg.chat_id)
                     {
-                        match messenger.reply_context(&msg.chat, &msg.message_id).await {
+                        match messenger.reply_context(&msg.chat_id, &msg.message_id).await {
                             Ok(context) => msg.reply_ctx = context,
                             Err(error) => {
                                 debug!(
@@ -1338,6 +1482,7 @@ impl App {
                     match msg.media.as_ref().map(|m| m.kind.clone()) {
                         Some(MediaKind::Image) => self.open_image_popup(msg),
                         Some(MediaKind::Audio { .. }) => self.open_audio_popup(msg),
+                        Some(MediaKind::Video) => self.open_video_popup(msg),
                         _ => self.state.create_popup(PopupKind::Message(msg)),
                     }
                 }
@@ -1401,22 +1546,40 @@ impl App {
         }
 
         if let Some(action) = media_action {
+            // The popup on screen decides which engine (and which state slot)
+            // the control applies to, so an audio popup can never drive the
+            // video player and vice versa.
+            let is_video = matches!(
+                self.state.pop_up.as_ref().map(|p| &p.popup_type),
+                Some(PopupKind::Video(_))
+            );
+
+            let player = if is_video {
+                &self.video_player
+            } else {
+                &self.player
+            };
+            let session = if is_video {
+                &self.state.video
+            } else {
+                &self.state.playback
+            };
+
             match action {
                 MediaAction::PlayPause => {
-                    let playing = self
-                        .state
-                        .playback
+                    let playing = session
                         .as_ref()
                         .is_some_and(|p| p.status == PlayState::Playing);
+
                     if playing {
-                        self.player.pause();
+                        player.pause();
                     } else {
-                        self.player.play();
+                        player.play();
                     }
                 }
                 MediaAction::Seek { delta_secs } => {
-                    debug!("Seeking {delta_secs}");
-                    self.player.seek_by(f64::from(delta_secs));
+                    debug!(video = is_video, "Seeking {delta_secs}");
+                    player.seek_by(f64::from(delta_secs));
                 }
             }
             return;
@@ -1432,7 +1595,8 @@ impl App {
                 return;
             } else if let PopupKind::Message(msg)
             | PopupKind::Image(ImagePopup { msg, .. })
-            | PopupKind::Audio(AudioPopup { msg, .. }) = &popup.popup_type
+            | PopupKind::Audio(AudioPopup { msg, .. })
+            | PopupKind::Video(VideoPopup { msg, .. }) = &popup.popup_type
                 && let KeyCode::Char(c) = key.code
                 && let Some(digit) = c.to_digit(10)
             {
@@ -1558,15 +1722,27 @@ impl App {
         }
 
         // add this here to the popup actually clears the content below it
-        if let Some(state) = &mut self.state.pop_up {
-            // Keep the audio popup's render mirror in sync with the live
-            // session (authoritative source: `AppState::playback`).
-            if let PopupKind::Audio(audio) = &mut state.popup_type {
+        if let Some(popup_state) = &mut self.state.pop_up {
+            // Keep each media popup's render mirror in sync with the live
+            // session (authoritative source: `AppState::playback`/`video`).
+            if let PopupKind::Audio(audio) = &mut popup_state.popup_type {
                 audio.playback = self.state.playback.clone();
             }
-            let tag = self.state.chat_state.get_tag();
 
-            popup::PopUp::new(tag.unwrap_or("")).render(frame.area(), frame.buffer_mut(), state);
+            if let PopupKind::Video(video) = &mut popup_state.popup_type {
+                video.playback = self.state.video.clone();
+            }
+
+            let tag = self.state.chat_state.get_tag();
+            let focused = self.state.focused;
+
+            popup_state.focused = focused;
+
+            popup::PopUp::new(tag.unwrap_or("")).render(
+                frame.area(),
+                frame.buffer_mut(),
+                popup_state,
+            );
         }
     }
 
@@ -1696,7 +1872,7 @@ mod tests {
     fn audio_demo_message() -> Message {
         Message {
             message_id: MessageId::from("audio-1"),
-            chat: ChatId::Myself,
+            chat_id: ChatId::Myself,
             sender: "Maria".into(),
             author_id: None,
             text: String::new(),
@@ -1864,6 +2040,351 @@ mod tests {
         assert_eq!(playback.status, PlayState::Paused);
         assert!(playback.position.abs() < 0.001, "must sit at the start");
         assert!((playback.duration - 1.0).abs() < 0.05);
+    }
+
+    fn video_demo_message() -> Message {
+        let mut msg = audio_demo_message();
+        msg.message_id = MessageId::from("video-1");
+        msg.media = Some(MessageMedia {
+            kind: MediaKind::Video,
+            caption: Some("clip".into()),
+            file_name: Some("clip.mp4".into()),
+        });
+        msg
+    }
+
+    fn video_popup() -> PopupKind {
+        PopupKind::Video(VideoPopup {
+            msg: video_demo_message(),
+            view: VideoWidgetState::new(
+                Arc::new(Mutex::new(None)),
+                ratatui_image::picker::Picker::halfblocks(),
+                tokio::sync::mpsc::unbounded_channel().0,
+            ),
+            playback: None,
+            error_note: None,
+        })
+    }
+
+    /// The `Loading` snapshot `open_video_popup` seeds; worker reports are only
+    /// accepted for a session with this source.
+    fn seed_video_session(app: &mut App) -> PlayKey {
+        let source = PlayKey {
+            chat: ChatId::Myself,
+            message_id: MessageId::from("video-1"),
+        };
+        app.state.video = Some(PlaybackState {
+            source: source.clone(),
+            status: PlayState::Loading,
+            position: 0.0,
+            duration: 0.0,
+            updated_at: Instant::now(),
+        });
+        source
+    }
+
+    /// Drain player reports, applying each to `app` and stopping once `done`
+    /// accepts the latest one. Every wait is bounded: a report that never
+    /// arrives must fail the test rather than hang the suite.
+    async fn wait_for_playback(
+        app: &mut App,
+        rx: &mut mpsc::UnboundedReceiver<UiEvent>,
+        mut done: impl FnMut(&PlaybackState) -> bool,
+    ) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut latest: Option<PlaybackState> = None;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let Ok(Some(event)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                panic!(
+                    "timed out waiting for a player report; last was {:?}",
+                    latest.as_ref().map(|s| s.status)
+                );
+            };
+
+            let UiEvent::PlaybackState(state) = event else {
+                continue;
+            };
+            app.state.apply_playback_state(state.clone());
+            if done(&state) {
+                return;
+            }
+            latest = Some(state);
+        }
+    }
+
+    /// A short synthetic clip, or `None` when ffmpeg is not installed. The
+    /// engine shells out to ffmpeg at runtime, so its tests cannot run without
+    /// it; generating the bytes here keeps this test honest about that.
+    fn sample_video_bytes() -> Option<Vec<u8>> {
+        use std::process::{Command, Stdio};
+
+        let probe = Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !probe {
+            return None;
+        }
+
+        let clip = tempfile::Builder::new()
+            .prefix("senders-video-test-")
+            .suffix(".mp4")
+            .tempfile()
+            .expect("scratch file for the generated clip");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x64:rate=25:duration=1",
+                "-pix_fmt",
+                "yuv420p",
+                "-y",
+                "-f",
+                "mp4",
+            ])
+            .arg(clip.path())
+            .status()
+            .expect("ffmpeg generates the test clip");
+        assert!(status.success(), "ffmpeg failed to build the test clip");
+
+        Some(std::fs::read(clip.path()).expect("generated clip is readable"))
+    }
+    #[tokio::test]
+    async fn selecting_a_video_message_opens_a_video_popup_and_fetches() {
+        // `open_video_popup` clones the messenger to move the fetch into a
+        // task, and `MessengerKind::Stub` panics on `clone`, so this one test
+        // uses the cloneable `Mock` variant rather than the `Stub` that
+        // `test_app` installs.
+        let config = Config::default();
+        let keymap = config.keys.parse().unwrap();
+        let mock = MockMessenger::new("Telegram");
+        let mut app = App::new(
+            config,
+            keymap,
+            vec![MessengerKind::Mock(Provider::Telegram, mock.clone())],
+            false,
+            ratatui_image::picker::Picker::halfblocks(),
+            tokio::sync::mpsc::unbounded_channel().0,
+        )
+        .await;
+
+        // A real provider chat: `open_video_popup` resolves the messenger from
+        // `msg.chat` and bails out when there is none (as for `ChatId::Myself`).
+        let mut msg = video_demo_message();
+        msg.chat_id = ChatId::Telegram(103);
+        app.state.chat_state.open_chat = Some(OpenChat {
+            chat: audio_chat(),
+            history: vec![msg],
+            has_more_history: false,
+        });
+        app.state.chat_state.message_list_state.select(Some(0));
+        app.state.focus = Focus::Chat;
+
+        let select = app.state.keymap.select;
+        app.handle_main_key(select).await;
+
+        let Some(PopupKind::Video(video)) = app.state.pop_up.as_ref().map(|p| &p.popup_type) else {
+            panic!("selecting a video must open a Video popup");
+        };
+        assert_eq!(video.msg.message_id, MessageId::from("video-1"));
+        assert!(video.error_note.is_none());
+
+        // The session is seeded as Loading so early worker reports route to it.
+        let session = app.state.video.as_ref().expect("video session seeded");
+        assert_eq!(session.status, PlayState::Loading);
+        assert_eq!(session.source.message_id, MessageId::from("video-1"));
+        assert_eq!(session.source.chat, ChatId::Telegram(103));
+    }
+
+    #[tokio::test]
+    async fn video_media_fetch_failure_leaves_a_note_and_an_error_status() {
+        let mut app = test_app().await;
+        app.state.create_popup(video_popup());
+        seed_video_session(&mut app);
+
+        // The mock has no video fixture, so the backgrounded fetch yields
+        // `Ok(None)` — the "provider has no bytes yet" path.
+        app.apply_video_media(ChatId::Myself, MessageId::from("video-1"), Ok(None))
+            .await;
+
+        let Some(PopupKind::Video(video)) = app.state.pop_up.as_ref().map(|p| &p.popup_type) else {
+            panic!("popup must still be open");
+        };
+        let note = video
+            .error_note
+            .as_deref()
+            .expect("a failed fetch must explain itself");
+        assert!(!note.is_empty(), "error note must not be empty");
+
+        let session = app.state.video.as_ref().expect("video session kept");
+        assert_eq!(session.status, PlayState::Error);
+    }
+
+    #[tokio::test]
+    async fn video_media_result_for_another_message_is_ignored() {
+        let mut app = test_app().await;
+        app.state.create_popup(video_popup());
+        seed_video_session(&mut app);
+
+        app.apply_video_media(
+            ChatId::Myself,
+            MessageId::from("some-other-message"),
+            Ok(None),
+        )
+        .await;
+
+        let Some(PopupKind::Video(video)) = app.state.pop_up.as_ref().map(|p| &p.popup_type) else {
+            panic!("popup must still be open");
+        };
+        assert!(
+            video.error_note.is_none(),
+            "a report for a different message must not touch this popup"
+        );
+        assert_eq!(app.state.video.as_ref().unwrap().status, PlayState::Loading);
+    }
+
+    #[tokio::test]
+    async fn dismissing_video_popup_is_clean() {
+        let mut app = test_app().await;
+        app.state.create_popup(video_popup());
+        seed_video_session(&mut app);
+
+        app.handle_popup_key(KeyEvent::from(KeyCode::Esc)).await;
+
+        assert!(app.state.pop_up.is_none());
+        assert!(
+            app.state.video.is_none(),
+            "the video session must not survive dismissal"
+        );
+    }
+
+    #[tokio::test]
+    async fn video_popup_digit_routes_to_message_action() {
+        let mut app = test_app().await;
+        app.state.chat_state.open_chat = Some(OpenChat {
+            chat: audio_chat(),
+            history: vec![video_demo_message()],
+            has_more_history: false,
+        });
+        app.state.create_popup(video_popup());
+
+        app.handle_popup_key(KeyEvent::from(KeyCode::Char('1')))
+            .await;
+
+        assert!(app.state.pop_up.is_none());
+        assert_eq!(app.state.focus, Focus::Write);
+        let reply = app
+            .state
+            .chat_state
+            .pending_reply
+            .as_ref()
+            .expect("reply should be armed");
+        assert_eq!(reply.message_id, MessageId::from("video-1"));
+    }
+
+    #[tokio::test]
+    async fn opening_a_video_does_not_autoplay_and_the_first_space_plays() {
+        let Some(bytes) = sample_video_bytes() else {
+            eprintln!("skipping: ffmpeg is not installed");
+            return;
+        };
+
+        let config = Config::default();
+        let keymap = config.keys.parse().unwrap();
+        let mock = Box::new(MockMessenger::new("Telegram"));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            config,
+            keymap,
+            vec![MessengerKind::Stub(Provider::Telegram, mock)],
+            false,
+            ratatui_image::picker::Picker::halfblocks(),
+            tx,
+        )
+        .await;
+        app.state.chat_state.open_chat = Some(OpenChat {
+            chat: audio_chat(),
+            history: vec![video_demo_message()],
+            has_more_history: false,
+        });
+        app.state.create_popup(video_popup());
+        let source = seed_video_session(&mut app);
+
+        // Feeding the downloaded bytes must load the session only. Playback
+        // starts on the first space press, never on open — loading merely
+        // leaves one decoded frame on screen.
+        app.apply_video_media(ChatId::Myself, MessageId::from("video-1"), Ok(Some(bytes)))
+            .await;
+
+        let mut saw_loading = false;
+        wait_for_playback(&mut app, &mut rx, |state| {
+            if state.status == PlayState::Loading {
+                saw_loading = true;
+                return false;
+            }
+            assert_eq!(
+                state.source, source,
+                "a video report must carry the session's source"
+            );
+            assert_eq!(
+                state.status,
+                PlayState::Paused,
+                "load must leave the video paused, not playing"
+            );
+            true
+        })
+        .await;
+        assert!(saw_loading);
+        assert_eq!(app.state.video.as_ref().unwrap().status, PlayState::Paused);
+
+        // Loading must publish a poster frame while still paused: the frame is
+        // on screen *before* the user presses space, not as a side effect of
+        // pressing it. Without this the popup sits on "Loading video…" until
+        // playback has already started.
+        let frame_before_play = app.video_frames.try_lock().is_ok_and(|slot| slot.is_some());
+        assert!(
+            frame_before_play,
+            "load must leave a decoded frame in the slot while paused"
+        );
+
+        // The first space press is what starts playback.
+        let space = KeyEvent::from(KeyCode::Char(' '));
+        assert_eq!(
+            app.state.media_controls(&space, &app.state.keymap),
+            Some(MediaAction::PlayPause),
+            "space must be bound on a video popup"
+        );
+        app.handle_popup_key(space).await;
+
+        wait_for_playback(&mut app, &mut rx, |state| {
+            state.status == PlayState::Playing
+        })
+        .await;
+        assert_eq!(app.state.video.as_ref().unwrap().status, PlayState::Playing);
+
+        // The clip is a second long, so the engine reaches EOF on its own and
+        // stops; that must not be mistaken for a failure.
+        wait_for_playback(&mut app, &mut rx, |state| {
+            if state.status == PlayState::Playing {
+                return false;
+            }
+            assert_ne!(
+                state.status,
+                PlayState::Error,
+                "a 1s clip must play to EOF, not error"
+            );
+            true
+        })
+        .await;
     }
 
     /// Hardware-free mic for push-to-talk dispatch tests; always yields an
