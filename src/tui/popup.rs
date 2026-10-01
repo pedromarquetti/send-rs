@@ -1,5 +1,5 @@
-use ratatui::prelude::*;
 use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::{prelude::*, widgets};
 use std::fmt::Debug;
 use std::time::Instant;
 
@@ -174,7 +174,6 @@ impl StatefulWidget for &mut PopUp {
 
                 Paragraph::new(format!("{data}\n\n{}", Line::from(options)))
                     .style(text_style)
-                    .scroll((state.scroll_idx as u16, 0))
                     .block(block.clone())
                     .render(popup_area, buf);
             }
@@ -338,8 +337,6 @@ impl StatefulWidget for &mut PopUp {
             }
 
             PopupKind::Image(ImagePopup { msg, view }) => {
-                // TODO: refactor this: long captions do not show properly and should
-                // be wrapped to a new line
                 let max_width = area.width.saturating_sub(2);
                 let width = ((area.width as u32 * 9 / 10) as u16)
                     .clamp(30.min(max_width), max_width.max(30));
@@ -366,34 +363,28 @@ impl StatefulWidget for &mut PopUp {
                     horizontal: 1,
                 });
 
-                let mut caption_lines: Vec<Line> = Vec::new();
+                let split_vert =
+                    Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(inner);
+
+                let split_hor =
+                    Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(split_vert[0]);
+
+                ImageWidget.render(split_hor[0], buf, view);
+
                 if let Some(caption) = msg
                     .media
                     .as_ref()
                     .and_then(|media| media.caption.clone())
                     .filter(|caption| !caption.trim().is_empty())
                 {
-                    for text_line in caption.lines() {
-                        for chunk in wrap_text(text_line, inner.width as usize) {
-                            caption_lines.push(Line::from(Span::raw(chunk)));
-                        }
-                    }
+                    Paragraph::new(caption)
+                        .scroll((state.scroll_idx as u16, 0))
+                        .wrap(widgets::Wrap { trim: false })
+                        .render(split_hor[1], buf);
                 }
 
-                let split = Layout::vertical([
-                    Constraint::Fill(1),
-                    Constraint::Length(caption_lines.len() as u16),
-                    Constraint::Length(1),
-                ])
-                .split(inner);
-
-                ImageWidget.render(split[0], buf, view);
-
-                if !caption_lines.is_empty() {
-                    Paragraph::new(caption_lines).render(split[1], buf);
-                }
-
-                Paragraph::new(message_actions_line(msg)).render(split[2], buf);
+                Paragraph::new(message_actions_line(msg)).render(split_vert[1], buf);
             }
 
             PopupKind::Audio(AudioPopup {
@@ -437,27 +428,10 @@ impl StatefulWidget for &mut PopUp {
 
                 content_lines.push(Line::from(Span::styled(progress, border_style)));
 
-                if let Some(caption) = msg
-                    .media
-                    .as_ref()
-                    .and_then(|media| media.caption.clone())
-                    .filter(|caption| !caption.trim().is_empty())
-                {
-                    content_lines.push(Line::from(Span::raw("")));
-
-                    for text_line in caption.lines() {
-                        for chunk in wrap_text(text_line, content_width) {
-                            content_lines.push(Line::from(Span::raw(chunk)));
-                        }
-                    }
-                }
-
                 let options_line = message_actions_line(msg);
 
                 let total_lines = content_lines.len();
-                let popup_height = (total_lines as u16 + 4)
-                    .min(area.height.saturating_sub(4))
-                    .max(6);
+                let popup_height = (total_lines as u16 * 6).min(area.height);
                 let popup_area = popup_area(area, width, popup_height);
 
                 Clear.render(popup_area, buf);
@@ -467,35 +441,50 @@ impl StatefulWidget for &mut PopUp {
                     horizontal: 1,
                 });
 
-                let split = Layout::vertical([
+                let split_vert = Layout::vertical([
                     Constraint::Fill(1),
                     Constraint::Length(1),
                     Constraint::Length(1),
                 ])
                 .split(inner);
 
-                let viewport_height = split[0].height as usize;
-                state.scroll_idx = state
-                    .scroll_idx
-                    .min(total_lines.saturating_sub(viewport_height));
+                let split_hor =
+                    Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(split_vert[0]);
 
-                let paragraph = Paragraph::new(content_lines)
-                    .scroll((state.scroll_idx as u16, 0))
-                    .block(block);
-                paragraph.render(popup_area, buf);
+                if let Some(caption) = msg
+                    .media
+                    .as_ref()
+                    .and_then(|media| media.caption.clone())
+                    .filter(|caption| !caption.trim().is_empty())
+                {
+                    Paragraph::new(caption)
+                        .scroll((state.scroll_idx as u16, 0))
+                        .wrap(widgets::Wrap { trim: false })
+                        .render(split_hor[1], buf);
+                }
+
+                Paragraph::new(content_lines).render(split_hor[0], buf);
+
+                block.render(popup_area, buf);
 
                 let hint = Line::from(Span::styled(
                     "  space ▸ play/pause   < ▸ -5s   > ▸ +5s   esc ▸ close".to_string(),
                     Style::default().fg(Color::DarkGray),
                 ));
 
-                Paragraph::new(hint).style(text_style).render(split[1], buf);
+                Paragraph::new(hint)
+                    .style(text_style)
+                    .render(split_vert[1], buf);
                 Paragraph::new(options_line)
                     .style(text_style)
-                    .render(split[2], buf);
+                    .render(split_vert[2], buf);
             }
 
-            // #[allow(dead_code)]
+            // <video> <caption>
+            // <bottom content such as progress bar and actions>
+            // TODO: check video fitting and rendering here - landscape video is not being redered
+            // in landscape orientation
             PopupKind::Video(VideoPopup {
                 msg,
                 view,
@@ -520,34 +509,6 @@ impl StatefulWidget for &mut PopUp {
                     None => block,
                 };
 
-                // One caption row, like the image popup: the frame viewport is
-                // the point of this popup and gets everything the caption and
-                // the fixed lines below do not need. The caption is truncated
-                // to the width with an ellipsis so it reads as cut rather than
-                // as the whole message.
-                let caption_line = msg
-                    .media
-                    .as_ref()
-                    .and_then(|media| media.caption.clone())
-                    .filter(|caption| !caption.trim().is_empty())
-                    .map(|caption| {
-                        let mut chunks =
-                            wrap_text(&caption, width.saturating_sub(2) as usize).into_iter();
-                        let head = chunks.next().unwrap_or_default();
-
-                        match chunks.next() {
-                            // `wrap_text` already ellipsises an overlong word.
-                            Some(_) if !head.ends_with('…') => format!("{head}…"),
-                            Some(_) => head,
-                            None => head,
-                        }
-                    })
-                    .map(|caption| Line::from(Span::raw(caption)));
-
-                // The video is the whole point of this popup, so the popup takes
-                // the full 90% height. Sizing it to its content instead (which is
-                // what the image popup does) pins the frame at a couple of rows
-                // however large the terminal is.
                 let max_height = ((area.height as u32 * 9 / 10) as u16)
                     .min(area.height.saturating_sub(1))
                     .max(8);
@@ -562,9 +523,8 @@ impl StatefulWidget for &mut PopUp {
                     horizontal: 1,
                 });
 
-                let split = Layout::vertical([
+                let split_vert = Layout::vertical([
                     Constraint::Fill(1),
-                    Constraint::Length(1),
                     Constraint::Length(1),
                     Constraint::Length(1),
                     Constraint::Length(1),
@@ -572,7 +532,11 @@ impl StatefulWidget for &mut PopUp {
                 ])
                 .split(inner);
 
-                VideoWidget.render(split[0], buf, view);
+                let split_hor =
+                    Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(split_vert[0]);
+
+                VideoWidget.render(split_hor[0], buf, view);
 
                 let (status_icon, elapsed, duration, ratio) = playback_status(playback.as_ref());
 
@@ -589,26 +553,34 @@ impl StatefulWidget for &mut PopUp {
                     ),
                     border_style.add_modifier(Modifier::BOLD),
                 )))
-                .render(split[1], buf);
+                .render(split_vert[1], buf);
 
                 Paragraph::new(progress_strip(ratio, width.saturating_sub(2) as usize))
-                    .render(split[2], buf);
+                    .render(split_vert[2], buf);
 
-                // The caption keeps its single row whatever its length, so the
-                // frame above never moves and scrolling it is not wired up yet.
-                if let Some(caption_line) = caption_line {
-                    Paragraph::new(caption_line).render(split[3], buf);
+                if let Some(caption_line) = msg
+                    .media
+                    .as_ref()
+                    .and_then(|media| media.caption.clone())
+                    .filter(|caption| !caption.trim().is_empty())
+                {
+                    Paragraph::new(caption_line)
+                        .scroll((state.scroll_idx as u16, 0))
+                        .wrap(widgets::Wrap { trim: false })
+                        .render(split_hor[1], buf);
                 }
 
                 Paragraph::new(message_actions_line(msg))
                     .style(text_style)
-                    .render(split[4], buf);
+                    // .render(split[4], buf);
+                    .render(split_vert[3], buf);
 
                 Paragraph::new(Line::from(Span::styled(
                     "  space ▸ play/pause   < ▸ -5s   > ▸ +5s   esc ▸ close".to_string(),
                     Style::default().fg(Color::DarkGray),
                 )))
-                .render(split[5], buf);
+                // .render(split[5], buf);
+                .render(split_vert[4], buf);
             }
         }
     }
