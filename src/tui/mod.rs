@@ -265,11 +265,10 @@ async fn run_app(
 
     // handling new events for each messenger type
     for messenger in messengers.iter() {
-        // removing this because wp login was broken
-        // if !messenger.is_enabled(&config.providers) {
-        //     continue;
-        // }
-
+        // Every provider is subscribed, enabled or not: subscribing only
+        // installs a receiver, and a dormant provider has nothing to emit yet.
+        // Gating the subscription on the config instead would leave a provider
+        // enabled later from settings with no receiver attached.
         let mut backend_rx = messenger.subscribe();
         let forward_tx = tx.clone();
         let provider = messenger.provider();
@@ -305,6 +304,12 @@ async fn run_app(
         tx.clone(),
     )
     .await;
+
+    // Lifecycle step: every backend receiver above is registered, so an enabled
+    // provider can be started without a `broadcast` channel dropping its first
+    // `Connected` / `QrCode` event. Providers the configuration leaves disabled
+    // stay dormant: no transport, no provider fetch.
+    app.state.start_enabled_providers();
 
     info!("TUI started");
 

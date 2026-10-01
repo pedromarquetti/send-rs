@@ -1097,6 +1097,29 @@ impl AppState {
         self.messengers.iter().find(|m| m.provider() == provider)
     }
 
+    /// Lifecycle step of the startup sequence: start every provider the
+    /// configuration enables, once all backend event receivers are registered.
+    ///
+    /// A provider the config leaves disabled stays `constructed/dormant` and
+    /// therefore opens no transport, which is what makes the disabled-provider
+    /// surfaces (no QR/`Connected`, no chat fetch, no notifications) hold.
+    /// Enabling a provider later from settings re-enters the same idempotent
+    /// [`Messenger::start`] path.
+    pub fn start_enabled_providers(&self) {
+        for messenger in self.messengers.iter() {
+            let provider = messenger.provider();
+            if provider.is_enabled(&self.config.providers) {
+                info!(provider = provider.name(), "starting enabled provider");
+                messenger.start();
+            } else {
+                info!(
+                    provider = provider.name(),
+                    "provider disabled; left dormant"
+                );
+            }
+        }
+    }
+
     fn provider_to_messenger_mut(&mut self, provider: Provider) -> Option<&mut MessengerKind> {
         self.messengers
             .iter_mut()
@@ -1210,20 +1233,18 @@ impl AppState {
         // Verify messenger was initialized
         let messenger = match self.provider_to_messenger(provider) {
             Some(m) => match m {
-                MessengerKind::WhatsApp(w) => {
-                    w.start();
-                    m
-                }
                 MessengerKind::Telegram(t) => {
                     // A configured-but-disabled messenger has no running
                     // listener; enabling it kicks one off so updates flow.
                     t.set_enabled(true);
                     m
                 }
-
-                MessengerKind::Mock(_, _) => m,
-                #[cfg(test)]
-                MessengerKind::Stub(_, _) => m,
+                // Every other provider opens its transport through the same
+                // idempotent `start()` the startup sequence uses.
+                _ => {
+                    m.start();
+                    m
+                }
             },
             None => {
                 self.create_popup(PopupKind::Error(format!(
@@ -1830,6 +1851,7 @@ mod tests {
     use ratatui::widgets::StatefulWidget;
     use ratatui_image::picker::Picker;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use tokio::sync::Mutex;
     use tokio::sync::broadcast;
 
@@ -2062,6 +2084,91 @@ mod tests {
         state.start_loading(LoadingArea::ChatList, "Fetching chats...");
         state.apply_fetched(Vec::new(), Vec::new());
         assert!(state.loading.is_none());
+    }
+
+    /// A handle to a stub provider's `start()` counter, kept by the test after
+    /// the stub itself was moved into the state.
+    #[derive(Clone)]
+    struct StartCount(Arc<AtomicUsize>);
+
+    impl StartCount {
+        fn load(&self) -> usize {
+            self.0.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    /// Build an `AppState` holding one stub per provider, plus a `start()` count
+    /// for each so a lifecycle assertion can inspect them after the move.
+    async fn stub_provider_state(whatsapp: bool) -> (AppState, StartCount, StartCount) {
+        let telegram = StubMessenger::new();
+        let whatsapp_stub = StubMessenger::new();
+        let telegram_starts = StartCount(telegram.start_calls.clone());
+        let whatsapp_starts = StartCount(whatsapp_stub.start_calls.clone());
+
+        let mut config = Config::default();
+        config.providers.telegram.enabled = true;
+        config.providers.whatsapp = whatsapp;
+        let keymap = config.keys.parse().unwrap();
+        let state = AppState::new(
+            config,
+            keymap,
+            vec![
+                MessengerKind::Stub(Provider::Telegram, Box::new(telegram)),
+                MessengerKind::Stub(Provider::WhatsApp, Box::new(whatsapp_stub)),
+            ],
+            false,
+        )
+        .await;
+
+        (state, telegram_starts, whatsapp_starts)
+    }
+
+    #[tokio::test]
+    async fn startup_starts_only_enabled_providers() {
+        let (state, telegram, whatsapp) = stub_provider_state(/* whatsapp */ false).await;
+
+        state.start_enabled_providers();
+
+        assert_eq!(telegram.load(), 1, "enabled Telegram must be started");
+        assert_eq!(whatsapp.load(), 0, "a disabled provider must stay dormant");
+    }
+
+    #[tokio::test]
+    async fn startup_starts_whatsapp_when_enabled() {
+        let (state, _telegram, whatsapp) = stub_provider_state(/* whatsapp */ true).await;
+
+        state.start_enabled_providers();
+
+        assert_eq!(whatsapp.load(), 1, "enabled WhatsApp must be started");
+    }
+
+    #[tokio::test]
+    async fn subscribe_before_start_receives_the_first_event() {
+        let (state, telegram, _) = stub_provider_state(/* whatsapp */ false).await;
+
+        // Mirrors the startup order in `tui::run`: receivers first, then start.
+        let mut rx = state.messengers[0].subscribe();
+        state.start_enabled_providers();
+
+        assert_eq!(telegram.load(), 1, "the subscribed provider must start");
+        assert!(
+            matches!(rx.recv().await, Ok(BackendEvent::Connected)),
+            "a provider started after subscribing must not lose its first event"
+        );
+    }
+
+    #[tokio::test]
+    async fn enabling_whatsapp_from_settings_starts_it() {
+        let (mut state, _, whatsapp) = stub_provider_state(/* whatsapp */ false).await;
+
+        state.toggle_provider(Provider::WhatsApp).await;
+
+        assert_eq!(
+            whatsapp.load(),
+            1,
+            "the settings toggle must start WhatsApp"
+        );
+        assert!(state.config.providers.whatsapp);
     }
 
     #[tokio::test]
@@ -3256,6 +3363,7 @@ mod tests {
         history_result: std::sync::Mutex<Option<Result<Vec<Message>, BackendError>>>,
         set_read_result: std::sync::Mutex<Option<Result<(), BackendError>>>,
         cancel_refresh_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        start_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         tx: broadcast::Sender<BackendEvent>,
     }
 
@@ -3268,6 +3376,7 @@ mod tests {
                 history_result: std::sync::Mutex::new(None),
                 set_read_result: std::sync::Mutex::new(None),
                 cancel_refresh_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                start_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 tx,
             }
         }
@@ -3382,6 +3491,14 @@ mod tests {
 
         fn subscribe(&self) -> broadcast::Receiver<BackendEvent> {
             self.tx.subscribe()
+        }
+
+        fn start(&self) {
+            self.start_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // A started provider announces itself on the same channel a real
+            // transport would use for its first `Connected` event.
+            let _ = self.tx.send(BackendEvent::Connected);
         }
 
         async fn cancel_chat_refresh(&self) {

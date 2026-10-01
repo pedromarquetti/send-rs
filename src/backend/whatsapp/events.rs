@@ -16,6 +16,7 @@ use tokio::sync::broadcast::Sender;
 use tracing::{debug, info, warn};
 use whatsapp_rust::Client;
 use whatsapp_rust::prelude::{Event, Server};
+use whatsapp_rust::transport::DisconnectReason;
 use whatsapp_rust::wacore::types::message::EditAttribute;
 use whatsapp_rust::wacore_binary::JidExt;
 
@@ -88,10 +89,15 @@ impl WhatsAppMessenger {
                 let _ = tx.send(BackendEvent::Connected);
             }
             Event::Disconnected(e) => {
-                let _ = tx.send(BackendEvent::Disconnected(format!(
-                    "WhatsApp: Disconnected! {:?}",
-                    e
-                )));
+                // only propagate error if is not Stream Ended - Stream Ended is expected,
+                // since WP auto disconnects the client after a while... but whatsapp-rust
+                // auto-reconnects
+                if e.reason != DisconnectReason::StreamEnded {
+                    let _ = tx.send(BackendEvent::Disconnected(format!(
+                        "WhatsApp: Disconnected! {:?}",
+                        e
+                    )));
+                }
             }
             Event::StreamError(e) => {
                 let err = format!("WhatsApp: ! {:?}", e);

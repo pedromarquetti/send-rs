@@ -1,28 +1,31 @@
 # Welcome to Sender!
 
 <!--toc:start-->
-
 - [Welcome to Sender!](#welcome-to-sender)
   - [System requirements](#system-requirements)
-    - [Linux](#linux)
-    - [macOS](#macos)
-    - [Windows](#windows)
-    - [Notifications](#notifications)
+    - [Requirements for **audio recording**](#requirements-for-audio-recording)
+      - [Linux](#linux)
+      - [macOS](#macos)
+      - [Windows](#windows)
+    - [Requirements for OS Notifications](#requirements-for-os-notifications)
+      - [Linux](#linux-1)
+      - [macOS — the presenting application is identified by the **bundle](#macos-the-presenting-application-is-identified-by-the-bundle)
+      - [Windows](#windows-1)
   - [Features](#features)
   - [Configuration](#configuration)
     - [Example `config.toml`:](#example-configtoml)
       - [Top-level options](#top-level-options)
-      - [Notifications](#notifications-1)
+      - [Notifications](#notifications)
       - [Providers](#providers)
     - [Telegram Setup](#telegram-setup)
     - [WhatsApp Setup](#whatsapp-setup)
+      - [Manual cold-start smoke test](#manual-cold-start-smoke-test)
   - [Controls / Key Bindings](#controls-key-bindings)
   - [Limitations](#limitations)
     - [Telegram (grammers / Telegram protocol)](#telegram-grammers-telegram-protocol)
     - [WhatsApp (whatsapp-rust / WhatsApp Web protocol)](#whatsapp-whatsapp-rust-whatsapp-web-protocol)
   - [Built with](#built-with)
   - [Inspirations](#inspirations)
-
 <!--toc:end-->
 
 Sender is an TUI app for interacting with Whatsapp AND telegram (maybe more in
@@ -273,6 +276,21 @@ WhatsApp has no credentials — pairing happens through a QR code:
 > be online and reachable; if it ignores the request, Senders times out after 10
 > seconds and keeps whatever is currently cached (scroll up again later to
 > retry).
+
+#### Manual cold-start smoke test
+
+WhatsApp only starts its transport once the TUI has registered every backend
+event receiver, and only when the provider is enabled; a disabled provider stays
+dormant (no connection, no QR). To exercise the offline-recovery path:
+
+1. Pair a dedicated account.
+2. Close Senders.
+3. Send messages from another account, including one group message with media.
+4. Restart Senders with WhatsApp enabled.
+5. Verify the messages are recovered exactly once — no duplicates — including
+   the group message and its media.
+6. Repeat the steps, interrupting the sync before it finishes, and verify
+   recovery still completes on the next start.
 
 ## Controls / Key Bindings
 

@@ -14,13 +14,17 @@ use super::convert::{
 };
 use super::ids::{canonical_chat_id, fold_lid_key, own_chat_id};
 use super::media::{MediaRef, handle_wa_media, ref_media_type, wa_media_ref};
+use super::messenger::WhatsAppMessenger;
 use super::state::{SharedState, WhatsAppState};
 use super::sync::{
     CdnFields, handle_history_sync, outbound_media_message, presence_label,
     should_skip_conversation,
 };
-use crate::backend::{Chat, ChatId, MediaKind, Message, MessageAction, MessageId, MessageMedia};
+use crate::backend::{
+    Chat, ChatId, MediaKind, Message, MessageAction, MessageId, MessageMedia, Messenger,
+};
 use chrono::TimeZone;
+use std::time::Duration;
 use whatsapp_rust::prelude::MessageField;
 use whatsapp_rust::wacore::types::message::MessageSource;
 
@@ -1928,4 +1932,62 @@ fn outbound_unsupported_kind_is_rejected() {
         err.to_string().contains("unsupported media kind"),
         "unexpected error: {err}"
     );
+}
+
+// -- Dormant lifecycle --
+
+/// A messenger that is constructed but never started must be fully inert: no
+/// transport, so no `Connected` and no `QrCode` reach a subscriber. Local-only
+/// work (sqlite store, JSON cache) is expected and allowed while dormant.
+#[tokio::test]
+async fn a_dormant_messenger_emits_no_events() {
+    let dir = std::env::temp_dir().join(format!("senders-wa-dormant-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store_path = dir.join("wa.db");
+
+    let mut messenger = WhatsAppMessenger::new(store_path.to_string_lossy().to_string())
+        .await
+        .expect("dormant construction should succeed offline");
+    let mut events = messenger.subscribe();
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(400), events.recv())
+            .await
+            .is_err(),
+        "a dormant provider must not emit Connected or a QR code"
+    );
+    assert!(!messenger.is_authenticated().await);
+
+    messenger.disconnect().await.expect("dormant shutdown");
+}
+
+/// The cold-start recovery inputs are established at construction time and must
+/// survive the lifecycle move: a dormant messenger already carries the full-sync
+/// history configuration the server needs to redeliver messages received while
+/// the client was offline.
+#[tokio::test]
+async fn construction_keeps_the_full_sync_history_config() {
+    let dir = std::env::temp_dir().join(format!("senders-wa-props-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store_path = dir.join("wa.db");
+
+    let mut messenger = WhatsAppMessenger::new(store_path.to_string_lossy().to_string())
+        .await
+        .expect("dormant construction should succeed offline");
+
+    let device = messenger
+        .current_client()
+        .persistence_manager()
+        .get_device_snapshot();
+    let props = &device.device_props;
+    assert_eq!(props.require_full_sync, Some(true));
+    let history = props
+        .history_sync_config
+        .as_option()
+        .expect("history config");
+    assert_eq!(history.full_sync_days_limit, Some(365));
+    assert_eq!(history.on_demand_ready, Some(true));
+    assert_eq!(history.complete_on_demand_ready, Some(true));
+
+    messenger.disconnect().await.expect("dormant shutdown");
 }

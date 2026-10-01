@@ -36,11 +36,10 @@ use whatsapp_rust::waproto::whatsapp::device_props::{HistorySyncConfig, Platform
 #[derive(Clone)]
 pub struct WhatsAppMessenger {
     client: Arc<Client>,
-    /// The configured-but-not-yet-started bot. The bot is intentionally not
-    /// spawned in `new()`: it is spun up lazily on the first [`Self::subscribe`]
-    /// so the TUI (which subscribes before reading the event channel) can never
-    /// miss the initial `Connected` / `QrCode` events, which a `broadcast`
-    /// channel would otherwise drop for not-yet-registered receivers.
+    /// The configured-but-not-yet-started bot. It is intentionally not spawned
+    /// in `new()`: only [`Messenger::start`] claims it, which is what keeps a
+    /// dormant provider free of any transport. Once claimed it is `None`, so a
+    /// second `start()` is a no-op.
     bot: Arc<Mutex<Option<Bot>>>,
     run_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     tx: Sender<BackendEvent>,
@@ -56,8 +55,11 @@ pub struct WhatsAppMessenger {
 
 impl WhatsAppMessenger {
     /// Open (or create) the sqlite store, build the bot with event callbacks,
-    /// and return a messenger bound to the live client. The bot is not started
-    /// until [`Self::subscribe`] is first called.
+    /// and return a messenger in the `constructed/dormant` state.
+    ///
+    /// Dormant is local-only work: the store, the JSON cache and the client are
+    /// all prepared, but no transport is opened and no provider API is called.
+    /// [`Messenger::start`] is the only way to reach the network.
     pub async fn new(store_path: String) -> Result<Self, BackendError> {
         let store = SqliteStore::new(&store_path)
             .await
@@ -201,7 +203,7 @@ impl WhatsAppMessenger {
         })
     }
 
-    fn current_client(&self) -> Arc<Client> {
+    pub(crate) fn current_client(&self) -> Arc<Client> {
         self.client.clone()
     }
 
@@ -212,19 +214,39 @@ impl WhatsAppMessenger {
         Ok(())
     }
 
-    /// Start the bot (once) if it has not been started yet, and return whether
-    /// this call performed the start. Starting is idempotent: the first caller
-    /// spawns the bot and its failure-watcher; later calls are no-ops.
-    pub fn start(&self) {
-        if self.shutdown.load(Ordering::SeqCst) {
+    /// Take the configured bot out of its dormant slot and hand it back to the
+    /// caller that owns the run loop. Returns `None` once the bot has been
+    /// claimed, which is what makes [`Messenger::start`] idempotent.
+    fn take_bot(&self) -> Option<Bot> {
+        self.bot.lock().unwrap().take()
+    }
+
+    /// Adopt the handle of the spawned run loop together with its failure
+    /// watcher, which reports an unexpected end of the loop as `Disconnected`.
+    fn track_run_task(&self, run_task: JoinHandle<()>) {
+        *self.run_task.lock().unwrap() = Some(run_task);
+    }
+
+    /// True once [`Messenger::disconnect`] ran; a shut-down provider must never
+    /// be started again.
+    fn is_shutting_down(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl Messenger for WhatsAppMessenger {
+    /// `dormant -> started`: spawn the bot exactly once, which is the first
+    /// point at which this provider touches the network. Called by the TUI for
+    /// an explicitly enabled provider, after every event receiver is
+    /// registered, so the first `Connected` / `QrCode` event has a subscriber.
+    fn start(&self) {
+        if self.is_shutting_down() {
             return;
         }
 
-        let bot = {
-            match self.bot.lock().unwrap().take() {
-                Some(bot) => bot,
-                None => return,
-            }
+        let Some(bot) = self.take_bot() else {
+            return;
         };
 
         let handle = bot.spawn();
@@ -243,12 +265,9 @@ impl WhatsAppMessenger {
             }
         });
 
-        *self.run_task.lock().unwrap() = Some(run_task);
+        self.track_run_task(run_task);
     }
-}
 
-#[async_trait::async_trait]
-impl Messenger for WhatsAppMessenger {
     async fn is_authenticated(&self) -> bool {
         self.client.clone().is_logged_in()
     }
@@ -300,7 +319,7 @@ impl Messenger for WhatsAppMessenger {
             let client = self.current_client();
             let _ = client
                 .mark_as_read(&target_jid, author.as_ref(), &[latest_id.as_str()])
-                .await;
+                .await?;
         }
 
         let mut state = self.state.write().await;

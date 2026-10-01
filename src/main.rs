@@ -157,9 +157,12 @@ async fn main() -> Result<()> {
             info!("Telegram: disabled and not configured, skipping");
         }
 
-        // Initialize WhatsApp when it is enabled. Unlike Telegram, WhatsApp pairing
-        // is event-driven (QR code), so the messenger is constructed unconditionally
-        // when enabled and the bot is started on first TUI subscription.
+        // Construct WhatsApp even while disabled, so the settings screen can
+        // offer an explicit "enable" action. Construction is local-only (sqlite
+        // store + JSON cache); the transport is opened later by `start()`, which
+        // the TUI calls after registering the backend event receivers and only
+        // for a provider the configuration enables. See the whatsapp module
+        // docs for the full lifecycle invariant.
         {
             let whatsapp_path = Config::user_config_dir()?.join("wa.db");
 
@@ -169,13 +172,10 @@ async fn main() -> Result<()> {
 
             match WhatsAppMessenger::new(whatsapp_path.to_string_lossy().to_string()).await {
                 Ok(wa) => {
-                    info!("WhatsApp messenger initialized");
-                    // Start the transport only when enabled; a disabled provider
-                    // stays inert (no connection, no QR) until the user enables it.
                     if config.providers.whatsapp {
-                        wa.start();
+                        info!("WhatsApp: enabled, provider will start in the TUI");
                     } else {
-                        info!("WhatsApp: enabled=false, keeping provider inactive");
+                        info!("WhatsApp: enabled=false, provider stays dormant");
                     }
                     messengers.push(MessengerKind::WhatsApp(wa));
                 }

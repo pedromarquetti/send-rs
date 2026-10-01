@@ -12,6 +12,23 @@
 //! - [`media`]: media references and kind detection.
 //! - [`sync`]: history sync, conversation filtering, name enrichment.
 //! - [`transport`]: address-racing WebSocket connect.
+//!
+//! # Lifecycle
+//!
+//! ```text
+//! constructed/dormant -> explicitly enabled -> started -> connected/paired
+//! constructed/dormant -> disabled (no transport, no provider fetch)
+//! started -> disconnected/reconnecting
+//! started -> graceful shutdown
+//! ```
+//!
+//! `WhatsAppMessenger::new` only opens the local sqlite store and JSON cache,
+//! and `subscribe` only installs a receiver: neither may start network work.
+//! [`Messenger::start`](crate::backend::Messenger::start) is the single
+//! transition into `started`, it is idempotent, and the TUI calls it after every
+//! backend receiver is registered so the first `Connected` / `QrCode` event is
+//! never dropped. A provider that stays `dormant` therefore opens no WebSocket,
+//! emits no QR/`Connected`, fetches no chats and posts no notifications.
 
 mod convert;
 mod events;

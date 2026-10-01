@@ -490,6 +490,27 @@ pub trait Messenger: Send + Sync {
     }
     /// Messenger provider >>> Client message handling
     fn subscribe(&self) -> broadcast::Receiver<BackendEvent>;
+    /// Move the provider from `constructed/dormant` to `started`.
+    ///
+    /// The lifecycle every provider follows is:
+    ///
+    /// ```text
+    /// constructed/dormant -> explicitly enabled -> started -> connected/paired
+    /// constructed/dormant -> disabled (no transport, no provider fetch)
+    /// started -> disconnected/reconnecting
+    /// started -> graceful shutdown
+    /// ```
+    ///
+    /// Only this call (and the actions that reach it) may open a transport, so
+    /// `new`, `subscribe`, `is_authenticated` and a disabled-provider chat-list
+    /// poll all stay inert. The TUI calls it once per enabled provider, after
+    /// every event receiver is registered, so a late subscription can never drop
+    /// the first `Connected` / `QrCode` event. Implementations must be
+    /// idempotent: enabling a provider later may call this again.
+    ///
+    /// The default is a no-op for providers whose transport is already live by
+    /// the time they are constructed.
+    fn start(&self) {}
     /// Optional provider-specific status for a chat, such as Telegram online/last-seen information.
     /// The default is `None`; a provider may fill this in later without changing the UI contract.
     async fn status(&self, _chat: &ChatId) -> Result<Option<String>, BackendError> {
@@ -624,6 +645,7 @@ impl MessengerKind {
         , async fn edit(&self, chat: &ChatId, id: &MessageId, text: &str) -> Result<(), BackendError> ;
         , async fn media_bytes(&self, chat: &ChatId, message_id: &MessageId) -> Result<Option<Vec<u8>>, BackendError> ;
         , fn subscribe(&self) -> broadcast::Receiver<BackendEvent> ;
+        , fn start(&self) -> () ;
         , async fn status(&self, chat: &ChatId) -> Result<Option<String>, BackendError> ;
         , async fn cancel_chat_refresh(&self) -> () ;
         , async fn reconnect(&self) -> Result<(), BackendError> ;
