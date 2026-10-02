@@ -65,10 +65,22 @@ impl WhatsAppMessenger {
             .await
             .map_err(|e| BackendError::Other(format!("WhatsApp: failed to open store: {e}")))?;
 
+        // `wa.db` holds the account's session keys; its `-wal` (write-ahead
+        // log) and `-shm` (shared memory) sidecars hold uncommitted pages of
+        // the same data. SQLite creates them with the process umask, typically
+        // world-readable, so tighten them now — before the first login or sync
+        // can write account data into them.
+        for suffix in ["", "-wal", "-shm"] {
+            let artifact = format!("{store_path}{suffix}");
+            if let Err(e) = crate::file::repair_owner_only(std::path::Path::new(&artifact)) {
+                warn!("WhatsApp: could not tighten {artifact} permissions: {e}");
+            }
+        }
+
         let (tx, _) = broadcast::channel(128);
 
         // Dedicated WhatsApp cache. Must NOT share the TUI's `chats.json`:
-        // that file holds a plain Vec<Chat> (see Config::save_chats) while this
+        // that file holds a plain Vec<Chat> (see `file::write_chats`) while this
         // cache holds the full WhatsAppState (history + pushnames + usync), and
         // the two schemas silently clobbered each other, leaving WhatsApp with
         // an empty state on every cold start.
@@ -80,7 +92,7 @@ impl WhatsAppMessenger {
         // chat list from the TUI's persisted rows so usync enrichment can
         // backfill names immediately, even before the first history sync lands.
         if state.chats.is_empty()
-            && let Ok(chat_cache) = Config::load_chats()
+            && let Ok(chat_cache) = crate::file::read_chats()
         {
             state.chats = chat_cache
                 .into_iter()

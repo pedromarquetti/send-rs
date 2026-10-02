@@ -245,7 +245,7 @@ impl AppState {
             clipboard,
         };
 
-        if let Ok(chat_cache) = Config::load_chats() {
+        if let Ok(chat_cache) = crate::file::read_chats() {
             debug!(chat_count = chat_cache.len(), "Loaded persisted chat list");
             app.apply_chats(chat_cache);
         }
@@ -413,7 +413,7 @@ impl AppState {
 
     /// Persist the current chat list so it survives a cold restart.
     pub(crate) fn persist_chats(&self) {
-        if let Err(e) = Config::save_chats(&self.chat_state.chats) {
+        if let Err(e) = crate::file::write_chats(&self.chat_state.chats) {
             error!(error = %e, "Failed to persist chat list");
         }
     }

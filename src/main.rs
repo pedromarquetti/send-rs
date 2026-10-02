@@ -4,6 +4,7 @@
 mod audio;
 mod backend;
 mod config;
+mod file;
 mod helpers;
 mod notify;
 mod tui;
@@ -37,7 +38,7 @@ async fn main() -> Result<()> {
         let mock_config_dir =
             std::env::temp_dir().join(format!("senders-mock-{}", std::process::id()));
 
-        std::fs::create_dir_all(&mock_config_dir)?;
+        file::create_dir_all(&mock_config_dir)?;
 
         Config::set_config_dir_override(mock_config_dir.clone())?;
 
@@ -53,7 +54,7 @@ async fn main() -> Result<()> {
         .join("sender.log");
 
     if let Some(parent) = log_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        let _ = file::create_dir_all(parent);
     }
 
     let log_file = std::fs::OpenOptions::new()
@@ -167,7 +168,7 @@ async fn main() -> Result<()> {
             let whatsapp_path = Config::user_config_dir()?.join("wa.db");
 
             if let Some(parent) = whatsapp_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+                let _ = file::create_dir_all(parent);
             }
 
             match WhatsAppMessenger::new(whatsapp_path.to_string_lossy().to_string()).await {

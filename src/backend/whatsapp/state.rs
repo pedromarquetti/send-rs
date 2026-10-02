@@ -38,10 +38,8 @@ pub(super) struct WhatsAppState {
     /// Persisted with the cache so that media from earlier sessions still
     /// downloads after a restart (the raw `wa::Message` itself is not
     /// deserializable). No media bytes are ever stored — only the fields that
-    /// fetch them on demand.
-    ///  TODO: this may contain image hashes, we need to fix file permissions: currently, in
-    /// linux, everyone can read send-rs files!
-    /// BUG: fix file permission for the app
+    /// fetch them on demand. The cache (including these hashes) is written
+    /// owner-only through [`crate::file::write_owner_only`].
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub(super) media_refs: HashMap<String, MediaRef>,
 
@@ -106,7 +104,9 @@ impl WhatsAppState {
     /// pushnames) so a cold restart does not start with an empty chat list or
     /// empty history. Missing/corrupt cache falls back to a fresh state.
     pub(super) fn load_from(cache_path: &str) -> Self {
-        match std::fs::read_to_string(cache_path) {
+        // `file::read_to_string` tightens the cache to owner-only as it opens
+        // it (it holds message history), so no separate repair step is needed.
+        match crate::file::read_to_string(Path::new(cache_path)) {
             Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
             Err(_) => Self::default(),
         }
@@ -123,14 +123,7 @@ impl WhatsAppState {
             }
         };
 
-        if let Some(parent) = std::path::Path::new(cache_path).parent()
-            && let Err(e) = std::fs::create_dir_all(parent)
-        {
-            warn!("Failed to create WA cache dir: {e}");
-            return;
-        }
-
-        if let Err(e) = std::fs::write(cache_path, raw) {
+        if let Err(e) = crate::file::write_owner_only(cache_path, raw.as_bytes()) {
             warn!(
                 "Failed to write WA cache {}: {e}",
                 cache_path.to_string_lossy()

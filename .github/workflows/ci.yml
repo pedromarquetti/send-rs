@@ -52,6 +52,16 @@ jobs:
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Reject bundled SQLite feature
+        run: |
+          set -euo pipefail
+          features="$(cargo metadata --locked --format-version 1 \
+            | jq -r '(.packages[] | select(.name == "whatsapp-rust") | .id) as $id
+                     | .resolve.nodes[] | select(.id == $id) | .features[]')"
+          if grep -qxF "sqlite-storage-bundled" <<<"$features"; then
+            echo "::error::whatsapp-rust resolved with sqlite-storage-bundled; it bundles SQLite and collides with libsql-ffi's sqlite3 symbols"
+            exit 1
+          fi
       - name: Run cargo fmt
         run: cargo fmt --all -- --check
       - name: Run tests

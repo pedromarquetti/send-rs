@@ -1,13 +1,13 @@
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    fs::create_dir_all,
     path::{Path, PathBuf},
 };
 
-use crate::backend::{Chat, Provider};
+use crate::backend::Provider;
+use crate::file;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
@@ -250,7 +250,7 @@ impl Config {
                 return Ok(dir.clone());
             }
             let dir = std::env::temp_dir().join(format!("senders-test-{}", std::process::id()));
-            let _ = std::fs::create_dir_all(&dir);
+            let _ = file::create_dir_all(&dir);
             let _ = TEST_CONFIG_DIR.set(dir.clone());
             Ok(dir)
         }
@@ -279,7 +279,7 @@ impl Config {
         if !path.exists() {
             return Ok(None);
         }
-        let raw = std::fs::read_to_string(&path)?;
+        let raw = file::read_to_string(&path)?;
         let config = toml::from_str(&raw)
             .with_context(|| format!("invalid config at {}", path.display()))?;
         Ok(Some(config))
@@ -288,51 +288,9 @@ impl Config {
     /// main func to save the app config file
     pub fn save_config(&self) -> Result<()> {
         let path = Self::config_file_path()?;
-
-        if let Some(parent) = path.parent() {
-            create_dir_all(parent)?;
-        }
-
         let raw = toml::to_string_pretty(self)?;
-        std::fs::write(&path, raw)?;
+        file::write_owner_only(&path, raw.as_bytes())?;
         Ok(())
-    }
-
-    /// local list of chat list for faster boot time.
-    pub fn save_chats(chats: &[Chat]) -> Result<()> {
-        // Unit tests run from a clean slate: never write into a real user's
-        // config dir, which would leak into other tests' `AppState::new`.
-        if cfg!(test) {
-            return Ok(());
-        }
-
-        let path = Self::user_config_dir()?.join("chats.json");
-
-        if let Some(parent) = path.parent() {
-            create_dir_all(parent)?;
-        }
-
-        let raw = serde_json::to_string_pretty(chats)?;
-        std::fs::write(&path, raw)?;
-        Ok(())
-    }
-
-    /// chats.json loader (chat list cache)
-    pub fn load_chats() -> Result<Vec<Chat>> {
-        // See `save_chats`: tests must not observe a real user's chat cache.
-        if cfg!(test) {
-            return Ok(vec![]);
-        }
-
-        let path = Self::user_config_dir()?.join("chats.json");
-
-        if !path.exists() {
-            return Err(anyhow!("Path does not exist"));
-        }
-
-        let raw = std::fs::read_to_string(&path)?;
-        let chats = serde_json::from_str(&raw)?;
-        Ok(chats)
     }
 }
 

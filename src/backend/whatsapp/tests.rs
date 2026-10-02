@@ -1991,3 +1991,109 @@ async fn construction_keeps_the_full_sync_history_config() {
 
     messenger.disconnect().await.expect("dormant shutdown");
 }
+
+#[test]
+fn cache_reopen_preserves_normalized_state_and_permissions() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache_path = dir.path().join("wp_cache.json");
+
+    let chat = ChatId::WhatsApp("15550000002@s.whatsapp.net".to_string());
+    let mut state = WhatsAppState::default();
+    state.chats.push(Chat {
+        id: chat.clone(),
+        contact_name: "Alice".to_string(),
+        ..Default::default()
+    });
+    state
+        .history
+        .insert(chat.clone(), vec![build_msg("wa-1", "hi", &chat, false)]);
+    state.pushnames.insert(
+        "15550000002@s.whatsapp.net".to_string(),
+        "Alice".to_string(),
+    );
+    state
+        .lid_pn
+        .insert("100000000000001".to_string(), "15550000002".to_string());
+    state.media_refs.insert(
+        "stanza-1".to_string(),
+        MediaRef {
+            kind: MediaKind::Image,
+            direct_path: "/d".to_string(),
+            media_key: vec![1u8; 32],
+            file_sha256: vec![3u8; 32],
+            file_enc_sha256: vec![2u8; 32],
+            file_length: 128,
+        },
+    );
+
+    state.save_to(&cache_path);
+    let restored = WhatsAppState::load_from(cache_path.to_string_lossy().as_ref());
+
+    assert_eq!(restored.chats.len(), 1);
+    assert_eq!(restored.chats[0].contact_name, "Alice");
+    assert_eq!(restored.history.get(&chat).map(Vec::len), Some(1));
+    assert_eq!(
+        restored
+            .pushnames
+            .get("15550000002@s.whatsapp.net")
+            .map(String::as_str),
+        Some("Alice")
+    );
+    assert_eq!(
+        restored.lid_pn.get("100000000000001").map(String::as_str),
+        Some("15550000002")
+    );
+    assert!(matches!(
+        restored.media_refs.get("stanza-1"),
+        Some(MediaRef {
+            file_length: 128,
+            ..
+        })
+    ));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&cache_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "WA cache must stay owner-only");
+    }
+}
+
+/// The SQLite store persists the account's signal session material. Reopening
+/// a dormant messenger on the same `wa.db` (after a clean shutdown) must
+/// recover the same device identity rather than minting a new one.
+#[tokio::test]
+async fn sqlite_session_survives_dormant_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_path = dir.path().join("wa.db").to_string_lossy().to_string();
+
+    let mut first = WhatsAppMessenger::new(store_path.clone())
+        .await
+        .expect("dormant construction should succeed offline");
+    let device = first
+        .current_client()
+        .persistence_manager()
+        .get_device_snapshot();
+    let registration_id = device.registration_id;
+    let signed_pre_key_id = device.signed_pre_key_id;
+    let identity = device.identity_key.public_key.public_key_bytes().to_vec();
+    first.disconnect().await.expect("dormant shutdown");
+
+    let mut second = WhatsAppMessenger::new(store_path)
+        .await
+        .expect("reopen should succeed offline");
+    let reopened = second
+        .current_client()
+        .persistence_manager()
+        .get_device_snapshot();
+
+    assert_eq!(reopened.registration_id, registration_id);
+    assert_eq!(reopened.signed_pre_key_id, signed_pre_key_id);
+    assert_eq!(
+        reopened.identity_key.public_key.public_key_bytes(),
+        identity.as_slice(),
+        "a reopen must not mint a new identity key"
+    );
+
+    second.disconnect().await.expect("dormant shutdown");
+}
