@@ -411,38 +411,30 @@ impl WhatsAppMessenger {
 
                 let _ = tx.send(BackendEvent::ChatList(snapshot));
             }
-            Event::Presence(u) => {
-                // TODO: Consider simplifying this:
-                // if unavailable {
-                // todo!();
-                // }
-                //
+            Event::Presence(presence_update) => {
                 // Only track peers that have a chat row; unknown LIDs would
                 // otherwise grow the map without bounds.
-                let online = !u.unavailable;
-                let last_seen = u.last_seen.map(|ts| ts.timestamp());
+                let online = !presence_update.unavailable;
+                let last_seen = presence_update.last_seen.map(|ts| ts.timestamp());
                 let label = presence_label(online, last_seen);
 
                 let mut st = state.write().await;
-                let Some(chat) = find_peer_chat(&st, &u.from) else {
+                let Some(chat) = find_peer_chat(&st, &presence_update.from) else {
                     return;
                 };
-                for key in presence_keys(&u.from, &st) {
+
+                for key in presence_keys(&presence_update.from, &st) {
                     st.presence.insert(key, (online, last_seen));
                 }
+
                 // Surface the learned status in the open chat and chat list; only
                 // broadcast when the row actually changes to avoid a flood of
                 // identical ChatUpdated events while a peer is active.
                 let Some(row) = st.chats.iter_mut().find(|c| c.id == chat) else {
                     return;
                 };
-                let changed = match (&row.status, &label) {
-                    (Some(current), Some(next)) => current != next,
-                    (Some(_), None) => true,
-                    (None, None) => false,
-                    (None, Some(_)) => true,
-                };
-                if changed {
+
+                if row.status != label {
                     row.status = label;
                     let updated = row.clone();
                     drop(st);

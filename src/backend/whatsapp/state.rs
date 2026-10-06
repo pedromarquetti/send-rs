@@ -22,12 +22,9 @@ pub(super) type SharedState = Arc<RwLock<WhatsAppState>>;
 /// bot. SQLite persists the session/auth credentials; this cache drives the TUI.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct WhatsAppState {
-    // TODO: check if needed: controls wether the provider is actually enabled in the config and if
-    // it should load
-    pub(super) enabled: bool,
     pub(super) chats: Vec<Chat>,
     // BUG: WhatsApp is still not delivering messages properly on cold starts:
-    // Messages received during our app's inactivity are not being fetched
+    // Messages received during our app's inactivity are not being fetched... Sometimes?
     pub(super) history: HashMap<ChatId, Vec<Message>>,
     /// Stanza is a XML-like structure exchanged between client and server.
     /// Each Stanza contains data that identifies and populates the message
@@ -86,8 +83,6 @@ pub(super) struct WhatsAppState {
     /// replay converge to the phone's current pin state regardless of order,
     /// and lets pins survive even when they arrive before the chat row exists.
     #[serde(default)]
-    // TODO: check if storing a hashmap of pin state changes is really needed, doesn't the chat
-    // already store its pin state?
     pub(super) pin_state: HashMap<String, (i64, bool)>,
     /// The account's own LID and phone-number JIDs (`to_non_ad_string`), used
     /// to label the self-chat ("Myself") instead of the formatted phone number.
