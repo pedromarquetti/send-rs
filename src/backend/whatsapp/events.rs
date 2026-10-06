@@ -198,6 +198,10 @@ impl WhatsAppMessenger {
                         state.media_refs.insert(stanza_id.clone(), media_ref);
                     }
 
+                    // Keep the raw proto so a later reply can quote this
+                    // message's content; attribution itself comes from history.
+                    state.remember_raw(&stanza_id, inbound.message.as_ref().clone());
+
                     let is_dup = state
                         .history
                         .get(&chat)

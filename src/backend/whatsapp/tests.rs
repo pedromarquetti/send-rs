@@ -1993,7 +1993,10 @@ fn outbound_image_message_maps_cdn_fields_and_context() {
         sample_cdn(),
         "pic.jpg",
         Some("caption"),
-        Some(&MessageId("stanza-1".into())),
+        Some(wa::ContextInfo {
+            stanza_id: Some("stanza-1".into()),
+            ..Default::default()
+        }),
     )
     .unwrap();
     let im = msg.image_message.as_option().unwrap();
@@ -2233,6 +2236,298 @@ fn outbound_unsupported_kind_is_rejected() {
         err.to_string().contains("unsupported media kind"),
         "unexpected error: {err}"
     );
+}
+
+/// A group reply names the quoted author's wire JID as `participant`, taken
+/// from the stored `author_id` (`info.source.sender`), never derived from the
+/// display name or the group JID. `remote_jid` stays unset: replies are
+/// same-chat, and WA Web only emits it for cross-chat quotes.
+#[test]
+fn group_reply_serializes_the_quoted_authors_participant() {
+    let chat = ChatId::WhatsApp("120363400000000000@g.us".to_string());
+    let mut st = WhatsAppState::default();
+    let mut x = build_msg("stanza-x", "from X", &chat, false);
+    x.author_id = Some("15550000001@s.whatsapp.net".to_string());
+    let mut y = build_msg("stanza-y", "from Y", &chat, false);
+    y.author_id = Some("15550000002@s.whatsapp.net".to_string());
+    st.history.insert(chat.clone(), vec![x, y]);
+
+    let ctx = st
+        .reply_context_info(&chat, &MessageId("stanza-x".into()))
+        .expect("a cached target resolves");
+    assert_eq!(ctx.stanza_id.as_deref(), Some("stanza-x"));
+    assert_eq!(
+        ctx.participant.as_deref(),
+        Some("15550000001@s.whatsapp.net"),
+        "the reply names X, never Y"
+    );
+    assert!(
+        ctx.remote_jid.is_none(),
+        "same-chat replies set no remote_jid"
+    );
+
+    // The quoted preview comes from the remembered raw proto when available
+    // and is simply omitted otherwise (attribution never depends on it).
+    assert!(
+        !ctx.quoted_message.is_set(),
+        "no raw proto remembered yet, so no quoted preview"
+    );
+    st.remember_raw("stanza-x", text_message("from X"));
+    let ctx = st
+        .reply_context_info(&chat, &MessageId("stanza-x".into()))
+        .unwrap();
+    assert!(
+        ctx.quoted_message.is_set(),
+        "a remembered raw proto yields the quoted preview"
+    );
+}
+
+/// Distinct (stanza, author) pairs resolve independently — quoting one
+/// message can never yield the other's author — and the lookup passes for
+/// both phone-number and LID author JIDs.
+#[test]
+fn distinct_group_authors_never_cross_attribute_in_either_jid_form() {
+    let chat = ChatId::WhatsApp("120363400000000001@g.us".to_string());
+    let mut st = WhatsAppState::default();
+    let mut lid_msg = build_msg("stanza-lid", "from the LID user", &chat, false);
+    lid_msg.author_id = Some("255202829570287@lid".to_string());
+    let mut pn_msg = build_msg("stanza-pn", "from the phone user", &chat, false);
+    pn_msg.author_id = Some("15550000003@s.whatsapp.net".to_string());
+    st.history.insert(chat.clone(), vec![lid_msg, pn_msg]);
+
+    let lid_ctx = st
+        .reply_context_info(&chat, &MessageId("stanza-lid".into()))
+        .unwrap();
+    let pn_ctx = st
+        .reply_context_info(&chat, &MessageId("stanza-pn".into()))
+        .unwrap();
+
+    assert_eq!(lid_ctx.stanza_id.as_deref(), Some("stanza-lid"));
+    assert_eq!(lid_ctx.participant.as_deref(), Some("255202829570287@lid"));
+    assert_eq!(pn_ctx.stanza_id.as_deref(), Some("stanza-pn"));
+    assert_eq!(
+        pn_ctx.participant.as_deref(),
+        Some("15550000003@s.whatsapp.net")
+    );
+    assert_ne!(
+        lid_ctx.participant, pn_ctx.participant,
+        "cross-quoting must never swap the authors"
+    );
+}
+
+/// Text and every supported outbound media kind embed the identical context
+/// resolved once for the reply — attribution cannot diverge per kind.
+#[test]
+fn text_and_every_media_kind_carry_the_same_participant() {
+    let chat = ChatId::WhatsApp("120363400000000002@g.us".to_string());
+    let mut st = WhatsAppState::default();
+    let mut target = build_msg("stanza-q", "quoted", &chat, false);
+    target.author_id = Some("15550000004@s.whatsapp.net".to_string());
+    st.history.insert(chat.clone(), vec![target]);
+
+    let ctx = st
+        .reply_context_info(&chat, &MessageId("stanza-q".into()))
+        .unwrap();
+
+    let text = wa::Message::text_with_context("reply", ctx.clone());
+    let text_ctx = text
+        .extended_text_message
+        .as_option()
+        .and_then(|m| m.context_info.as_option())
+        .expect("text reply embeds the context");
+    assert_eq!(
+        text_ctx.participant.as_deref(),
+        Some("15550000004@s.whatsapp.net")
+    );
+
+    let kinds = [
+        MediaKind::Image,
+        MediaKind::Video,
+        MediaKind::Audio {
+            duration_secs: Some(1),
+            is_voice: false,
+            waveform: None,
+        },
+        MediaKind::Document,
+        MediaKind::Sticker,
+    ];
+    for kind in kinds {
+        let msg =
+            outbound_media_message(kind.clone(), sample_cdn(), "f.bin", None, Some(ctx.clone()))
+                .unwrap();
+        let embedded = msg
+            .image_message
+            .as_option()
+            .map(|m| &m.context_info)
+            .or_else(|| msg.video_message.as_option().map(|m| &m.context_info))
+            .or_else(|| msg.audio_message.as_option().map(|m| &m.context_info))
+            .or_else(|| msg.document_message.as_option().map(|m| &m.context_info))
+            .or_else(|| msg.sticker_message.as_option().map(|m| &m.context_info))
+            .and_then(|field| field.as_option())
+            .unwrap_or_else(|| panic!("{kind:?} must embed the reply context"));
+        assert_eq!(
+            embedded.participant.as_deref(),
+            Some("15550000004@s.whatsapp.net"),
+            "{kind:?} carries the same participant as text"
+        );
+        assert_eq!(
+            embedded.stanza_id.as_deref(),
+            Some("stanza-q"),
+            "{kind:?} quotes the right stanza"
+        );
+    }
+}
+
+/// A direct-message reply carries no group-only `participant` — the same
+/// group-only convention `MessageKey::participant` follows upstream.
+#[test]
+fn a_direct_message_reply_omits_the_group_participant() {
+    let chat = ChatId::WhatsApp("15550000009@s.whatsapp.net".to_string());
+    let mut st = WhatsAppState::default();
+    let mut peer = build_msg("stanza-dm", "yo", &chat, false);
+    peer.author_id = Some("15550000009@s.whatsapp.net".to_string());
+    st.history.insert(chat.clone(), vec![peer]);
+
+    let ctx = st
+        .reply_context_info(&chat, &MessageId("stanza-dm".into()))
+        .unwrap();
+    assert_eq!(ctx.stanza_id.as_deref(), Some("stanza-dm"));
+    assert!(
+        ctx.participant.is_none(),
+        "DM quotes carry no group participant"
+    );
+    assert!(ctx.remote_jid.is_none());
+}
+
+/// A reply to our own local echo (recorded before the server echoed the
+/// message back, so it has no author) resolves the account's own wire
+/// identity — LID first, since groups address us by LID — and fails
+/// explicitly when the identity is not known yet.
+#[test]
+fn a_reply_to_an_own_message_uses_the_accounts_wire_identity() {
+    let chat = ChatId::WhatsApp("120363400000000003@g.us".to_string());
+    // `build_msg` records no author — exactly what a local echo looks like.
+    let own_echo = || build_msg("stanza-mine", "sent", &chat, true);
+
+    let mut st = WhatsAppState {
+        own_lid: Some("255202829570288@lid".into()),
+        own_pn: Some("15550000010@s.whatsapp.net".into()),
+        ..Default::default()
+    };
+    st.history.insert(chat.clone(), vec![own_echo()]);
+    let ctx = st
+        .reply_context_info(&chat, &MessageId("stanza-mine".into()))
+        .unwrap();
+    assert_eq!(
+        ctx.participant.as_deref(),
+        Some("255202829570288@lid"),
+        "the LID form is preferred: groups address us by LID"
+    );
+
+    let mut pn_only = WhatsAppState {
+        own_pn: Some("15550000010@s.whatsapp.net".into()),
+        ..Default::default()
+    };
+    pn_only.history.insert(chat.clone(), vec![own_echo()]);
+    let ctx = pn_only
+        .reply_context_info(&chat, &MessageId("stanza-mine".into()))
+        .unwrap();
+    assert_eq!(
+        ctx.participant.as_deref(),
+        Some("15550000010@s.whatsapp.net"),
+        "an account without a LID falls back to its phone form"
+    );
+
+    let mut unknown = WhatsAppState::default();
+    unknown.history.insert(chat.clone(), vec![own_echo()]);
+    let err = unknown
+        .reply_context_info(&chat, &MessageId("stanza-mine".into()))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("own wire identity"),
+        "no identity, no reply: {err}"
+    );
+}
+
+/// A reply target this session cannot resolve fails outright. `send`
+/// resolves the context before any upload and before `send_message`, so no
+/// message is sent and (through `send_outbound`) no local echo is inserted
+/// for a reply that could be attributed ambiguously.
+#[test]
+fn an_unavailable_reply_target_fails_instead_of_sending_ambiguously() {
+    let chat = ChatId::WhatsApp("120363400000000004@g.us".to_string());
+    let st = WhatsAppState::default();
+
+    let err = st
+        .reply_context_info(&chat, &MessageId("stanza-unknown".into()))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("not in this chat's history"),
+        "unexpected error: {err}"
+    );
+
+    // A stored target with no recoverable author is equally unresolvable:
+    // the error must not silently attribute the quote to the group.
+    let mut st = WhatsAppState::default();
+    let orphan = {
+        let mut msg = build_msg("stanza-orphan", "???", &chat, false);
+        msg.author_id = None;
+        msg
+    };
+    st.history.insert(chat.clone(), vec![orphan]);
+    let err = st
+        .reply_context_info(&chat, &MessageId("stanza-orphan".into()))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("no known author"),
+        "unexpected error: {err}"
+    );
+}
+
+/// Inbound replies keep `reply_stanza_id` paired with the correct chat and
+/// author even when LID and phone identifiers refer to different participants
+/// in the same group.
+#[test]
+fn inbound_reply_metadata_stays_paired_with_its_author() {
+    let chat = ChatId::WhatsApp("120363400000000005@g.us".to_string());
+    let mut st = WhatsAppState::default();
+    let mut x = build_msg("stanza-x", "from X", &chat, false);
+    x.author_id = Some("255202829570287@lid".into());
+    x.sender = "X".into();
+    let mut y = build_msg("stanza-y", "from Y", &chat, false);
+    y.author_id = Some("15550000002@s.whatsapp.net".into());
+    y.sender = "Y".into();
+    st.history.insert(chat.clone(), vec![x, y]);
+    for id in ["stanza-x", "stanza-y"] {
+        st.by_stanza_id
+            .insert(id.to_string(), (chat.clone(), MessageId(id.to_string())));
+    }
+
+    let group = Jid::from_str("120363400000000005@g.us").unwrap();
+    let peer = pn("15550000001");
+    let quote = |id: &str| {
+        wa::Message::text_with_context(
+            "reply",
+            wa::ContextInfo {
+                stanza_id: Some(id.to_string()),
+                ..Default::default()
+            },
+        )
+    };
+
+    for (quoted, author) in [("stanza-x", "X"), ("stanza-y", "Y")] {
+        let info = msg_info(&group, &peer, "Zed", &format!("r-{quoted}"), false);
+        let normalized = to_senders_msg(chat.clone(), &info, &quote(quoted), &st);
+        assert_eq!(normalized.reply_to_id, Some(MessageId(quoted.to_string())));
+        let chain = normalized
+            .reply_ctx
+            .unwrap_or_else(|| panic!("reply chain for {quoted} resolves"));
+        assert_eq!(chain.id, MessageId(quoted.to_string()));
+        assert_eq!(
+            chain.sender, author,
+            "the chain names the quoted message's own author, not the other one"
+        );
+    }
 }
 
 // -- Dormant lifecycle --

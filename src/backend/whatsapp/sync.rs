@@ -1,4 +1,4 @@
-use crate::backend::{BackendError, BackendEvent, Chat, ChatId, MediaKind, Message, MessageId};
+use crate::backend::{BackendError, BackendEvent, Chat, ChatId, MediaKind, Message};
 use crate::helpers::{now, relative};
 
 use super::convert::{
@@ -406,6 +406,12 @@ pub(super) async fn handle_history_sync(
                 state.media_refs.insert(stanza_id.to_string(), media_ref);
             }
 
+            // Same for the raw proto (runtime-only, bounded): a reply to
+            // this message quotes its content from here, captured before the
+            // `already` skip so a message whose history row predates the
+            // stash still becomes quotable.
+            state.remember_raw(stanza_id, msg.clone());
+
             let already = state
                 .history
                 .get(&chat)
@@ -760,15 +766,16 @@ pub(super) struct CdnFields {
 }
 
 /// Build the outbound `wa::Message` for uploaded bytes, mapping the
-/// provider-neutral kind onto WhatsApp's media sub-protos and carrying the
-/// reply context. Deterministic given the CDN fields, so the mapping is
-/// testable offline.
+/// provider-neutral kind onto WhatsApp's media sub-protos and embedding the
+/// reply context resolved once by the caller, so every media kind carries
+/// identical attribution. Deterministic given the CDN fields, so the mapping
+/// is testable offline.
 pub(super) fn outbound_media_message(
     kind: MediaKind,
     cdn: CdnFields,
     file_name: &str,
     caption: Option<&str>,
-    reply_to: Option<&MessageId>,
+    reply_ctx: Option<wa::ContextInfo>,
 ) -> Result<WaMessage, BackendError> {
     let CdnFields {
         url,
@@ -782,12 +789,7 @@ pub(super) fn outbound_media_message(
     } = cdn;
 
     let caption = caption.map(str::to_string);
-    let context_info = reply_to.map(|id| {
-        Box::new(wa::ContextInfo {
-            stanza_id: Some(id.to_string()),
-            ..Default::default()
-        })
-    });
+    let context_info = reply_ctx;
 
     let message = match kind {
         MediaKind::Image => WaMessage {
@@ -801,9 +803,7 @@ pub(super) fn outbound_media_message(
                 media_key_timestamp: Some(media_key_timestamp),
                 mimetype: Some("image/jpeg".into()),
                 caption,
-                context_info: context_info
-                    .map(|ci| MessageField::some(*ci))
-                    .unwrap_or_default(),
+                context_info: context_info.map(MessageField::some).unwrap_or_default(),
                 ..Default::default()
             }),
             ..Default::default()
@@ -820,9 +820,7 @@ pub(super) fn outbound_media_message(
                 streaming_sidecar,
                 mimetype: Some("video/mp4".into()),
                 caption,
-                context_info: context_info
-                    .map(|ci| MessageField::some(*ci))
-                    .unwrap_or_default(),
+                context_info: context_info.map(MessageField::some).unwrap_or_default(),
                 ..Default::default()
             }),
             ..Default::default()
@@ -845,9 +843,7 @@ pub(super) fn outbound_media_message(
                 ptt: Some(is_voice),
                 waveform,
                 mimetype: Some("audio/ogg; codecs=opus".into()),
-                context_info: context_info
-                    .map(|ci| MessageField::some(*ci))
-                    .unwrap_or_default(),
+                context_info: context_info.map(MessageField::some).unwrap_or_default(),
                 ..Default::default()
             }),
             ..Default::default()
@@ -864,9 +860,7 @@ pub(super) fn outbound_media_message(
                 mimetype: Some("application/octet-stream".into()),
                 file_name: Some(file_name.to_string()),
                 caption,
-                context_info: context_info
-                    .map(|ci| MessageField::some(*ci))
-                    .unwrap_or_default(),
+                context_info: context_info.map(MessageField::some).unwrap_or_default(),
                 ..Default::default()
             }),
             ..Default::default()
@@ -879,9 +873,7 @@ pub(super) fn outbound_media_message(
                 mimetype: Some("image/webp".into()),
                 file_length: Some(file_length),
                 media_key_timestamp: Some(media_key_timestamp),
-                context_info: context_info
-                    .map(|ci| MessageField::some(*ci))
-                    .unwrap_or_default(),
+                context_info: context_info.map(MessageField::some).unwrap_or_default(),
                 ..Default::default()
             }),
             ..Default::default()

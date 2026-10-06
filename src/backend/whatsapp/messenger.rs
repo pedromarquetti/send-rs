@@ -585,19 +585,28 @@ impl Messenger for WhatsAppMessenger {
 
         let jid = Jid::from_str(jid_str)
             .map_err(|e| BackendError::Other(format!("WhatsApp: invalid chat jid: {e}")))?;
+
+        // Resolve the reply context once, before any upload: both arms embed
+        // this same `ContextInfo`, so attribution (quoted author / group
+        // participant) can never diverge between message kinds, and an
+        // unresolvable target fails the send outright — before
+        // `send_message`, so no local echo is ever inserted for a reply
+        // that could be attributed ambiguously.
+        let reply_ctx = match &reply_to {
+            Some(id) => {
+                let state = self.state.read().await;
+                Some(state.reply_context_info(chat, id)?)
+            }
+            None => None,
+        };
+
         let client = self.current_client();
 
         let (text_content, message, media, media_ref) = match msg {
             OutboundMessage::Text { text } => {
                 let content = text.clone();
-                let wa_msg = match &reply_to {
-                    Some(id) => wa::Message::text_with_context(
-                        text.clone(),
-                        wa::ContextInfo {
-                            stanza_id: Some(id.to_string()),
-                            ..Default::default()
-                        },
-                    ),
+                let wa_msg = match reply_ctx {
+                    Some(context) => wa::Message::text_with_context(text.clone(), context),
                     None => wa::Message::text(text.clone()),
                 };
                 (content, wa_msg, None, None)
@@ -640,7 +649,7 @@ impl Messenger for WhatsAppMessenger {
                     },
                     file_name,
                     caption.as_deref(),
-                    reply_to.as_ref(),
+                    reply_ctx,
                 )?;
                 let media = Some(MessageMedia {
                     kind: kind.clone(),

@@ -1,7 +1,7 @@
-use crate::backend::{Chat, ChatId, Message, MessageId};
+use crate::backend::{BackendError, Chat, ChatId, Message, MessageId};
 
 use super::convert::{resolve_conversation_name, resolve_sender_name};
-use super::ids::is_self_chat;
+use super::ids::{fold_lid_key, is_self_chat};
 use super::media::MediaRef;
 use super::sync::should_skip_conversation;
 use std::collections::{HashMap, HashSet};
@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 use whatsapp_rust::Client;
-use whatsapp_rust::prelude::{Jid, MessageExt, MessageInfo, wa};
+use whatsapp_rust::prelude::{Jid, MessageExt, MessageField, MessageInfo, wa};
 use whatsapp_rust::wacore_binary::JidExt;
 use whatsapp_rust::waproto::whatsapp::Message as WaMessage;
 
@@ -103,12 +103,26 @@ pub(super) struct WhatsAppState {
     /// worth keeping.
     #[serde(skip)]
     pub(super) pending_edits: HashMap<(MessageId, ChatId), String>,
+    /// Raw inbound message protos keyed by stanza id, remembered so a reply
+    /// can carry the quoted preview (`ContextInfo.quoted_message`) the way
+    /// WA Web does. Runtime-only (the proto does not survive serialization)
+    /// and bounded by [`RAW_MESSAGE_LIMIT`]: reply attribution itself comes
+    /// from `history` and never depends on this cache. No media bytes are
+    /// held — only proto fields that reference CDN URLs.
+    #[serde(skip)]
+    pub(super) raw_messages: HashMap<String, WaMessage>,
 }
 
 /// How many unresolved edits to hold before dropping the newest. Generous
 /// next to the handful of edits a single sync burst replays, but bounded so a
 /// stream of edits for messages we never cache cannot grow state without limit.
 const PENDING_EDIT_LIMIT: usize = 64;
+
+/// How many raw inbound protos to keep for reply quoting before the cache is
+/// cleared. Generous next to a burst of history sync, but bounded so a long
+/// session cannot grow state without limit; past the cap replies keep their
+/// attribution (stanza id + participant) and simply omit the quoted preview.
+const RAW_MESSAGE_LIMIT: usize = 2048;
 
 impl WhatsAppState {
     /// Restore a previously persisted account snapshot (chats, history,
@@ -242,6 +256,91 @@ impl WhatsAppState {
                 chat.verified = false;
             }
         }
+    }
+
+    /// Remember the raw proto of an ingested message so a later reply can
+    /// quote its content. Bounded: once full the cache is cleared and starts
+    /// over with the newest message — the quoted preview is best-effort, the
+    /// reply's attribution never depends on it.
+    pub(super) fn remember_raw(&mut self, stanza_id: &str, message: WaMessage) {
+        if self.raw_messages.len() >= RAW_MESSAGE_LIMIT {
+            self.raw_messages.clear();
+        }
+
+        self.raw_messages.insert(stanza_id.to_string(), message);
+    }
+
+    /// Build the wire `ContextInfo` for replying to `reply_to` in `chat`.
+    ///
+    /// The quoted author's stored wire JID (`Message.author_id`, taken from
+    /// `info.source.sender` on ingest) becomes `participant` for group
+    /// replies — never the group, the recipient or a display name — and is
+    /// omitted for direct messages, the same group-only convention
+    /// `MessageKey::participant` follows upstream. A reply to our own local
+    /// echo falls back to the account's own wire identity (LID first: groups
+    /// address us by LID). `remote_jid` stays unset: replies are same-chat
+    /// and WA Web only emits it for cross-chat quotes. The quoted preview
+    /// comes from the raw proto when this session still holds it. An unknown
+    /// target or an unresolvable author is an error, so a reply is never
+    /// sent with ambiguous attribution.
+    pub(super) fn reply_context_info(
+        &self,
+        chat: &ChatId,
+        reply_to: &MessageId,
+    ) -> Result<wa::ContextInfo, BackendError> {
+        let chat_key = match chat {
+            ChatId::WhatsApp(raw) => fold_lid_key(raw, self),
+            other => other.clone(),
+        };
+
+        let target = self
+            .history
+            .get(&chat_key)
+            .and_then(|msgs| msgs.iter().find(|m| m.message_id == *reply_to))
+            .ok_or_else(|| {
+                BackendError::Other(format!(
+                    "WhatsApp: replied message {reply_to} is not in this chat's history"
+                ))
+            })?;
+
+        let is_group = match &chat_key {
+            ChatId::WhatsApp(raw) => Jid::from_str(raw).is_ok_and(|j| j.is_group()),
+            _ => false,
+        };
+
+        let participant = if is_group {
+            let author = match (&target.author_id, target.from_me) {
+                (Some(author), _) => author.clone(),
+                (None, true) => self
+                    .own_lid
+                    .clone()
+                    .or_else(|| self.own_pn.clone())
+                    .ok_or_else(|| {
+                        BackendError::Other(
+                            "WhatsApp: cannot reply before own wire identity is known".into(),
+                        )
+                    })?,
+                (None, false) => {
+                    return Err(BackendError::Other(format!(
+                        "WhatsApp: replied message {reply_to} has no known author"
+                    )));
+                }
+            };
+            Some(author)
+        } else {
+            None
+        };
+
+        Ok(wa::ContextInfo {
+            stanza_id: Some(reply_to.to_string()),
+            participant,
+            quoted_message: self
+                .raw_messages
+                .get(&**reply_to)
+                .map(|m| MessageField::from_box(m.prepare_for_quote()))
+                .unwrap_or_default(),
+            ..Default::default()
+        })
     }
 
     /// Rewrite the text of a stored message (by its original id) and refresh

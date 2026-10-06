@@ -3673,6 +3673,70 @@ mod tests {
         }
     }
 
+    /// A send that fails with a reply pending must not insert a misleading
+    /// local echo: the draft (reply target included) is stashed for retry and
+    /// the error surfaces, but the open chat's history stays untouched.
+    #[tokio::test]
+    async fn failed_reply_send_leaves_no_local_echo() {
+        let chat = Chat {
+            id: ChatId::Telegram(1),
+            contact_name: "Test".into(),
+            ..Default::default()
+        };
+        let stub = StubMessenger::new()
+            .with_chats(vec![chat])
+            .with_send_error(BackendError::Other("unavailable reply target".into()));
+        let mut config = Config::default();
+        config.providers.telegram.enabled = true;
+        let keymap = config.keys.parse().unwrap();
+        let mut state = AppState::new(
+            config,
+            keymap,
+            vec![MessengerKind::Stub(Provider::Telegram, Box::new(stub))],
+            false,
+        )
+        .await;
+        fetch_and_apply(&mut state).await;
+        state.chat_state.chat_list_state.select(Some(0));
+        let chat = state.chat_state.chats[0].clone();
+        state.chat_state.open_chat = Some(OpenChat {
+            chat,
+            history: Vec::new(),
+            has_more_history: true,
+        });
+
+        let target = audio_message();
+        state.chat_state.pending_reply = Some(target.clone());
+        state.write.insert_str("hello");
+        state.send_message().await;
+
+        let draft = state
+            .retry_draft
+            .as_ref()
+            .expect("the failed send keeps its draft for retry");
+        assert_eq!(
+            draft.message_id,
+            Some(target.message_id.clone()),
+            "the retry keeps the reply target"
+        );
+        assert!(
+            state
+                .chat_state
+                .open_chat
+                .as_ref()
+                .is_some_and(|open| open.history.is_empty()),
+            "a failed send must not insert a local echo"
+        );
+        let popup = state
+            .pop_up
+            .as_ref()
+            .expect("send error popup should exist");
+        match &popup.popup_type {
+            PopupKind::Error(msg) => assert!(msg.contains("unavailable reply target")),
+            other => panic!("expected Error popup, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn stub_media_send_returns_explicit_error() {
         let chat = Chat {

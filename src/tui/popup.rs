@@ -565,6 +565,12 @@ impl StatefulWidget for &mut PopUp {
                     .filter(|caption| !caption.trim().is_empty())
                 {
                     Paragraph::new(caption_line)
+                        // TODO: add universal scrollbar + scroll limits for captions
+                        // in media:
+                        // 1. currently the user can scroll more than the actual
+                        //    content
+                        // 2. The user should have a visual representation of how far
+                        //    he has scrolled, maybe make a local wrapper widget?
                         .scroll((state.scroll_idx as u16, 0))
                         .wrap(widgets::Wrap { trim: false })
                         .render(split_hor[1], buf);
