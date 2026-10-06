@@ -199,7 +199,7 @@ impl AppState {
     ) -> Self {
         let mut write = TextArea::default();
         write.set_placeholder_text("Write a message...");
-        write.set_cursor_style(Style::default().fg(Color::Yellow));
+        write.set_cursor_style(Style::default().bg(Color::White).fg(Color::White));
         write.set_cursor_line_style(Style::default());
         write.set_wrap_mode(WrapMode::WordOrGlyph);
 
@@ -4654,9 +4654,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn video_popup_caption_is_one_ellipsised_row() {
-        // Deliberately far more caption than a single row can hold, with a
-        // numbered word per token so the visible slice is identifiable.
+    async fn video_popup_caption_wraps_beside_the_frame() {
+        // Deliberately far more caption than the caption column can hold, with
+        // a numbered word per token so the visible slice is identifiable.
         let words: Vec<String> = (1..=300).map(|i| format!("w{i:03}")).collect();
         let caption = words.join(" ");
         let mut popup = video_popup(
@@ -4670,23 +4670,36 @@ mod tests {
         let tag = app_state().await.chat_state.get_tag().unwrap_or("");
         (&mut PopUp::new(tag)).render(area, &mut buf, &mut popup);
 
-        // One row, ellipsised, exactly like the image popup's caption.
-        let caption_row: String = buf
+        let rows: Vec<String> = buf
             .content
             .chunks(area.width as usize)
             .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+            .collect();
+
+        // The caption lives in the right half of the popup (72-wide popup
+        // centred in 80 columns, 70 inner split 50/50 → right half from
+        // column 40) and wraps across as many rows as it needs.
+        let caption_rows: Vec<&String> = rows
+            .iter()
+            .filter(|row| row.contains("w0"))
+            .collect();
+        assert!(
+            caption_rows.len() >= 2,
+            "caption did not wrap: {caption_rows:?}"
+        );
+        let start = caption_rows
+            .iter()
             .find(|row| row.contains("w001"))
             .expect("caption start is not on screen");
         assert!(
-            caption_row.contains('…'),
-            "caption was not ellipsised: {caption_row:?}"
+            !start.chars().take(40).any(|c| c == 'w'),
+            "caption spilled into the frame half: {start:?}"
         );
-        assert!(!caption_row.contains('\n'));
 
         let rendered: String = buf.content.iter().map(|c| c.symbol()).collect();
         assert!(
             !rendered.contains("w300"),
-            "the caption spilled past its single row"
+            "the caption spilled past its viewport"
         );
 
         // The fixed rows survive the long caption, and the frame viewport is
@@ -4699,16 +4712,22 @@ mod tests {
             rendered.contains("Loading"),
             "frame viewport collapsed under a long caption"
         );
+        assert!(
+            rows.iter()
+                .filter(|row| row.contains("Reply") || row.contains("esc ▸ close"))
+                .all(|row| !row.contains("w0")),
+            "the caption overran the fixed rows"
+        );
 
-        // Scrolling is not wired up for the video caption yet, so the caption
-        // must not move when the popup scrolls.
+        // The caption column scrolls with the popup, so an over-scrolled
+        // viewport pushes it out of sight instead of pinning it.
         popup.scroll_idx = 99;
         let mut buf = Buffer::empty(area);
         (&mut PopUp::new(tag)).render(area, &mut buf, &mut popup);
         let scrolled: String = buf.content.iter().map(|c| c.symbol()).collect();
         assert!(
-            scrolled.contains("w001"),
-            "the single caption row scrolled away"
+            !scrolled.contains("w001"),
+            "the caption ignored the popup scroll"
         );
     }
 

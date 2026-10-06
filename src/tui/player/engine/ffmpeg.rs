@@ -35,9 +35,10 @@ use super::rodio::Timing;
 use crate::tui::UiEvent;
 use crate::tui::player::{MediaEngine, PlayState};
 
-/// Terminal frame rates are far below 12 fps, so decoding a 60 fps source at
-/// 60 fps only burns CPU on frames nobody sees. Also the fallback when a
-/// container does not declare a frame rate.
+/// Cap on the decode frame rate: a source faster than this is decoded at this
+/// rate instead, so a high-fps source does not burn CPU on frames the terminal
+/// never shows. Also the fallback when a container does not declare a frame
+/// rate.
 /// NOTE: increasing this actually improved video playback, maybe we should confirm again if this
 /// makes any difference
 const MAX_FPS: f64 = 60.0;
@@ -772,8 +773,23 @@ mod tests {
 
         let (width, height, fps, duration) = parse_probe_json(json).unwrap();
         assert_eq!((width, height), (320, 240));
-        assert_eq!(fps, 12.0, "decode is capped at terminal frame rates");
+        assert_eq!(fps, 25.0, "a rate below the cap passes through untouched");
         assert_eq!(duration, 2.0);
+
+        // A rate above the cap is decoded at the cap instead.
+        let json = r#"{
+  "streams": [
+    {
+      "width": 320,
+      "height": 240,
+      "avg_frame_rate": "120/1",
+      "duration": "2.000000"
+    }
+  ],
+  "format": { "duration": "2.000000" }
+}"#;
+        let (_, _, fps, _) = parse_probe_json(json).unwrap();
+        assert_eq!(fps, MAX_FPS, "decode is capped at MAX_FPS");
     }
 
     #[test]
@@ -795,7 +811,7 @@ mod tests {
   "format": { "duration": "7.500000" }
 }"#;
         let (_, _, fps, duration) = parse_probe_json(json).unwrap();
-        assert_eq!(fps, MAX_FPS, "30 fps is still above the terminal cap");
+        assert_eq!(fps, 30.0, "30 fps is below the cap, so it passes through");
         assert_eq!(duration, 7.5);
     }
 

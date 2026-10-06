@@ -196,12 +196,24 @@ impl StatefulWidget for ChatWidget<'_> {
 
             let needle = self.message_needle.as_deref();
 
+            let filtered: Vec<Message> = if state.message_search.is_filtered() {
+                state
+                    .message_search
+                    .indices()
+                    .iter()
+                    .filter_map(|&idx| history.get(idx))
+                    .cloned()
+                    .collect()
+            } else {
+                history.to_vec()
+            };
+
             // Render each message once; the ListItem line count IS the item
             // height, so the scrollbar and the list always agree.
             let visible = inner.height as usize;
             state.visible_page = visible;
 
-            let mut item_heights: Vec<usize> = Vec::with_capacity(history.len());
+            let mut item_heights: Vec<usize> = Vec::with_capacity(filtered.len());
             let mut total_lines = 0usize;
             //BUG: messages are appearing with split lines:
             // messages should appear like this
@@ -209,7 +221,7 @@ impl StatefulWidget for ChatWidget<'_> {
             // not
             // like
             // this
-            let items: Vec<ListItem> = history
+            let items: Vec<ListItem> = filtered
                 .iter()
                 .map(|msg| {
                     let lines = message_lines(msg, content.width, max_lines, needle);

@@ -140,7 +140,7 @@ impl SearchState {
                     cursor.to_string(),
                     Style::default()
                         .fg(Color::Black)
-                        .bg(Color::Yellow)
+                        .bg(Color::White)
                         .add_modifier(Modifier::BOLD),
                 ),
             ])
