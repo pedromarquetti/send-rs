@@ -33,7 +33,9 @@ types.
   `Chat`/`Message`/`BackendEvent`/`BackendError`, `MessageId`/`ChatId` (provider
   routing), the `MessengerKind` delegation enum/macro.
 - `src/backend/telegram.rs` — grammers implementation (reference backend).
-- `src/backend/whatsapp.rs` — whatsapp-rust implementation (stub/in progress).
+- `src/backend/whatsapp/` — whatsapp-rust implementation: `messenger.rs`
+  (lifecycle + `Messenger` impl), `events.rs`, `state.rs`, `ids.rs`,
+  `convert.rs`, `sync.rs`, `transport.rs`, `media.rs`.
 - `src/backend/mock.rs` — `MockMessenger` used by startup mode and tests.
 - `src/config.rs` — keymap parsing, provider config, save/load.
 - `src/main.rs` — logging, config load, provider construction.
@@ -115,9 +117,10 @@ dep is temporary and must not be treated as authoritative:
   (`Backend` trait).
 - Protocol ground truth: <https://github.com/oxidezap/whatspec> (structured
   WhatsApp Web IR).
-- Pin version expectations to the `whatsapp-rust` entry in `Cargo.toml` and
-  check `Cargo.lock` before assuming any API; verify signatures in the pinned
-  source above rather than guessing from memory.
+- Pin version expectations to the `whatsapp-rust` entry in `Cargo.toml`
+  (currently rev `24652ea9e5fce77b56c2bc7a900ea06209a87da8`) and check
+  `Cargo.lock` before assuming any API; verify signatures in the pinned source
+  above rather than guessing from memory.
 
 Both deps are version-pinned (`grammers-client 0.10`, `whatsapp-rust` entry in
 `Cargo.toml`). Do not suggest APIs from older/newer versions without checking

@@ -1,6 +1,7 @@
 # Welcome to Sender!
 
 <!--toc:start-->
+
 - [Welcome to Sender!](#welcome-to-sender)
   - [System requirements](#system-requirements)
     - [Requirements for **audio recording**](#requirements-for-audio-recording)
@@ -19,13 +20,17 @@
       - [Providers](#providers)
     - [Telegram Setup](#telegram-setup)
     - [WhatsApp Setup](#whatsapp-setup)
+      - [Session and cache files](#session-and-cache-files)
+      - [Disabled provider behavior](#disabled-provider-behavior)
       - [Manual cold-start smoke test](#manual-cold-start-smoke-test)
   - [Controls / Key Bindings](#controls-key-bindings)
   - [Limitations](#limitations)
     - [Telegram (grammers / Telegram protocol)](#telegram-grammers-telegram-protocol)
     - [WhatsApp (whatsapp-rust / WhatsApp Web protocol)](#whatsapp-whatsapp-rust-whatsapp-web-protocol)
+  - [Development](#development)
   - [Built with](#built-with)
   - [Inspirations](#inspirations)
+
 <!--toc:end-->
 
 Sender is an TUI app for interacting with Whatsapp AND telegram (maybe more in
@@ -102,14 +107,16 @@ can do for itself.
 - [x] Descriptive error handling
 - [x] WhatsApp integration
 - [x] Message actions (reply, edit, delete) for whatsapp
-- [ ] Copy messages' text to clipboard
+- [x] Copy messages' text to clipboard
 - [x] Telegram integration
 - [x] Message actions (reply, edit, delete) for telegram
 - [x] **Telegram** - Support for endless chat scroll.
 - [x] **WhatsApp** - Support for endless chat scroll.
 - [x] Image rendering
 - [x] Audio playback
-- [ ] Send images - TODO: check if possible: send images + "paste to send"
+- [ ] Send images / video / files - the provider backends can upload media, but
+      the TUI has no path to attach them: only audio (voice notes) is composed
+      in-app
 - [x] Send audio
 - [x] Support for notifications
 - [x] Ordered chat list - All chats, ordered by pinned/most recent.
@@ -265,6 +272,24 @@ WhatsApp has no credentials — pairing happens through a QR code:
 3. Once linked, the session is stored under `wa.db` in the same directory as the
    config file, so the next launch is already paired (no QR needed).
 
+#### Session and cache files
+
+All state lives in the config directory (see [Configuration](#configuration)):
+
+- `wa.db` (with its `-wal` / `-shm` companions) — the WhatsApp session: your
+  linked-device keys.
+- `wp_cache.json` — the WhatsApp account cache: chat list, message history, push
+  names and media references.
+- `chats.json` — the chat-list rows shared by both providers.
+- `tg_session.sqlite` — the Telegram session.
+
+WhatsApp's `wa.db` and `wp_cache.json` (like `config.toml` and `chats.json`) are
+written owner-only (`0600`) and repaired to that mode whenever they are opened;
+`tg_session.sqlite` is created by SQLite under your process umask. Logs go to
+`sender.log` in the OS data directory (`~/.local/share/sender/` on Linux). Treat
+these files as secrets — they are never committed to the repository, and
+credentials and session keys are never written to the log.
+
 > [!NOTE]
 > Closing Senders gracefully disconnects but **never logs your device out of
 > WhatsApp** — your linked device stays active. To remove it, unlink it from the
@@ -343,6 +368,13 @@ libraries already support but senders has not wired up yet are not listed here.
   history-sync blobs uploaded by the linked phone; requesting older messages
   asks the phone and returns nothing while it is offline. Only newsletters are
   served history from the server.
+- **Offline recovery is phone-dependent and bounded.** Messages that arrive
+  while Senders is closed come back only when the linked phone is online and
+  delivers its history/offline sync — there is no server-side replay. The
+  automatic full sync requests at most the last 365 days of history, and an
+  interrupted sync resumes on the next start. The
+  [manual cold-start smoke test](#manual-cold-start-smoke-test) verifies this
+  path end to end.
 - **No server "list chats" API.** There is no endpoint that returns the chat
   list; it must be reconstructed locally from history-sync blobs and push
   events.
@@ -350,6 +382,23 @@ libraries already support but senders has not wired up yet are not listed here.
   account (QR code, pair code or passkey).
 - **Queued offline sending is not possible.** Outbound messages require a live
   WebSocket connection.
+
+## Development
+
+- **Testing:** `cargo test` is fully offline and deterministic: no credentials,
+  no network, fake JIDs — the WhatsApp suite drives real provider events through
+  the real dispatch (adapter → messenger → TUI boundary) and CI runs it
+  unchanged. Anything that needs a real account — QR pairing, reconnect,
+  cold-start recovery — is covered only by the
+  [manual smoke test](#manual-cold-start-smoke-test) and must never run in CI:
+  no credentials, QR captures, `wa.db` or `wp_cache.json` belong in the
+  repository.
+- **Dependency pinning:** `whatsapp-rust` is pinned to rev
+  `24652ea9e5fce77b56c2bc7a900ea06209a87da8` in `Cargo.toml`. It builds with
+  `default-features = false` + `sqlite-storage` (system `libsqlite3`);
+  `sqlite-storage-bundled` must stay off — the bundled library would export a
+  second set of `sqlite3` symbols next to grammers-session's `libsql-ffi` and
+  break linking. CI rejects that feature combination explicitly.
 
 ## Built with
 
