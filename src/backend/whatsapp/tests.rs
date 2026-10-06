@@ -5,7 +5,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast};
 use whatsapp_rust::prelude::{Event, Jid, MessageBuilderExt, MessageInfo, wa};
-use whatsapp_rust::types::events::{Connected, PairingQrCode};
+use whatsapp_rust::types::events::{ArchiveUpdate, Connected, MarkChatAsReadUpdate, PairingQrCode};
 use whatsapp_rust::wacore::download::MediaType;
 use whatsapp_rust::wacore::types::message::EditAttribute;
 
@@ -13,7 +13,7 @@ use super::convert::{
     format_pn, message_actions, name_from_lid_pn, resolve_conversation_name, resolve_sender_name,
     to_senders_msg,
 };
-use super::ids::{canonical_chat_id, fold_lid_key, own_chat_id};
+use super::ids::{canonical_chat_id, canonical_jid_chat_id, fold_lid_key, own_chat_id};
 use super::media::{MediaRef, handle_wa_media, ref_media_type, wa_media_ref};
 use super::messenger::WhatsAppMessenger;
 use super::state::{SharedState, WhatsAppState};
@@ -491,6 +491,159 @@ async fn canonical_chat_id_folds_known_lid_pin_to_phone_row() {
     assert_eq!(canonical_chat_id(None, &state, lid).await, pn_chat);
 }
 
+/// WhatsApp addresses 1:1 threads by LID on the wire while the chat list and
+/// the open chat are keyed by the phone number, so every event that names a
+/// conversation has to fold its JID through the same resolver a message does.
+/// A handler comparing the raw LID would miss the phone-keyed row and apply
+/// its update to nothing the user can see.
+#[tokio::test]
+async fn canonical_jid_chat_id_folds_a_wire_lid_to_the_phone_keyed_row() {
+    let pn_chat = ChatId::WhatsApp("15550000001@s.whatsapp.net".to_string());
+    let state: SharedState = Arc::new(RwLock::new(WhatsAppState {
+        chats: vec![Chat {
+            id: pn_chat.clone(),
+            ..Default::default()
+        }],
+        lid_pn: HashMap::from([("255202829570287".to_string(), "15550000001".to_string())]),
+        ..Default::default()
+    }));
+
+    let lid = Jid::lid("255202829570287");
+    assert_eq!(canonical_jid_chat_id(None, &state, &lid).await, pn_chat);
+    // A phone-keyed event is already canonical and stays put.
+    assert_eq!(
+        canonical_jid_chat_id(None, &state, &pn("15550000001")).await,
+        pn_chat
+    );
+}
+
+/// The fold must never rename a chat: with no mapping, or with no phone-keyed
+/// row, the LID is what the user opens, so the event has to land there.
+#[tokio::test]
+async fn canonical_jid_chat_id_keeps_an_unresolved_lid_row() {
+    let lid_chat = ChatId::WhatsApp("255202829570287@lid".to_string());
+    let unmapped: SharedState = Arc::new(RwLock::new(WhatsAppState {
+        chats: vec![Chat {
+            id: lid_chat.clone(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }));
+    assert_eq!(
+        canonical_jid_chat_id(None, &unmapped, &Jid::lid("255202829570287")).await,
+        lid_chat
+    );
+
+    // Mapped, but the phone-keyed row is not on the list.
+    let mapped_no_row: SharedState = Arc::new(RwLock::new(WhatsAppState {
+        chats: vec![Chat {
+            id: lid_chat.clone(),
+            ..Default::default()
+        }],
+        lid_pn: HashMap::from([("255202829570287".to_string(), "15550000001".to_string())]),
+        ..Default::default()
+    }));
+    assert_eq!(
+        canonical_jid_chat_id(None, &mapped_no_row, &Jid::lid("255202829570287")).await,
+        lid_chat
+    );
+}
+
+/// End-to-end for the app-state events that used to compare a raw wire JID:
+/// archive and mark-read addressed to a LID must land on the phone-keyed row
+/// the chat list renders.
+#[tokio::test]
+async fn archive_and_mark_read_reach_the_phone_keyed_row_through_a_lid_jid() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut messenger =
+        WhatsAppMessenger::new(dir.path().join("wa.db").to_string_lossy().to_string())
+            .await
+            .expect("dormant construction should succeed offline");
+    let client = messenger.current_client();
+
+    let pn_chat = ChatId::WhatsApp("15550000001@s.whatsapp.net".to_string());
+    let state: SharedState = Arc::new(RwLock::new(WhatsAppState {
+        chats: vec![Chat {
+            id: pn_chat.clone(),
+            unread: true,
+            unread_count: 3,
+            last_message_ts: Some(1_700_000_000),
+            ..Default::default()
+        }],
+        lid_pn: HashMap::from([("255202829570287".to_string(), "15550000001".to_string())]),
+        ..Default::default()
+    }));
+    let (tx, mut rx) = broadcast::channel(16);
+    let qr: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
+    let lid = Jid::lid("255202829570287");
+
+    WhatsAppMessenger::handle_event(
+        &Arc::new(Event::ArchiveUpdate(
+            ArchiveUpdate::builder()
+                .jid(lid.clone())
+                .timestamp(chrono::Utc::now())
+                .action(Box::new(wa::sync_action_value::ArchiveChatAction {
+                    archived: Some(true),
+                    ..Default::default()
+                }))
+                .from_full_sync(false)
+                .build(),
+        )),
+        &client,
+        &state,
+        &tx,
+        &qr,
+        dir.path(),
+    )
+    .await;
+    WhatsAppMessenger::handle_event(
+        &Arc::new(Event::MarkChatAsReadUpdate(
+            MarkChatAsReadUpdate::builder()
+                .jid(lid)
+                .timestamp(chrono::Utc::now())
+                .action(Box::new(wa::sync_action_value::MarkChatAsReadAction {
+                    read: Some(true),
+                    ..Default::default()
+                }))
+                .from_full_sync(false)
+                .build(),
+        )),
+        &client,
+        &state,
+        &tx,
+        &qr,
+        dir.path(),
+    )
+    .await;
+
+    let chat = state.read().await.chats[0].clone();
+    assert_eq!(chat.id, pn_chat, "the phone-keyed row is the visible one");
+    assert_eq!(chat.status.as_deref(), Some("archived"));
+    assert!(!chat.unread);
+    assert_eq!(chat.unread_count, 0);
+    assert_eq!(
+        chat.last_message_ts,
+        Some(1_700_000_000),
+        "a status event must not move the chat in the list"
+    );
+
+    let mut archived = 0;
+    let mut read = 0;
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            BackendEvent::ChatUpdated(chat) if chat.status.as_deref() == Some("archived") => {
+                archived += 1;
+            }
+            BackendEvent::UnreadUpdated { unread: false, .. } => read += 1,
+            _ => {}
+        }
+    }
+    assert_eq!(archived, 1, "archive must be announced once");
+    assert_eq!(read, 1, "mark-as-read must be announced once");
+
+    messenger.disconnect().await.expect("dormant shutdown");
+}
+
 #[test]
 fn upsert_self_chat_is_named_myself() {
     let mut st = WhatsAppState {
@@ -824,7 +977,7 @@ fn edit_rewrites_stored_message_via_top_level_edited_message() {
 }
 
 #[test]
-fn edit_of_unknown_message_is_ignored() {
+fn edit_of_unknown_message_is_deferred_until_its_base_arrives() {
     let chat = ChatId::jid_to_chat_id("15550000001@s.whatsapp.net");
     let mut st = WhatsAppState::default();
     st.history.insert(
@@ -835,7 +988,7 @@ fn edit_of_unknown_message_is_ignored() {
     let wa_msg = wa::Message {
         protocol_message: MessageField::some(wa::message::ProtocolMessage {
             key: MessageField::some(wa::MessageKey {
-                id: Some("other-9".to_string()),
+                id: Some("later-9".to_string()),
                 ..Default::default()
             }),
             edited_message: MessageField::some(wa::Message::text("after".to_string())),
@@ -847,13 +1000,106 @@ fn edit_of_unknown_message_is_ignored() {
         &pn("15550000001"),
         &pn("15550000001"),
         "Alice",
-        "other-9",
+        "later-9",
         false,
     );
     info.edit = EditAttribute::MessageEdit;
 
+    // Nothing to rewrite yet: the edit is held for its base instead of dropped.
     assert!(st.apply_message_edit(&chat, &info, &wa_msg).is_none());
+    assert!(st.apply_deferred_edits(&chat).is_empty());
+    assert!(
+        st.pending_edits
+            .contains_key(&(MessageId("later-9".into()), chat.clone())),
+        "an unresolved edit must stay pending"
+    );
     assert_eq!(st.history[&chat][0].text, "before");
+}
+
+/// The convergence the pending map exists for: an edit that overtook its base
+/// message is applied as soon as the message is ingested, whether the base came
+/// from a live batch or a history-sync chunk.
+#[test]
+fn a_deferred_edit_applies_once_its_base_is_cached() {
+    let chat = ChatId::jid_to_chat_id("15550000001@s.whatsapp.net");
+    let mut st = WhatsAppState::default();
+    let edit_msg = |id: &str, text: &str| wa::Message {
+        protocol_message: MessageField::some(wa::message::ProtocolMessage {
+            key: MessageField::some(wa::MessageKey {
+                id: Some(id.to_string()),
+                ..Default::default()
+            }),
+            edited_message: MessageField::some(wa::Message::text(text.to_string())),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut info = msg_info(
+        &pn("15550000001"),
+        &pn("15550000001"),
+        "Alice",
+        "base-1",
+        false,
+    );
+    info.edit = EditAttribute::MessageEdit;
+
+    assert!(
+        st.apply_message_edit(&chat, &info, &edit_msg("base-1", "rewritten"))
+            .is_none()
+    );
+
+    // The base lands afterwards (cold start: live edit, then history chunk).
+    st.history.insert(
+        chat.clone(),
+        vec![build_msg("base-1", "original", &chat, false)],
+    );
+    let applied = st.apply_deferred_edits(&chat);
+
+    assert_eq!(applied.len(), 1);
+    assert_eq!(applied[0].text, "rewritten");
+    assert_eq!(st.history[&chat][0].text, "rewritten");
+    assert!(
+        st.pending_edits.is_empty(),
+        "a replayed edit must not be held again"
+    );
+    assert!(
+        st.apply_deferred_edits(&chat).is_empty(),
+        "a replayed edit is applied exactly once"
+    );
+}
+
+/// An edit whose base never arrives (a message we do not cache) must not grow
+/// state without limit.
+#[test]
+fn unresolved_edits_are_capped() {
+    let chat = ChatId::jid_to_chat_id("15550000001@s.whatsapp.net");
+    let mut st = WhatsAppState::default();
+    let edit_msg = |id: &str| wa::Message {
+        protocol_message: MessageField::some(wa::message::ProtocolMessage {
+            key: MessageField::some(wa::MessageKey {
+                id: Some(id.to_string()),
+                ..Default::default()
+            }),
+            edited_message: MessageField::some(wa::Message::text("after".to_string())),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut info = msg_info(&pn("15550000001"), &pn("15550000001"), "Alice", "x", false);
+    info.edit = EditAttribute::MessageEdit;
+
+    for i in 0..200 {
+        assert!(
+            st.apply_message_edit(&chat, &info, &edit_msg(&format!("gone-{i}")))
+                .is_none()
+        );
+    }
+
+    assert!(
+        st.pending_edits.len() <= 64,
+        "unresolved edits must stay bounded, got {}",
+        st.pending_edits.len()
+    );
 }
 
 #[test]

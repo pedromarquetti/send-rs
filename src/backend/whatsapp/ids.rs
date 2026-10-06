@@ -107,9 +107,11 @@ pub(super) async fn canonical_chat_id(
         let Some(client) = client else {
             return chat;
         };
+
         let Ok(Some(entry)) = client.get_lid_pn_entry(&jid).await else {
             return chat;
         };
+
         state
             .write()
             .await
@@ -119,4 +121,22 @@ pub(super) async fn canonical_chat_id(
 
     let st = state.read().await;
     fold_lid_key(raw, &st)
+}
+
+/// [`canonical_chat_id`] for a JID as it arrives on the wire.
+///
+/// The entry point every event that names a conversation goes through, so no
+/// arm can fall back to a raw `ChatId::jid_to_chat_id` compare and silently
+/// miss the phone-keyed row when the wire key is a LID.
+pub(super) async fn canonical_jid_chat_id(
+    client: Option<&Arc<Client>>,
+    state: &SharedState,
+    jid: &Jid,
+) -> ChatId {
+    canonical_chat_id(
+        client,
+        state,
+        ChatId::jid_to_chat_id(&jid.to_non_ad_string()),
+    )
+    .await
 }

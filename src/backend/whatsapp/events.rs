@@ -1,7 +1,7 @@
 use crate::backend::{BackendError, BackendEvent, ChatId, MessageId};
 
 use super::convert::to_senders_msg;
-use super::ids::{canonical_chat_id, own_chat_id};
+use super::ids::{canonical_chat_id, canonical_jid_chat_id, own_chat_id};
 use super::media::wa_media_ref;
 use super::messenger::WhatsAppMessenger;
 use super::state::SharedState;
@@ -145,6 +145,9 @@ impl WhatsAppMessenger {
                         continue;
                     }
 
+                    // Own messages arrive keyed by my own LID/PN (note-to-self, status):
+                    // map them to the counterpart chat first, then fold a peer
+                    // LID onto its phone-keyed row like every other event.
                     let chat = own_chat_id(
                         client.lid().as_ref(),
                         client.pn().as_ref(),
@@ -152,8 +155,6 @@ impl WhatsAppMessenger {
                         inbound.info.source.is_from_me,
                     );
 
-                    // Live messages are keyed by the peer's LID; fold to the
-                    // phone-keyed row the user opens before touching state.
                     let chat = canonical_chat_id(Some(client), state, chat).await;
 
                     // Resolve a LID author (group message) to a phone number
@@ -211,10 +212,18 @@ impl WhatsAppMessenger {
                             .push(msg.clone());
                     }
 
+                    // This message may be the base an earlier edit was
+                    // waiting for (an edit that overtook it), so replay
+                    // whatever is now resolvable while the lock is held.
+                    let deferred = state.apply_deferred_edits(&chat);
                     state.upsert_chat_from_message(chat.clone(), &msg);
 
                     drop(state);
                     let _ = tx.send(BackendEvent::MessageReceived(msg));
+
+                    for updated in deferred {
+                        let _ = tx.send(BackendEvent::MessageUpdated(updated));
+                    }
                 }
                 state.read().await.save_to(cache_path);
             }
@@ -257,33 +266,37 @@ impl WhatsAppMessenger {
                 }
             }
             Event::DeleteChatUpdate(u) => {
-                if let Some(chat) = remove_chat(state, &u.jid).await {
+                if let Some(chat) = remove_chat(Some(client), state, &u.jid).await {
                     let _ = tx.send(BackendEvent::ChatRemoved { chat });
                 }
             }
             Event::ClearChatUpdate(u) => {
-                let chat_id = ChatId::jid_to_chat_id(&u.jid.to_string());
+                let chat_id = canonical_jid_chat_id(Some(client), state, &u.jid).await;
                 let mut state = state.write().await;
                 let ids: Vec<MessageId> = state
                     .history
                     .get(&chat_id)
                     .map(|h| h.iter().map(|m| m.message_id.clone()).collect())
                     .unwrap_or_default();
+
                 if ids.is_empty() {
                     return;
                 }
+
                 if let Some(history) = state.history.get_mut(&chat_id) {
                     history.clear();
                 }
                 state.refresh_last_message_ts(&chat_id);
+
                 drop(state);
+
                 let _ = tx.send(BackendEvent::MessageDeleted {
                     chat: Some(chat_id),
                     message_ids: ids,
                 });
             }
             Event::DeleteMessageForMeUpdate(u) => {
-                let chat_id = ChatId::jid_to_chat_id(&u.chat_jid.to_string());
+                let chat_id = canonical_jid_chat_id(Some(client), state, &u.chat_jid).await;
                 let id = MessageId(u.message_id.clone());
                 let mut state = state.write().await;
                 let mut removed = false;
@@ -302,12 +315,9 @@ impl WhatsAppMessenger {
                 }
             }
             Event::MuteUpdate(u) => {
+                let chat_id = canonical_jid_chat_id(Some(client), state, &u.jid).await;
                 let mut state = state.write().await;
-                if let Some(chat) = state
-                    .chats
-                    .iter_mut()
-                    .find(|c| c.id == ChatId::jid_to_chat_id(&u.jid.to_string()))
-                {
+                if let Some(chat) = state.chats.iter_mut().find(|c| c.id == chat_id) {
                     chat.status = Some(if u.action.muted.unwrap_or(false) {
                         "muted".to_string()
                     } else {
@@ -318,16 +328,7 @@ impl WhatsAppMessenger {
             }
             Event::PinUpdate(u) => {
                 debug!("Pinning event! {:?}", u);
-                // WhatsApp pins 1:1 threads by LID on the wire, but the chat
-                // list rows are canonicalized to their phone-keyed twins; fold
-                // the pin JID the same way live messages are folded (async
-                // LID↔PN lookup must stay outside the write lock).
-                let chat = canonical_chat_id(
-                    Some(client),
-                    state,
-                    ChatId::jid_to_chat_id(&u.jid.to_string()),
-                )
-                .await;
+                let chat = canonical_jid_chat_id(Some(client), state, &u.jid).await;
 
                 let mut guard = state.write().await;
 
@@ -350,12 +351,9 @@ impl WhatsAppMessenger {
                 }
             }
             Event::ArchiveUpdate(u) => {
+                let chat_id = canonical_jid_chat_id(Some(client), state, &u.jid).await;
                 let mut state = state.write().await;
-                if let Some(chat) = state
-                    .chats
-                    .iter_mut()
-                    .find(|c| c.id == ChatId::jid_to_chat_id(&u.jid.to_string()))
-                {
+                if let Some(chat) = state.chats.iter_mut().find(|c| c.id == chat_id) {
                     chat.status = Some(if u.action.archived.unwrap_or(false) {
                         "archived".to_string()
                     } else {
@@ -365,12 +363,9 @@ impl WhatsAppMessenger {
                 }
             }
             Event::MarkChatAsReadUpdate(u) => {
+                let chat_id = canonical_jid_chat_id(Some(client), state, &u.jid).await;
                 let mut guard = state.write().await;
-                if let Some(chat) = guard
-                    .chats
-                    .iter_mut()
-                    .find(|c| c.id == ChatId::jid_to_chat_id(&u.jid.to_string()))
-                {
+                if let Some(chat) = guard.chats.iter_mut().find(|c| c.id == chat_id) {
                     chat.unread = false;
                     chat.unread_count = 0;
                     let _ = tx.send(BackendEvent::UnreadUpdated {

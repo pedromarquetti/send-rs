@@ -4,7 +4,7 @@ use crate::helpers::{now, relative};
 use super::convert::{
     format_pn, name_from_lid_pn, resolve_conversation_name, resolve_sender_name, to_senders_msg,
 };
-use super::ids::{canonical_chat_id, fold_lid_key, pn_chat_id};
+use super::ids::{canonical_chat_id, canonical_jid_chat_id, fold_lid_key, pn_chat_id};
 use super::media::wa_media_ref;
 use super::state::{SharedState, WhatsAppState};
 use std::collections::{HashMap, HashSet};
@@ -66,9 +66,13 @@ pub(super) fn should_skip_conversation(conv: &wa::Conversation) -> Option<&'stat
 }
 
 /// Remove a chat (and its history + stanza index) from the shared state.
-pub(super) async fn remove_chat(state: &SharedState, jid: &Jid) -> Option<Chat> {
+pub(super) async fn remove_chat(
+    client: Option<&Arc<Client>>,
+    state: &SharedState,
+    jid: &Jid,
+) -> Option<Chat> {
+    let chat_id = canonical_jid_chat_id(client, state, jid).await;
     let mut state = state.write().await;
-    let chat_id = ChatId::jid_to_chat_id(&jid.to_string());
     let removed = state
         .chats
         .iter()
@@ -344,6 +348,9 @@ pub(super) async fn handle_history_sync(
         }
     }
 
+    // Replay edits whose base this chunk carried, broadcast after the write lock
+    // is dropped.
+    let mut deferred_edits: Vec<Message> = Vec::new();
     for (conversation, chat) in history_sync.conversations.iter().zip(canonical.iter()) {
         let chat = chat.clone();
 
@@ -499,6 +506,10 @@ pub(super) async fn handle_history_sync(
 
         // Always finish with an up-to-date preview.
         state.refresh_last_message_ts(&chat);
+
+        // An edit that overtook its base may be resolvable now that this
+        // chunk carries the message it rewrites.
+        deferred_edits.extend(state.apply_deferred_edits(&chat));
     }
 
     // Re-resolve senders the ingest froze bare before the pushnames bundle
@@ -515,6 +526,10 @@ pub(super) async fn handle_history_sync(
     }
 
     info!("WA handle_history_sync done: chats={}", chats_total);
+
+    for updated in deferred_edits {
+        let _ = tx.send(BackendEvent::MessageUpdated(updated));
+    }
 
     // Publish the whole dialog list as a single snapshot so a large history
     // sync is not flood-sent as hundreds of tiny ChatUpdated events over the

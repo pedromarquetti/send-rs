@@ -196,6 +196,8 @@ impl StatefulWidget for ChatWidget<'_> {
 
             let needle = self.message_needle.as_deref();
 
+            // BUG: this does not appear to work: 
+            // filtered list breaks message selection logic
             let filtered: Vec<Message> = if state.message_search.is_filtered() {
                 state
                     .message_search

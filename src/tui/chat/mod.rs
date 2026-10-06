@@ -1385,6 +1385,73 @@ mod tests {
         );
     }
 
+    /// The chat list is merged across providers and sorted by shared code, so
+    /// both providers' rows must follow one rule: the pin band first, then
+    /// descending recency, ties resolved by the stable sort (insertion order).
+    /// And a status-only update — the shape presence/mute produce — must not
+    /// reorder or re-stamp anything, or a peer coming online would shuffle the
+    /// list under the user's cursor.
+    #[test]
+    fn mixed_provider_rows_sort_together_and_ignore_status_updates() {
+        let wa_new = ChatId::WhatsApp("15550000001@s.whatsapp.net".into());
+        let wa_tie = ChatId::WhatsApp("15550000002@s.whatsapp.net".into());
+        let mut tg_pin = chat(ChatId::Telegram(1), "tg-pin");
+        tg_pin.fixed = true;
+        let tg_none = chat(ChatId::Telegram(2), "tg-none");
+
+        let mut state = ChatState {
+            chats: vec![
+                chat_with_ts(wa_new.clone(), "wa-new", 200),
+                tg_none.clone(),
+                chat_with_ts(wa_tie.clone(), "wa-tie", 200),
+                tg_pin.clone(),
+            ],
+            ..Default::default()
+        };
+        state.sort_pinned_then_recent();
+
+        let ids: Vec<_> = state.chats.iter().map(|c| c.id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                ChatId::Telegram(1), // pin band
+                wa_new.clone(),      // recency, tie broken by insertion order
+                wa_tie.clone(),
+                ChatId::Telegram(2), // no timestamp sinks
+            ]
+        );
+
+        // A presence/status update carries no timestamp: same order, same
+        // recency, only the status changes.
+        let mut online = chat_with_ts(wa_new.clone(), "wa-new", 200);
+        online.status = Some("online".into());
+        assert!(state.upsert_chat(online));
+        let ids: Vec<_> = state.chats.iter().map(|c| c.id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                ChatId::Telegram(1),
+                wa_new.clone(),
+                wa_tie.clone(),
+                ChatId::Telegram(2)
+            ]
+        );
+        let row = state.chats.iter().find(|c| c.id == wa_new).unwrap();
+        assert_eq!(row.status.as_deref(), Some("online"));
+        assert_eq!(row.last_message_ts, Some(200));
+
+        // Pinning the timestamp-less chat lifts it into the pin band without
+        // disturbing the recency order behind it.
+        let mut newly_pinned = tg_none.clone();
+        newly_pinned.fixed = true;
+        state.upsert_chat(newly_pinned);
+        let ids: Vec<_> = state.chats.iter().map(|c| c.id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![ChatId::Telegram(1), ChatId::Telegram(2), wa_new, wa_tie]
+        );
+    }
+
     #[test]
     fn upsert_activity_never_puts_chat_above_pins() {
         let mut state = ChatState::default();

@@ -27,7 +27,7 @@ use tracing::{debug, info, warn};
 use whatsapp_rust::Client;
 use whatsapp_rust::UploadOptions;
 use whatsapp_rust::download::DownloadParams;
-use whatsapp_rust::prelude::{Bot, Jid, MessageBuilderExt, SqliteStore, wa};
+use whatsapp_rust::prelude::{Bot, EventDelivery, Jid, MessageBuilderExt, SqliteStore, wa};
 use whatsapp_rust::wacore::download::MediaType;
 use whatsapp_rust::wacore::store::DevicePropsOverride;
 use whatsapp_rust::wacore_binary::JidExt;
@@ -132,6 +132,16 @@ impl WhatsAppMessenger {
                         ..whatsapp_rust::wacore::store::device::default_history_sync_config()
                     }),
             )
+            // Ordered, bounded delivery: every event mutates one shared state,
+            // and the guarantees depend on arrival order (an edit must not
+            // overtake its base message, a history chunk must not land after
+            // the live message it already holds, a clear must not be undone by
+            // a later poll). `Concurrent` spawns a task per event, so those
+            // outcomes come down to scheduler luck. The mailbox absorbs the
+            // gap to the drainer; past it the library drops and counts rather
+            // than lagging without bound. Dispatch stays non-blocking, so a
+            // slow callback delays later events but never the transport.
+            .with_event_delivery(EventDelivery::Ordered { capacity: 1024 })
             .on_event({
                 let tx = tx.clone();
                 let state = state.clone();

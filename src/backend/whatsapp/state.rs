@@ -97,7 +97,23 @@ pub(super) struct WhatsAppState {
     pub(super) own_lid: Option<String>,
     #[serde(default)]
     pub(super) own_pn: Option<String>,
+    /// Edits whose base message is not in `history` yet, keyed by
+    /// `(base message id, chat)`. An edit can outrun its base — on a cold
+    /// start a live edit arrives before the history chunk that carries the
+    /// message it rewrites — so it is held here and replayed by
+    /// [`WhatsAppState::apply_deferred_edits`] when the base lands instead of
+    /// being dropped. Runtime-only (never persisted: a new session re-receives
+    /// the message and the edit with it) and capped by
+    /// [`PENDING_EDIT_LIMIT`], since an edit whose base never arrives is not
+    /// worth keeping.
+    #[serde(skip)]
+    pub(super) pending_edits: HashMap<(MessageId, ChatId), String>,
 }
+
+/// How many unresolved edits to hold before dropping the newest. Generous
+/// next to the handful of edits a single sync burst replays, but bounded so a
+/// stream of edits for messages we never cache cannot grow state without limit.
+const PENDING_EDIT_LIMIT: usize = 64;
 
 impl WhatsAppState {
     /// Restore a previously persisted account snapshot (chats, history,
@@ -264,8 +280,12 @@ impl WhatsAppState {
     /// `protocol_message.edited_message`. The stored copy is located by the
     /// original message id, its text swapped, the preview refreshed, and the
     /// updated message returned for a `BackendEvent::MessageUpdated` broadcast.
-    /// Returns `None` when the edited body carries no text or the target is
-    /// not in the cache.
+    ///
+    /// Returns the updated message, or `None` when the stanza carries no text
+    /// to apply. An edit whose base is not cached yet is *not* dropped: it is
+    /// held in `pending_edits` for [`WhatsAppState::apply_deferred_edits`] to
+    /// replay once the base is ingested, which is the only way an edit that
+    /// outran its message survives.
     pub(super) fn apply_message_edit(
         &mut self,
         chat: &ChatId,
@@ -293,7 +313,44 @@ impl WhatsAppState {
             return None;
         }
 
-        self.edit_message_text(chat, &target_id, &new_text)
+        if let Some(updated) = self.edit_message_text(chat, &target_id, &new_text) {
+            return Some(updated);
+        }
+
+        if self.pending_edits.len() < PENDING_EDIT_LIMIT {
+            self.pending_edits
+                .insert((target_id, chat.clone()), new_text);
+        }
+        None
+    }
+
+    /// Replay the edits held in `pending_edits` whose base message is now
+    /// cached, returning each edited message for broadcast. Called after every
+    /// ingest so an edit that arrived before its base converges as soon as the
+    /// message lands, whether that is a live batch or a history-sync chunk.
+    pub(super) fn apply_deferred_edits(&mut self, chat: &ChatId) -> Vec<Message> {
+        // Resolved before applying: an edit mutates `history` and drops its
+        // own `pending_edits` entry, so the candidate set is collected first.
+        let ready: Vec<(MessageId, String)> = self
+            .pending_edits
+            .iter()
+            .filter(|((_, pending_chat), _)| pending_chat == chat)
+            .filter(|((id, _), _)| {
+                self.history
+                    .get(chat)
+                    .is_some_and(|h| h.iter().any(|m| &m.message_id == id))
+            })
+            .map(|((id, _), text)| (id.clone(), text.clone()))
+            .collect();
+
+        let mut applied = Vec::new();
+        for (id, text) in ready {
+            if let Some(updated) = self.edit_message_text(chat, &id, &text) {
+                applied.push(updated);
+                self.pending_edits.remove(&(id, chat.clone()));
+            }
+        }
+        applied
     }
 
     /// Apply a pin/unpin event for a chat, keyed by its change timestamp.
