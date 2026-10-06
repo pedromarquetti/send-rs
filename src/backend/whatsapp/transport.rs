@@ -1,16 +1,24 @@
 //! WhatsApp WebSocket transport that races every address the host resolves to.
 //!
 //! `tokio-websockets`' own `Gai` resolver takes only the *first* address
-//! `getaddrinfo` returns (`resolver.rs`: `lookup_host(..).next()`), and its
-//! `connect()` then dials that single `SocketAddr` with no fallback. A host
+//! `getaddrinfo` returns (`resolver.rs`: `lookup_host(..).next()`, v0.13.3), and
+//! its `connect()` then dials that single `SocketAddr` with no fallback. A host
 //! that resolves to an unreachable IPv6 address first — e.g. a machine that
 //! holds an IPv6 address but has no IPv6 default route — therefore hangs on
-//! the dead address until whatsapp-rust's 20s connect timeout expires, and
-//! the IPv4 address that would have worked is never tried.
+//! the dead address until whatsapp-rust's 20s connect timeout expires
+//! (`src/client.rs`: `TRANSPORT_CONNECT_TIMEOUT`), and the IPv4 address that
+//! would have worked is never tried.
 //!
 //! This factory resolves the host itself, orders the candidates so both
 //! families are tried early, and races them: the first socket to connect wins
 //! while the others keep dialing in the background.
+//!
+//! Kept rather than folded into configuration: at the
+//! pinned `whatsapp-rust` revision the default `TokioWebSocketTransportFactory`
+//! exposes no resolver seam — only `with_url`, `with_origin`,
+//! `without_origin` and `with_connector` — so the single-address commit cannot
+//! be configured away, only replaced. Everything else about the default is
+//! reproduced below.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};

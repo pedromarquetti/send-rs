@@ -4,7 +4,8 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast};
-use whatsapp_rust::prelude::{Jid, MessageBuilderExt, MessageInfo, wa};
+use whatsapp_rust::prelude::{Event, Jid, MessageBuilderExt, MessageInfo, wa};
+use whatsapp_rust::types::events::{Connected, PairingQrCode};
 use whatsapp_rust::wacore::download::MediaType;
 use whatsapp_rust::wacore::types::message::EditAttribute;
 
@@ -21,7 +22,8 @@ use super::sync::{
     should_skip_conversation,
 };
 use crate::backend::{
-    Chat, ChatId, MediaKind, Message, MessageAction, MessageId, MessageMedia, Messenger,
+    BackendEvent, Chat, ChatId, MediaKind, Message, MessageAction, MessageId, MessageMedia,
+    Messenger,
 };
 use chrono::TimeZone;
 use std::time::Duration;
@@ -1377,6 +1379,55 @@ async fn history_sync_persists_media_refs_for_on_demand_download() {
 }
 
 #[tokio::test]
+async fn history_sync_replay_does_not_duplicate_cached_messages() {
+    let (tx, mut rx) = broadcast::channel(128);
+    let state: SharedState = Arc::new(RwLock::new(WhatsAppState::default()));
+    let chat_id = "15550000009@s.whatsapp.net";
+    let cache = Path::new("/tmp/wa_test_cache.json");
+
+    let hs = wa::HistorySync {
+        conversations: vec![conversation(
+            chat_id,
+            vec![
+                web_msg(chat_id, None, "wa-replay-1", 1000, false, "Alice", "hi"),
+                web_msg(chat_id, None, "wa-replay-2", 1001, false, "Alice", "again"),
+            ],
+        )],
+        pushnames: vec![],
+        ..Default::default()
+    };
+
+    handle_history_sync(&hs, None, &state, &tx, cache).await;
+    let chat = ChatId::WhatsApp(chat_id.to_string());
+    let first = {
+        let s = state.read().await;
+        (
+            s.history.get(&chat).map(Vec::len).expect("history"),
+            s.by_stanza_id.len(),
+        )
+    };
+    assert_eq!(first.0, 2);
+
+    // `require_full_sync` re-requests the backfill on every connect, so the
+    // server replays conversations we may already hold. The ingest has to be
+    // idempotent or each cold start would double the cached history.
+    handle_history_sync(&hs, None, &state, &tx, cache).await;
+    {
+        let s = state.read().await;
+        assert_eq!(s.history.get(&chat).map(Vec::len), Some(first.0));
+        assert_eq!(s.by_stanza_id.len(), first.1);
+    }
+
+    // A replay is a cold-start recovery, not new traffic: it must not announce
+    // anything, so nothing may come out as `MessageReceived`.
+    assert!(
+        !std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|event| matches!(event, BackendEvent::MessageReceived(_))),
+        "history sync must not emit MessageReceived"
+    );
+}
+
+#[tokio::test]
 async fn cached_voice_note_gains_a_media_ref_on_resync() {
     let (tx, _rx) = broadcast::channel(128);
     let state: SharedState = Arc::new(RwLock::new(WhatsAppState::default()));
@@ -1981,6 +2032,12 @@ async fn construction_keeps_the_full_sync_history_config() {
         .get_device_snapshot();
     let props = &device.device_props;
     assert_eq!(props.require_full_sync, Some(true));
+    // UWP is the platform label the full-sync row belongs to, not an identity
+    // claim: it travels with `require_full_sync` as one decision.
+    assert_eq!(
+        props.platform_type,
+        Some(whatsapp_rust::waproto::whatsapp::device_props::PlatformType::UWP)
+    );
     let history = props
         .history_sync_config
         .as_option()
@@ -1988,6 +2045,95 @@ async fn construction_keeps_the_full_sync_history_config() {
     assert_eq!(history.full_sync_days_limit, Some(365));
     assert_eq!(history.on_demand_ready, Some(true));
     assert_eq!(history.complete_on_demand_ready, Some(true));
+
+    messenger.disconnect().await.expect("dormant shutdown");
+}
+
+/// One connection must produce exactly one `Connected`. It used to produce two:
+/// `BotBuilder::on_connected` and the `Event::Connected` arm of the catch-all
+/// `on_event` handler are both interested in `EventKind::Connected`, and the
+/// library's concurrent delivery hands the event to every interested callback —
+/// so the TUI rebuilt its chat list twice per connect. Only `on_event` is
+/// registered now, and this pins that the surviving path emits once.
+#[tokio::test]
+async fn one_connection_emits_a_single_connected_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut messenger =
+        WhatsAppMessenger::new(dir.path().join("wa.db").to_string_lossy().to_string())
+            .await
+            .expect("dormant construction should succeed offline");
+
+    let client = messenger.current_client();
+    let state: SharedState = Arc::new(RwLock::new(WhatsAppState::default()));
+    let (tx, mut rx) = broadcast::channel(16);
+    let qr: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
+
+    WhatsAppMessenger::handle_event(
+        &Arc::new(Event::Connected(Connected::builder().build())),
+        &client,
+        &state,
+        &tx,
+        &qr,
+        dir.path(),
+    )
+    .await;
+
+    // `handle_connect` emits its `Connected` before returning, so the whole
+    // burst is already queued; the enrichment task it spawns may add more.
+    let mut connected = 0;
+    while let Ok(event) = rx.try_recv() {
+        if matches!(event, BackendEvent::Connected) {
+            connected += 1;
+        }
+    }
+    assert_eq!(
+        connected, 1,
+        "one Event::Connected must yield exactly one BackendEvent::Connected"
+    );
+
+    messenger.disconnect().await.expect("dormant shutdown");
+}
+
+/// The same fan-out duplicate hit the pairing path: `on_qr_code` and the
+/// `Event::PairingQrCode` arm both fired per issued code. One code must now
+/// reach the login screen once, with the code it should render.
+#[tokio::test]
+async fn one_pairing_qr_code_emits_a_single_qr_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut messenger =
+        WhatsAppMessenger::new(dir.path().join("wa.db").to_string_lossy().to_string())
+            .await
+            .expect("dormant construction should succeed offline");
+
+    let client = messenger.current_client();
+    let state: SharedState = Arc::new(RwLock::new(WhatsAppState::default()));
+    let (tx, mut rx) = broadcast::channel(16);
+    let qr: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
+
+    let code = "2/abc+def+ghi==";
+    WhatsAppMessenger::handle_event(
+        &Arc::new(Event::PairingQrCode(
+            PairingQrCode::builder()
+                .code(code.to_string())
+                .timeout(Duration::from_secs(20))
+                .build(),
+        )),
+        &client,
+        &state,
+        &tx,
+        &qr,
+        dir.path(),
+    )
+    .await;
+
+    let emitted: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|event| match event {
+            BackendEvent::QrCode(code) => Some(code),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(emitted, vec![code.to_string()]);
+    assert_eq!(qr.read().await.as_deref(), Some(code));
 
     messenger.disconnect().await.expect("dormant shutdown");
 }

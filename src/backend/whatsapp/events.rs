@@ -21,8 +21,9 @@ use whatsapp_rust::wacore::types::message::EditAttribute;
 use whatsapp_rust::wacore_binary::JidExt;
 
 impl WhatsAppMessenger {
-    /// Called once when the underlying server connection is established.
-    /// Past here, message routing is done by `handle_event`.
+    /// Called once per established connection, from `handle_event`'s `Connected`
+    /// arm — the single authoritative path for it. Past here, message routing is
+    /// done by `handle_event`.
     pub(super) fn handle_connect(
         client: &Arc<Client>,
         tx: &Sender<BackendEvent>,
@@ -53,7 +54,7 @@ impl WhatsAppMessenger {
         let _ = tx.send(BackendEvent::Connected);
     }
 
-    /// Called when a QR code is required for pairing.
+    /// Called when a QR code is required for pairing, from `handle_event`.
     pub(super) async fn handle_qr(
         code: &str,
         timeout: std::time::Duration,
@@ -65,7 +66,8 @@ impl WhatsAppMessenger {
         let _ = tx.send(BackendEvent::QrCode(code.to_string()));
     }
 
-    /// Called when the WhatsApp session is logged out / invalidated.
+    /// Called when the WhatsApp session is logged out / invalidated, from
+    /// `handle_event`.
     pub(super) fn handle_logged_out(tx: &Sender<BackendEvent>) {
         warn!("WhatsApp logged out");
         let _ = tx.send(BackendEvent::Disconnected(
@@ -76,6 +78,13 @@ impl WhatsAppMessenger {
     /// Dispatch a routed `Event` coming from the server stream.
     /// Also handles reconnect/QR state and the chat list mutations (deletion,
     /// clear, mute/archive/pin/mark-as-read) that arrive over the syncd channel.
+    ///
+    /// The connection, QR and logout variants live here rather than in
+    /// `BotBuilder::on_connected` / `on_qr_code` / `on_logged_out`: those are
+    /// sugar over `on_event_for` for the very same `EventKind`s, and the
+    /// default concurrent delivery hands one event to every interested
+    /// callback — so registering both paths emitted `Connected` twice per
+    /// connection (two chat-list rebuilds) and each QR code twice.
     pub(super) async fn handle_event(
         event: &Arc<Event>,
         client: &Arc<Client>,
@@ -86,7 +95,7 @@ impl WhatsAppMessenger {
     ) {
         match &**event {
             Event::Connected(_) => {
-                let _ = tx.send(BackendEvent::Connected);
+                Self::handle_connect(client, tx, state, cache_path);
             }
             Event::Disconnected(e) => {
                 // only propagate error if is not Stream Ended - Stream Ended is expected,
@@ -108,8 +117,10 @@ impl WhatsAppMessenger {
                 let _ = tx.send(BackendEvent::Error(err.clone(), BackendError::Other(err)));
             }
             Event::PairingQrCode(q) => {
-                *current_qr.write().await = Some(q.code.clone());
-                let _ = tx.send(BackendEvent::QrCode(q.code.clone()));
+                Self::handle_qr(&q.code, q.timeout, tx, current_qr).await;
+            }
+            Event::LoggedOut(_) => {
+                Self::handle_logged_out(tx);
             }
             Event::PairSuccess(_) => {
                 let _ = tx.send(BackendEvent::QrCode(String::from("ok")));

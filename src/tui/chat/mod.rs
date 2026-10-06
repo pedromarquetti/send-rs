@@ -642,7 +642,6 @@ impl ChatState {
 
     /// Prepend older messages to the open chat history without dropping the
     /// current selection or duplicate entries. This is the foundation for lazy
-    /// history loading in phase 11.
     pub fn prepend_history(&mut self, chat_id: &ChatId, older: Vec<Message>) {
         let mut handled = false;
         if let Some(open) = &mut self.open_chat

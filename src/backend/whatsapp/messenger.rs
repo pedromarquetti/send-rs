@@ -115,64 +115,23 @@ impl WhatsAppMessenger {
 
         let builder = Bot::builder()
             .with_backend(store)
-            // Replaces the tokio-transport default so a host that resolves
-            // web.whatsapp.com to an unroutable address first still connects.
+            // Upstream's `tokio-transport` default commits to the
+            // single address `getaddrinfo` returns first, so a host that
+            // resolves to an unreachable address first never connects; the
+            // racing dial and its upstream evidence are documented in
+            // `transport.rs`.
             .with_transport_factory(WebSocketTransportFactory::new())
             .with_device_props(
                 DevicePropsOverride::new()
-                    .with_os("Send-rs")
-                    // Rebuild wacore's "win_hybrid" row (`require_full_sync`
-                    // + full_sync_days_limit + on_demand_ready): advertising
-                    // `requireFullSync` makes the server push the full recent
-                    // history to this device, which is the only way messages
-                    // received while sendrs was closed are ever re-delivered
-                    // (with their CDN media fields, so voice notes and images
-                    // can be played/downloaded after the fact).
                     .with_platform_type(PlatformType::UWP)
                     .with_require_full_sync(true)
                     .with_history_sync_config(HistorySyncConfig {
-                        // Enable on-demand history fetch and ask for the full
-                        // 365-day backfill window the win_hybrid row uses.
                         full_sync_days_limit: Some(365),
                         on_demand_ready: Some(true),
                         complete_on_demand_ready: Some(true),
                         ..whatsapp_rust::wacore::store::device::default_history_sync_config()
                     }),
             )
-            .on_connected({
-                let tx = tx.clone();
-                let state = state.clone();
-                let cache_path = chat_cache.clone();
-
-                move |client| {
-                    let tx = tx.clone();
-                    let state = state.clone();
-                    let cache_path = cache_path.clone();
-                    async move {
-                        Self::handle_connect(&client, &tx, &state, &cache_path);
-                    }
-                }
-            })
-            .on_qr_code({
-                let tx = tx.clone();
-                let current_qr = current_qr.clone();
-                move |code, timeout| {
-                    let tx = tx.clone();
-                    let current_qr = current_qr.clone();
-                    async move {
-                        Self::handle_qr(&code, timeout, &tx, &current_qr).await;
-                    }
-                }
-            })
-            .on_logged_out({
-                let tx = tx.clone();
-                move |_info| {
-                    let tx = tx.clone();
-                    async move {
-                        Self::handle_logged_out(&tx);
-                    }
-                }
-            })
             .on_event({
                 let tx = tx.clone();
                 let state = state.clone();
