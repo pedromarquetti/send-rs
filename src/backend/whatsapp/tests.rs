@@ -5,7 +5,11 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast};
 use whatsapp_rust::prelude::{Event, Jid, MessageBuilderExt, MessageInfo, wa};
-use whatsapp_rust::types::events::{ArchiveUpdate, Connected, MarkChatAsReadUpdate, PairingQrCode};
+use whatsapp_rust::types::events::{
+    ArchiveUpdate, BatchOrigin, ClearChatUpdate, ConnectFailureReason, Connected,
+    DeleteMessageForMeUpdate, InboundMessage, LoggedOut, MarkChatAsReadUpdate, MessageBatch,
+    MuteUpdate, PairingQrCode, PresenceUpdate,
+};
 use whatsapp_rust::wacore::download::MediaType;
 use whatsapp_rust::wacore::types::message::EditAttribute;
 
@@ -22,8 +26,8 @@ use super::sync::{
     should_skip_conversation,
 };
 use crate::backend::{
-    BackendEvent, Chat, ChatId, MediaKind, Message, MessageAction, MessageId, MessageMedia,
-    Messenger,
+    BackendError, BackendEvent, Chat, ChatId, MediaKind, Message, MessageAction, MessageId,
+    MessageMedia, Messenger,
 };
 use chrono::TimeZone;
 use std::time::Duration;
@@ -2488,4 +2492,578 @@ async fn sqlite_session_survives_dormant_reopen() {
     );
 
     second.disconnect().await.expect("dormant shutdown");
+}
+
+/// A dormant `WhatsAppMessenger` with the collaborators `handle_event` needs,
+/// scoped to a temporary cache directory.
+async fn adapter() -> (
+    WhatsAppMessenger,
+    SharedState,
+    broadcast::Sender<BackendEvent>,
+    Arc<RwLock<Option<String>>>,
+    tempfile::TempDir,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let messenger = WhatsAppMessenger::new(dir.path().join("wa.db").to_string_lossy().to_string())
+        .await
+        .expect("dormant construction should succeed offline");
+    let state: SharedState = Arc::new(RwLock::new(WhatsAppState::default()));
+    let (tx, _) = broadcast::channel(64);
+    let qr: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
+    (messenger, state, tx, qr, dir)
+}
+
+/// Everything queued since the last drain, in arrival order.
+fn drained(rx: &mut broadcast::Receiver<BackendEvent>) -> Vec<BackendEvent> {
+    let mut out = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        out.push(event);
+    }
+    out
+}
+
+/// A phone-keyed row plus its history — the state a syncd update or a live
+/// batch expects to find.
+async fn seed_row(state: &SharedState, chat: ChatId, messages: Vec<Message>) {
+    let last_message_ts = messages.iter().map(|m| m.timestamp).max();
+    let mut guard = state.write().await;
+    guard.chats.push(Chat {
+        id: chat.clone(),
+        last_message_ts,
+        ..Default::default()
+    });
+    if !messages.is_empty() {
+        guard.history.insert(chat, messages);
+    }
+    drop(guard);
+}
+
+fn inbound(chat: &Jid, id: &str, text: &str) -> InboundMessage {
+    InboundMessage::builder()
+        .message(Arc::new(text_message(text)))
+        .info(Arc::new(msg_info(chat, chat, "Alice", id, false)))
+        .build()
+}
+
+/// A WhatsApp edit re-sends the ORIGINAL stanza id with an edit payload.
+fn edit_inbound(chat: &Jid, id: &str, text: &str) -> InboundMessage {
+    let mut info = msg_info(chat, chat, "Alice", id, false);
+    info.edit = EditAttribute::MessageEdit;
+    InboundMessage::builder()
+        .message(Arc::new(wa::Message {
+            protocol_message: MessageField::some(wa::message::ProtocolMessage {
+                key: MessageField::some(wa::MessageKey {
+                    id: Some(id.to_string()),
+                    ..Default::default()
+                }),
+                edited_message: MessageField::some(wa::Message::text(text.to_string())),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+        .info(Arc::new(info))
+        .build()
+}
+
+fn messages_event(messages: Vec<InboundMessage>) -> Event {
+    Event::Messages(
+        MessageBatch::builder()
+            .messages(Arc::from(messages))
+            .origin(BatchOrigin::Live)
+            .build(),
+    )
+}
+
+#[tokio::test]
+async fn a_live_message_reaches_history_and_the_chat_list() {
+    let (mut messenger, state, tx, qr, dir) = adapter().await;
+    let client = messenger.current_client();
+    let mut rx = tx.subscribe();
+    let chat_jid = pn("15550000008");
+
+    WhatsAppMessenger::handle_event(
+        &Arc::new(messages_event(vec![inbound(&chat_jid, "m-1", "hello")])),
+        &client,
+        &state,
+        &tx,
+        &qr,
+        dir.path(),
+    )
+    .await;
+
+    let chat = ChatId::WhatsApp("15550000008@s.whatsapp.net".into());
+    let guard = state.read().await;
+    let history = guard.history.get(&chat).expect("history bucket");
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].text, "hello");
+    let row = guard.chats.iter().find(|c| c.id == chat).expect("chat row");
+    assert_eq!(
+        row.last_message_ts,
+        Some(1000),
+        "the row must join the list by recency"
+    );
+    drop(guard);
+
+    let events = drained(&mut rx);
+    assert_eq!(events.len(), 1, "one message, one announcement: {events:?}");
+    assert!(
+        matches!(&events[0], BackendEvent::MessageReceived(m) if m.text == "hello"),
+        "got {events:?}"
+    );
+
+    messenger.disconnect().await.expect("dormant shutdown");
+}
+
+#[tokio::test]
+async fn an_edit_updates_and_broadcasts_the_stored_message() {
+    let (mut messenger, state, tx, qr, dir) = adapter().await;
+    let client = messenger.current_client();
+    let mut rx = tx.subscribe();
+    let chat_jid = pn("15550000008");
+
+    WhatsAppMessenger::handle_event(
+        &Arc::new(messages_event(vec![inbound(&chat_jid, "m-1", "before")])),
+        &client,
+        &state,
+        &tx,
+        &qr,
+        dir.path(),
+    )
+    .await;
+    let _ = drained(&mut rx);
+
+    WhatsAppMessenger::handle_event(
+        &Arc::new(messages_event(vec![edit_inbound(
+            &chat_jid, "m-1", "after",
+        )])),
+        &client,
+        &state,
+        &tx,
+        &qr,
+        dir.path(),
+    )
+    .await;
+
+    let chat = ChatId::WhatsApp("15550000008@s.whatsapp.net".into());
+    let guard = state.read().await;
+    assert_eq!(guard.history[&chat][0].text, "after");
+    assert_eq!(
+        guard.history[&chat].len(),
+        1,
+        "an edit rewrites the message rather than adding one"
+    );
+    drop(guard);
+
+    let events = drained(&mut rx);
+    assert_eq!(events.len(), 1, "one edit, one update: {events:?}");
+    assert!(
+        matches!(&events[0], BackendEvent::MessageUpdated(m) if m.text == "after"),
+        "got {events:?}"
+    );
+
+    messenger.disconnect().await.expect("dormant shutdown");
+}
+
+/// The Phase 4 deferral guarantee, observed at the boundary: an edit that
+/// arrives before the message it rewrites is held, then applied and broadcast
+/// the moment that message lands.
+#[tokio::test]
+async fn an_edit_that_outruns_its_base_converges_at_the_boundary() {
+    let (mut messenger, state, tx, qr, dir) = adapter().await;
+    let client = messenger.current_client();
+    let mut rx = tx.subscribe();
+    let chat_jid = pn("15550000008");
+
+    WhatsAppMessenger::handle_event(
+        &Arc::new(messages_event(vec![edit_inbound(
+            &chat_jid, "m-1", "after",
+        )])),
+        &client,
+        &state,
+        &tx,
+        &qr,
+        dir.path(),
+    )
+    .await;
+    assert!(
+        drained(&mut rx).is_empty(),
+        "an edit with no base message has nothing to report yet"
+    );
+
+    WhatsAppMessenger::handle_event(
+        &Arc::new(messages_event(vec![inbound(&chat_jid, "m-1", "before")])),
+        &client,
+        &state,
+        &tx,
+        &qr,
+        dir.path(),
+    )
+    .await;
+
+    let chat = ChatId::WhatsApp("15550000008@s.whatsapp.net".into());
+    let guard = state.read().await;
+    assert_eq!(guard.history[&chat][0].text, "after");
+    drop(guard);
+
+    let events = drained(&mut rx);
+    assert_eq!(
+        events.len(),
+        2,
+        "the base and the deferred edit: {events:?}"
+    );
+    assert!(
+        matches!(&events[0], BackendEvent::MessageReceived(_)),
+        "got {events:?}"
+    );
+    assert!(
+        matches!(&events[1], BackendEvent::MessageUpdated(m) if m.text == "after"),
+        "got {events:?}"
+    );
+
+    messenger.disconnect().await.expect("dormant shutdown");
+}
+
+#[tokio::test]
+async fn clearing_a_chat_reports_every_message_it_drops() {
+    let (mut messenger, state, tx, qr, dir) = adapter().await;
+    let client = messenger.current_client();
+    let mut rx = tx.subscribe();
+    let chat = ChatId::WhatsApp("15550000008@s.whatsapp.net".into());
+    seed_row(
+        &state,
+        chat.clone(),
+        vec![
+            build_msg("m-1", "one", &chat, false),
+            build_msg("m-2", "two", &chat, false),
+        ],
+    )
+    .await;
+
+    WhatsAppMessenger::handle_event(
+        &Arc::new(Event::ClearChatUpdate(
+            ClearChatUpdate::builder()
+                .jid(pn("15550000008"))
+                .delete_starred(false)
+                .delete_media(false)
+                .timestamp(chrono::Utc::now())
+                .action(Box::new(wa::sync_action_value::ClearChatAction::default()))
+                .from_full_sync(false)
+                .build(),
+        )),
+        &client,
+        &state,
+        &tx,
+        &qr,
+        dir.path(),
+    )
+    .await;
+
+    let events = drained(&mut rx);
+    assert_eq!(events.len(), 1, "one clear, one announcement: {events:?}");
+    match &events[0] {
+        BackendEvent::MessageDeleted {
+            chat: Some(cleared),
+            message_ids,
+        } => {
+            assert_eq!(cleared, &chat);
+            assert_eq!(
+                message_ids,
+                &vec![MessageId("m-1".into()), MessageId("m-2".into())],
+                "the UI needs every id it must drop"
+            );
+        }
+        other => panic!("expected MessageDeleted, got {other:?}"),
+    }
+
+    let guard = state.read().await;
+    assert!(
+        guard.history.get(&chat).is_none_or(|h| h.is_empty()),
+        "cleared history must be gone"
+    );
+    assert_eq!(
+        guard.chats[0].last_message_ts, None,
+        "an empty chat no longer has recency"
+    );
+    drop(guard);
+
+    messenger.disconnect().await.expect("dormant shutdown");
+}
+
+#[tokio::test]
+async fn delete_for_me_removes_and_reports_only_the_target_message() {
+    let (mut messenger, state, tx, qr, dir) = adapter().await;
+    let client = messenger.current_client();
+    let mut rx = tx.subscribe();
+    let chat = ChatId::WhatsApp("15550000008@s.whatsapp.net".into());
+    seed_row(
+        &state,
+        chat.clone(),
+        vec![
+            build_msg("m-1", "one", &chat, false),
+            build_msg("m-2", "two", &chat, false),
+        ],
+    )
+    .await;
+
+    WhatsAppMessenger::handle_event(
+        &Arc::new(Event::DeleteMessageForMeUpdate(
+            DeleteMessageForMeUpdate::builder()
+                .chat_jid(pn("15550000008"))
+                .message_id("m-2".to_string())
+                .from_me(false)
+                .timestamp(chrono::Utc::now())
+                .action(Box::new(
+                    wa::sync_action_value::DeleteMessageForMeAction::default(),
+                ))
+                .from_full_sync(false)
+                .build(),
+        )),
+        &client,
+        &state,
+        &tx,
+        &qr,
+        dir.path(),
+    )
+    .await;
+
+    let events = drained(&mut rx);
+    assert_eq!(events.len(), 1, "got {events:?}");
+    match &events[0] {
+        BackendEvent::MessageDeleted {
+            chat: Some(target),
+            message_ids,
+        } => {
+            assert_eq!(target, &chat);
+            assert_eq!(message_ids, &vec![MessageId("m-2".into())]);
+        }
+        other => panic!("expected MessageDeleted, got {other:?}"),
+    }
+
+    let guard = state.read().await;
+    let history = &guard.history[&chat];
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].message_id, MessageId("m-1".into()));
+    assert_eq!(guard.chats[0].last_message_ts, Some(1000));
+    drop(guard);
+
+    messenger.disconnect().await.expect("dormant shutdown");
+}
+
+#[tokio::test]
+async fn presence_updates_the_status_label_without_touching_recency() {
+    let (mut messenger, state, tx, qr, dir) = adapter().await;
+    let client = messenger.current_client();
+    let mut rx = tx.subscribe();
+    let chat = ChatId::WhatsApp("15550000008@s.whatsapp.net".into());
+    seed_row(
+        &state,
+        chat.clone(),
+        vec![build_msg("m-1", "hi", &chat, false)],
+    )
+    .await;
+
+    WhatsAppMessenger::handle_event(
+        &Arc::new(Event::Presence(
+            PresenceUpdate::builder()
+                .from(pn("15550000008"))
+                .unavailable(false)
+                .build(),
+        )),
+        &client,
+        &state,
+        &tx,
+        &qr,
+        dir.path(),
+    )
+    .await;
+
+    let events = drained(&mut rx);
+    assert_eq!(
+        events.len(),
+        1,
+        "the row changed, so it is announced: {events:?}"
+    );
+    assert!(
+        matches!(&events[0], BackendEvent::ChatUpdated(c) if c.status.as_deref() == Some("online")),
+        "got {events:?}"
+    );
+    let guard = state.read().await;
+    let row = guard.chats.iter().find(|c| c.id == chat).unwrap();
+    assert_eq!(row.status.as_deref(), Some("online"));
+    assert_eq!(
+        row.last_message_ts,
+        Some(1000),
+        "presence must never move a chat in the list"
+    );
+    drop(guard);
+
+    let _ = drained(&mut rx);
+    WhatsAppMessenger::handle_event(
+        &Arc::new(Event::Presence(
+            PresenceUpdate::builder()
+                .from(pn("15550000008"))
+                .unavailable(true)
+                .last_seen(chrono::Utc.timestamp_opt(900, 0).unwrap())
+                .build(),
+        )),
+        &client,
+        &state,
+        &tx,
+        &qr,
+        dir.path(),
+    )
+    .await;
+
+    let guard = state.read().await;
+    let row = guard.chats.iter().find(|c| c.id == chat).unwrap();
+    assert!(
+        row.status
+            .as_deref()
+            .is_some_and(|s| s.starts_with("last seen ")),
+        "expected a last-seen label, got {:?}",
+        row.status
+    );
+    drop(guard);
+
+    messenger.disconnect().await.expect("dormant shutdown");
+}
+
+#[tokio::test]
+async fn a_mute_marks_the_visible_chat_row() {
+    let (mut messenger, state, tx, qr, dir) = adapter().await;
+    let client = messenger.current_client();
+    let mut rx = tx.subscribe();
+    let chat = ChatId::WhatsApp("15550000008@s.whatsapp.net".into());
+    seed_row(&state, chat.clone(), vec![]).await;
+
+    WhatsAppMessenger::handle_event(
+        &Arc::new(Event::MuteUpdate(
+            MuteUpdate::builder()
+                .jid(pn("15550000008"))
+                .timestamp(chrono::Utc::now())
+                .action(Box::new(wa::sync_action_value::MuteAction {
+                    muted: Some(true),
+                    ..Default::default()
+                }))
+                .from_full_sync(false)
+                .build(),
+        )),
+        &client,
+        &state,
+        &tx,
+        &qr,
+        dir.path(),
+    )
+    .await;
+
+    let events = drained(&mut rx);
+    assert_eq!(events.len(), 1, "got {events:?}");
+    assert!(
+        matches!(&events[0], BackendEvent::ChatUpdated(c) if c.status.as_deref() == Some("muted")),
+        "got {events:?}"
+    );
+    let guard = state.read().await;
+    assert_eq!(
+        guard.chats[0].last_message_ts, None,
+        "a mute must not invent recency"
+    );
+    drop(guard);
+
+    messenger.disconnect().await.expect("dormant shutdown");
+}
+
+#[tokio::test]
+async fn a_server_logout_surfaces_as_a_disconnect() {
+    let (mut messenger, state, tx, qr, dir) = adapter().await;
+    let client = messenger.current_client();
+    let mut rx = tx.subscribe();
+
+    WhatsAppMessenger::handle_event(
+        &Arc::new(Event::LoggedOut(Box::new(
+            LoggedOut::builder()
+                .on_connect(false)
+                .reason(ConnectFailureReason::LoggedOut)
+                .build(),
+        ))),
+        &client,
+        &state,
+        &tx,
+        &qr,
+        dir.path(),
+    )
+    .await;
+
+    let events = drained(&mut rx);
+    assert_eq!(events.len(), 1, "one logout, one announcement: {events:?}");
+    assert!(
+        matches!(&events[0], BackendEvent::Disconnected(msg) if msg.contains("logged out")),
+        "got {events:?}"
+    );
+    assert!(
+        qr.read().await.is_none(),
+        "a logout is not a pairing opportunity"
+    );
+
+    messenger.disconnect().await.expect("dormant shutdown");
+}
+
+/// Write paths must fail loudly on a provider that never authenticated: a
+/// silently swallowed error is indistinguishable from a sent message.
+#[tokio::test]
+async fn write_operations_surface_not_authenticated_instead_of_success() {
+    let (mut messenger, _, _, _, _) = adapter().await;
+    let chat = ChatId::WhatsApp("15550000008@s.whatsapp.net".into());
+    let id = MessageId("m-1".into());
+
+    assert!(
+        matches!(
+            messenger
+                .send(
+                    &chat,
+                    &crate::backend::OutboundMessage::Text { text: "hi".into() },
+                    None
+                )
+                .await,
+            Err(BackendError::NotAuthenticated)
+        ),
+        "send must not report success while logged out"
+    );
+    assert!(matches!(
+        messenger.edit(&chat, &id, "x").await,
+        Err(BackendError::NotAuthenticated)
+    ));
+    assert!(matches!(
+        messenger.delete(&chat, &id).await,
+        Err(BackendError::NotAuthenticated)
+    ));
+    assert!(matches!(
+        messenger.set_read(&chat).await,
+        Err(BackendError::NotAuthenticated)
+    ));
+
+    messenger.disconnect().await.expect("dormant shutdown");
+}
+
+/// `disconnect` tears down exactly once, and a provider that is already shut
+/// down can never come back (`start` returns before it reaches the bot).
+#[tokio::test]
+async fn disconnect_is_idempotent_and_a_shutdown_provider_never_restarts() {
+    let (mut messenger, _, tx, _, _) = adapter().await;
+    let mut rx = tx.subscribe();
+
+    assert!(messenger.disconnect().await.is_ok());
+    assert!(
+        messenger.disconnect().await.is_ok(),
+        "the second teardown is a no-op, not an error"
+    );
+
+    // `start()` after shutdown returns before touching the bot, so this stays
+    // offline: a shut-down provider must never respawn its run loop.
+    messenger.start();
+    messenger.start();
+
+    assert!(
+        rx.try_recv().is_err(),
+        "a provider shut down before it ever started emits nothing"
+    );
 }

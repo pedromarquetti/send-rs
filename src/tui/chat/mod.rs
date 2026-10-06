@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use ratatui::crossterm::event::KeyEvent;
 use ratatui::widgets::ListState;
+use tracing::{debug, trace, warn};
 
 use crate::backend::{Chat, ChatId, Message, MessageId};
 use crate::tui::search::SearchState;
@@ -294,7 +295,7 @@ impl ChatState {
         });
 
         if !duplicate_ids.is_empty() {
-            tracing::warn!(
+            warn!(
                 duplicates = ?duplicate_ids,
                 "Removed duplicate chat IDs from chat list state"
             );
@@ -429,7 +430,7 @@ impl ChatState {
     pub fn find_mut(&mut self, id: &ChatId) -> Option<(usize, &mut Chat)> {
         if !self.chats.iter().any(|chat| chat.id == *id) {
             let ids: Vec<_> = self.chats.iter().map(|c| format!("{:?}", c.id)).collect();
-            tracing::trace!(search = ?id, chat_list = ?ids, "find_mut: chat not found in chat list");
+            trace!(search = ?id, chat_list = ?ids, "find_mut: chat not found in chat list");
         }
         self.chats
             .iter_mut()
@@ -692,7 +693,8 @@ impl ChatState {
             self.drafts.remove(id);
         } else {
             self.drafts.insert(id.clone(), text);
-        }
+        };
+        debug!("Draft HashMap {:?}", self.drafts);
     }
 
     /// Load the draft for a chat, or None if there is no draft.

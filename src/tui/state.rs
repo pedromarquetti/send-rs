@@ -559,6 +559,7 @@ impl AppState {
             Focus::Write => {
                 // Save draft and clear write when exiting chat
                 // + close the current chat
+                // BUG: this is not working? dismissing Write does not persist the message
                 if let Some(chat_id) = self
                     .chat_state
                     .open_chat
@@ -566,6 +567,7 @@ impl AppState {
                     .map(|o| o.chat.id.clone())
                 {
                     let text = self.write.lines().join("\n");
+                    debug!("Saving {text} to draft");
                     self.chat_state.save_draft(&chat_id, text);
                 }
 
@@ -629,6 +631,7 @@ impl AppState {
         self.write.clear();
 
         if let Some(draft) = self.chat_state.load_draft(&chat.id) {
+            debug!("draft '{draft}' present on chat load, inserting...");
             self.write.insert_str(draft);
         }
 
@@ -2853,6 +2856,99 @@ mod tests {
         assert_eq!(chat.unread_count, 1);
     }
 
+    /// The boundary is provider-neutral: the same `MessageReceived` shape must
+    /// badge the WhatsApp row, leave the open Telegram chat alone, and carry
+    /// `Provider::WhatsApp` into the notification the user sees.
+    #[tokio::test]
+    async fn a_whatsapp_message_badges_only_the_whatsapp_row() {
+        let mut state = dual_provider_state(true).await;
+
+        // Open a Telegram chat, so a WhatsApp message is one the user cannot see.
+        let tg_index = state
+            .chat_state
+            .chats
+            .iter()
+            .position(|c| matches!(c.id, ChatId::Telegram(_)))
+            .expect("the merged list holds a Telegram row");
+        select_chat(&mut state, tg_index).await;
+        let open = state.chat_state.open_chat.as_ref().unwrap();
+        let (open_id, open_len) = (open.chat.id.clone(), open.history.len());
+        let telegram_before: Vec<(ChatId, bool, i32, Option<i64>)> = state
+            .chat_state
+            .chats
+            .iter()
+            .filter(|c| matches!(c.id, ChatId::Telegram(_)))
+            .map(|c| (c.id.clone(), c.unread, c.unread_count, c.last_message_ts))
+            .collect();
+
+        let design = ChatId::WhatsApp("5511999990002@s.whatsapp.net".into());
+        let mut incoming = inbound(design.clone(), "Lia", "shipping it");
+        incoming.timestamp = 600;
+
+        let notice = state
+            .notice_for_message(Provider::WhatsApp, &incoming)
+            .expect("an unseen WhatsApp message is worth a notification");
+        assert_eq!(notice.provider, Provider::WhatsApp);
+        assert_eq!(notice.chat, design.clone());
+        assert_eq!(notice.title, "Design Team");
+        assert_eq!(notice.body, "shipping it");
+
+        state.handle_backend_event(Provider::WhatsApp, BackendEvent::MessageReceived(incoming));
+
+        let row = state
+            .chat_state
+            .chats
+            .iter()
+            .find(|c| c.id == design)
+            .expect("the WhatsApp row stays in the list");
+        assert!(row.unread, "the unseen WhatsApp row takes the badge");
+        assert_eq!(row.unread_count, 1);
+        assert_eq!(
+            row.last_message_ts,
+            Some(600),
+            "recency follows the message itself"
+        );
+
+        // A message older than the row's newest activity must not pull the
+        // chat back down the list, but it is still an unread message.
+        let mut stale = inbound(design.clone(), "Lia", "an older message");
+        stale.timestamp = 100;
+        state.handle_backend_event(Provider::WhatsApp, BackendEvent::MessageReceived(stale));
+
+        let row = state
+            .chat_state
+            .chats
+            .iter()
+            .find(|c| c.id == design)
+            .expect("the WhatsApp row stays in the list");
+        assert_eq!(
+            row.last_message_ts,
+            Some(600),
+            "recency never regresses to an older message"
+        );
+        assert_eq!(row.unread_count, 2, "it is still an unread message");
+
+        let open = state.chat_state.open_chat.as_ref().unwrap();
+        assert_eq!(open.chat.id, open_id, "the open Telegram chat is untouched");
+        assert_eq!(
+            open.history.len(),
+            open_len,
+            "the message did not land in the open conversation"
+        );
+
+        let telegram_after: Vec<(ChatId, bool, i32, Option<i64>)> = state
+            .chat_state
+            .chats
+            .iter()
+            .filter(|c| matches!(c.id, ChatId::Telegram(_)))
+            .map(|c| (c.id.clone(), c.unread, c.unread_count, c.last_message_ts))
+            .collect();
+        assert_eq!(
+            telegram_before, telegram_after,
+            "a WhatsApp message must not touch a Telegram row"
+        );
+    }
+
     /// An inbound message for a chat the user is not reading, built by hand so
     /// each seam test can vary only what it is about.
     fn inbound(chat: ChatId, sender: &str, text: &str) -> Message {
@@ -4679,10 +4775,7 @@ mod tests {
         // The caption lives in the right half of the popup (72-wide popup
         // centred in 80 columns, 70 inner split 50/50 → right half from
         // column 40) and wraps across as many rows as it needs.
-        let caption_rows: Vec<&String> = rows
-            .iter()
-            .filter(|row| row.contains("w0"))
-            .collect();
+        let caption_rows: Vec<&String> = rows.iter().filter(|row| row.contains("w0")).collect();
         assert!(
             caption_rows.len() >= 2,
             "caption did not wrap: {caption_rows:?}"
