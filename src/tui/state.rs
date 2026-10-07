@@ -2361,7 +2361,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transient_disconnect_does_not_open_the_qr_screen() {
+    async fn a_terminal_disconnect_shows_an_error_without_opening_login() {
         let (mut state, _telegram, _whatsapp) = stub_provider_state(/* whatsapp */ true).await;
         state.handle_backend_event(Provider::WhatsApp, BackendEvent::Connected);
         assert!(
@@ -2369,9 +2369,9 @@ mod tests {
             "precondition: the provider is connected"
         );
 
-        // StreamEnded is suppressed upstream, so a plain drop amounts to a
-        // transient disconnect; the reconnect that follows must not pop a
-        // pairing screen over a perfectly good session.
+        // `Disconnected` from the run-loop watcher / logout handler means the
+        // transport actually died — it is loud (error popup, connection
+        // revoked) but never itself a pairing prompt.
         state.handle_backend_event(
             Provider::WhatsApp,
             BackendEvent::Disconnected("WhatsApp: connection lost".into()),
@@ -2379,8 +2379,12 @@ mod tests {
 
         assert!(!state.provider_connected.contains(&Provider::WhatsApp));
         assert!(
+            state.pop_up.is_some(),
+            "a terminal disconnect must surface an error"
+        );
+        assert!(
             state.login_state.is_none() && matches!(state.screen, Screen::Main),
-            "a transient disconnect must not open the QR/login screen"
+            "a terminal disconnect must not open the QR/login screen"
         );
 
         state.handle_backend_event(Provider::WhatsApp, BackendEvent::Connected);
@@ -2389,6 +2393,48 @@ mod tests {
             state.login_state.is_none(),
             "reconnect confirms the session and stays on the main screen"
         );
+    }
+
+    #[tokio::test]
+    async fn a_transient_reconnect_status_keeps_the_provider_connected() {
+        let (mut state, _telegram, _whatsapp) = stub_provider_state(/* whatsapp */ true).await;
+        state.handle_backend_event(Provider::WhatsApp, BackendEvent::Connected);
+        assert!(
+            state.provider_connected.contains(&Provider::WhatsApp),
+            "precondition: the provider is connected"
+        );
+
+        // A clean stream recycle is announced as a transient status, not a
+        // terminal outage: no error popup, the connection is not revoked, the
+        // session is not cleared, and no pairing prompt appears.
+        state.handle_backend_event(
+            Provider::WhatsApp,
+            BackendEvent::Status("WhatsApp reconnecting".into()),
+        );
+
+        assert_eq!(
+            state.backend_status.as_deref(),
+            Some("WhatsApp reconnecting")
+        );
+        assert!(
+            state.provider_connected.contains(&Provider::WhatsApp),
+            "a recycle must not revoke the connection"
+        );
+        assert!(
+            state.pop_up.is_none(),
+            "a recycle must not pop an error dialog"
+        );
+        assert!(state.login_state.is_none());
+
+        // The single `Connected` that follows a successful reconnect clears the
+        // transient status and stays on the main screen.
+        state.handle_backend_event(Provider::WhatsApp, BackendEvent::Connected);
+        assert!(
+            state.backend_status.is_none(),
+            "Connected clears the status"
+        );
+        assert!(state.provider_connected.contains(&Provider::WhatsApp));
+        assert!(state.login_state.is_none());
     }
 
     #[tokio::test]

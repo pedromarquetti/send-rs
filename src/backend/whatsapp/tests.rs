@@ -5,10 +5,11 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast};
 use whatsapp_rust::prelude::{Event, Jid, MessageBuilderExt, MessageInfo, wa};
+use whatsapp_rust::transport::DisconnectReason;
 use whatsapp_rust::types::events::{
     ArchiveUpdate, BatchOrigin, ClearChatUpdate, ConnectFailureReason, Connected,
-    DeleteMessageForMeUpdate, InboundMessage, LoggedOut, MarkChatAsReadUpdate, MessageBatch,
-    MuteUpdate, PairingQrCode, PresenceUpdate,
+    DeleteMessageForMeUpdate, Disconnected, InboundMessage, LoggedOut, MarkChatAsReadUpdate,
+    MessageBatch, MuteUpdate, PairingQrCode, PresenceUpdate,
 };
 use whatsapp_rust::wacore::download::MediaType;
 use whatsapp_rust::wacore::types::message::EditAttribute;
@@ -3297,6 +3298,62 @@ async fn a_server_logout_surfaces_as_a_disconnect() {
     assert!(
         qr.read().await.is_none(),
         "a logout is not a pairing opportunity"
+    );
+
+    messenger.disconnect().await.expect("dormant shutdown");
+}
+
+#[tokio::test]
+async fn a_clean_stream_recycle_is_transient_not_terminal() {
+    let (mut messenger, state, tx, qr, dir) = adapter().await;
+    let client = messenger.current_client();
+    let mut rx = tx.subscribe();
+
+    // A graceful, server-initiated recycle (EOF, or a normal close frame) is
+    // the routine reconnect path: it must surface as a transient "reconnecting"
+    // status — never a terminal error — while the run task stays alive.
+    WhatsAppMessenger::handle_event(
+        &Arc::new(Event::Disconnected(
+            Disconnected::builder()
+                .reason(DisconnectReason::StreamEnded)
+                .build(),
+        )),
+        &client,
+        &state,
+        &tx,
+        &qr,
+        dir.path(),
+    )
+    .await;
+
+    let events = drained(&mut rx);
+    assert_eq!(events.len(), 1, "one recycle, one announcement: {events:?}");
+    assert!(
+        matches!(&events[0], BackendEvent::Status(s) if s.contains("reconnecting")),
+        "a clean recycle is transient: got {events:?}"
+    );
+
+    // A genuine transport failure (read/IO error) must stay loud so it never
+    // hides behind reconnect noise.
+    WhatsAppMessenger::handle_event(
+        &Arc::new(Event::Disconnected(
+            Disconnected::builder()
+                .reason(DisconnectReason::ReadError("connection reset".into()))
+                .build(),
+        )),
+        &client,
+        &state,
+        &tx,
+        &qr,
+        dir.path(),
+    )
+    .await;
+
+    let events = drained(&mut rx);
+    assert_eq!(events.len(), 1, "got {events:?}");
+    assert!(
+        matches!(&events[0], BackendEvent::Disconnected(msg) if msg.contains("Disconnected!")),
+        "a transport failure must stay loud: got {events:?}"
     );
 
     messenger.disconnect().await.expect("dormant shutdown");
