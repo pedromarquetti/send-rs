@@ -66,10 +66,16 @@ enum UiEvent {
         result: Result<Vec<backend::Message>, BackendError>,
         status: Option<String>,
     },
-    ChatList(Provider, Result<Vec<Chat>, BackendError>),
+    /// Result of a backgrounded per-provider chat-list sync. The `u64` is the
+    /// lifecycle epoch the fetch started under; results from before a provider
+    /// disable are discarded by `AppState::apply_synced_chats`.
+    ChatList(Provider, Result<Vec<Chat>, BackendError>, u64),
+    /// Result of a backgrounded chat-list fetch across all providers, tagged
+    /// with the lifecycle epoch it started under (see [`UiEvent::ChatList`]).
     ChatsLoaded {
         chats: Vec<Chat>,
         errors: Vec<BackendError>,
+        epoch: u64,
     },
     /// Result of a backgrounded `Messenger::media_bytes` fetch for the image
     /// popup; applied by `App::apply_image_media` (a no-op if the popup for
@@ -309,7 +315,7 @@ async fn run_app(
     // provider can be started without a `broadcast` channel dropping its first
     // `Connected` / `QrCode` event. Providers the configuration leaves disabled
     // stay dormant: no transport, no provider fetch.
-    app.state.start_enabled_providers();
+    app.state.start_enabled_providers().await;
 
     info!("TUI started");
 
@@ -332,17 +338,25 @@ async fn run_app(
         .start_loading(LoadingArea::ChatList, "Fetching chats...".to_string());
 
     // Kick off the initial chat list fetch in the background so the UI renders
-    // immediately (non-blocking startup). Results arrive via `ChatsLoaded`.
+    // immediately (non-blocking startup). Results arrive via `ChatsLoaded`,
+    // tagged with the epoch they started under so a disable that lands while
+    // the fetch is in flight discards its WhatsApp rows.
     let chat_loader_tx = tx.clone();
     let loader_messengers = app.state.messengers.clone();
     let provider_configs = app.state.config.providers.clone();
 
     {
         let provider_configs = provider_configs.clone();
+        let epoch = app.state.lifecycle_epoch;
+
         tokio::spawn(async move {
             let (chats, errors) =
                 crate::tui::state::fetch_all_chats(&loader_messengers, &provider_configs).await;
-            let _ = chat_loader_tx.send(UiEvent::ChatsLoaded { chats, errors });
+            let _ = chat_loader_tx.send(UiEvent::ChatsLoaded {
+                chats,
+                errors,
+                epoch,
+            });
         });
     };
 
@@ -411,29 +425,44 @@ async fn run_app(
                     continue;
                 }
 
+                // Only enabled providers are fetched, so `pending` counts
+                // exactly what is spawned below: one disabled provider must
+                // not strand the counter (and with it every later sync).
+                // Enabled state is read live, not from the startup snapshot —
+                // a provider disabled since then must not be polled again.
+                let enabled: Vec<_> = app
+                    .state
+                    .messengers
+                    .iter()
+                    .filter(|messenger| {
+                        messenger
+                            .provider()
+                            .is_enabled(&app.state.config.providers)
+                    })
+                    .cloned()
+                    .collect();
+
+                if enabled.is_empty() {
+                    continue;
+                }
+
                 app.state.chatlist_sync_in_flight = true;
-                app.state.chatlist_sync_pending = app.state.messengers.len();
+                app.state.chatlist_sync_pending = enabled.len();
 
                 app.state.start_loading(
                     LoadingArea::ChatList,
                     "Syncing chats...".to_string(),
                 );
 
-                for messenger in app.state.messengers.iter() {
-                    let provider = messenger.provider();
+                let epoch = app.state.lifecycle_epoch;
 
-                    if !provider.is_enabled(&provider_configs) {
-                        warn!("Provider {:#?} disabled! Skipping chat fetch background task", provider);
-                        continue;
-                    }
-
-                    let messenger = messenger.clone();
+                for messenger in enabled {
                     let tx = tx.clone();
 
                     tokio::spawn(async move {
                         let provider = messenger.provider();
                         let result = messenger.chats().await;
-                        let _ = tx.send(UiEvent::ChatList(provider, result));
+                        let _ = tx.send(UiEvent::ChatList(provider, result, epoch));
                     });
                 }
             }
@@ -457,13 +486,18 @@ async fn run_app(
                             "TUI processing backend event, pending render"
                         );
 
-                        let rebuild = matches!(backend_event, BackendEvent::Connected);
+                        let rebuild = matches!(backend_event, BackendEvent::Connected)
+                            && provider.is_enabled(&app.state.config.providers);
 
                         // Asked before the event is consumed: the notice reads
                         // the pre-update chat list, which is exactly the state
-                        // the event is about to act on.
+                        // the event is about to act on. A disabled provider
+                        // never announces: its events are stale leftovers from
+                        // the stop.
                         let notice = match &backend_event {
-                            BackendEvent::MessageReceived(message) => {
+                            BackendEvent::MessageReceived(message)
+                                if provider.is_enabled(&app.state.config.providers) =>
+                            {
                                 app.state.notice_for_message(provider, message)
                             }
                             _ => None,
@@ -510,6 +544,7 @@ async fn run_app(
                             let chat_loader_tx = tx.clone();
                             let loader_messengers = app.state.messengers.clone();
                             let loader_providers = app.state.config.providers.clone();
+                            let epoch = app.state.lifecycle_epoch;
 
                             tokio::spawn(async move {
                                 let (chats, errors) = crate::tui::state::fetch_all_chats(
@@ -517,8 +552,11 @@ async fn run_app(
                                     &loader_providers,
                                 )
                                 .await;
-                                let _ = chat_loader_tx
-                                    .send(UiEvent::ChatsLoaded { chats, errors });
+                                let _ = chat_loader_tx.send(UiEvent::ChatsLoaded {
+                                    chats,
+                                    errors,
+                                    epoch,
+                                });
                             });
                         }
                     }
@@ -552,44 +590,16 @@ async fn run_app(
                             result,
                             status,
                         } => app.state.apply_chat_load(chat, generation, result, status),
-                    UiEvent::ChatList(provider, result) => {
-                                // TODO: hide archived chats from the main list once the TUI has an
-                                    // Archived section; until then they stay visible to match the phone.
-
-                        app.state.chatlist_sync_pending =
-                            app.state.chatlist_sync_pending.saturating_sub(1);
-                        app.state.chatlist_sync_in_flight = app.state.chatlist_sync_pending > 0;
-
-                        if !app.state.chatlist_sync_in_flight {
-                            app.state.finish_loading(LoadingArea::ChatList);
-                        }
-
-                        match result {
-                            Ok(chats) => {
-                                // Skip the persistence write when nothing
-                                // changed (both messenger syncs every
-                                // `chat_list_sync_secs`; identical snapshots
-                                // must not churn the cache file).
-                                if app
-                                    .state
-                                    .chat_state
-                                    .reconcile_provider_chats(provider, chats)
-                                {
-                                    app.state.persist_chats();
-                                }
-                                debug!(provider = ?provider, "Chat list sync OK");
-                            }
-
-                            Err(e) => error!(provider = ?provider, error = %e, "Chat list sync failed"),
-                        }
+                    UiEvent::ChatList(provider, result, epoch) => {
+                        app.state.apply_synced_chats(provider, result, epoch);
                     }
-                    UiEvent::ChatsLoaded { chats, errors } => {
+                    UiEvent::ChatsLoaded { chats, errors, epoch } => {
                         debug!(
                             chats = chats.len(),
                             errors = errors.len(),
                             "ChatsLoaded applied"
                         );
-                        app.state.apply_fetched(chats, errors);
+                        app.state.apply_fetched(chats, errors, epoch);
                     }
                     UiEvent::ImageMedia {
                         chat,

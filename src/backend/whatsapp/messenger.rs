@@ -15,7 +15,7 @@ use super::sync::{
 };
 use super::transport::WebSocketTransportFactory;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::broadcast::Sender;
 use tokio::sync::{RwLock, broadcast};
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use whatsapp_rust::Client;
 use whatsapp_rust::UploadOptions;
 use whatsapp_rust::download::DownloadParams;
@@ -35,11 +35,15 @@ use whatsapp_rust::waproto::whatsapp::device_props::{HistorySyncConfig, Platform
 
 #[derive(Clone)]
 pub struct WhatsAppMessenger {
-    client: Arc<Client>,
+    /// The client of the currently built bot. Swapped on a restart: a
+    /// disconnected client is terminal, so [`Messenger::start`] builds a fresh
+    /// bot (and with it a fresh client) from the durable session after a stop.
+    /// `Arc`-wrapped so the messenger keeps its cheap `Clone`.
+    client: Arc<std::sync::RwLock<Arc<Client>>>,
     /// The configured-but-not-yet-started bot. It is intentionally not spawned
     /// in `new()`: only [`Messenger::start`] claims it, which is what keeps a
     /// dormant provider free of any transport. Once claimed it is `None`, so a
-    /// second `start()` is a no-op.
+    /// second `start()` is a no-op until a stop/restart rebuilds it.
     bot: Arc<Mutex<Option<Bot>>>,
     run_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     tx: Sender<BackendEvent>,
@@ -51,6 +55,9 @@ pub struct WhatsAppMessenger {
     /// Path to the JSON cache backing this account's chats/history/pushnames,
     /// derived from the sqlite store path so both survive the same data dir.
     cache_path: PathBuf,
+    /// Path of the sqlite session store, kept so a restart can reopen the same
+    /// durable session without logging out.
+    store_path: PathBuf,
 }
 
 impl WhatsAppMessenger {
@@ -61,22 +68,6 @@ impl WhatsAppMessenger {
     /// all prepared, but no transport is opened and no provider API is called.
     /// [`Messenger::start`] is the only way to reach the network.
     pub async fn new(store_path: String) -> Result<Self, BackendError> {
-        let store = SqliteStore::new(&store_path)
-            .await
-            .map_err(|e| BackendError::Other(format!("WhatsApp: failed to open store: {e}")))?;
-
-        // `wa.db` holds the account's session keys; its `-wal` (write-ahead
-        // log) and `-shm` (shared memory) sidecars hold uncommitted pages of
-        // the same data. SQLite creates them with the process umask, typically
-        // world-readable, so tighten them now — before the first login or sync
-        // can write account data into them.
-        for suffix in ["", "-wal", "-shm"] {
-            let artifact = format!("{store_path}{suffix}");
-            if let Err(e) = crate::file::repair_owner_only(std::path::Path::new(&artifact)) {
-                warn!("WhatsApp: could not tighten {artifact} permissions: {e}");
-            }
-        }
-
         let (tx, _) = broadcast::channel(128);
 
         // Dedicated WhatsApp cache. Must NOT share the TUI's `chats.json`:
@@ -113,6 +104,57 @@ impl WhatsAppMessenger {
         let shutdown = Arc::new(AtomicBool::new(false));
         let current_qr: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
 
+        let bot = Self::build_bot(&store_path, &tx, &state, &current_qr, &chat_cache).await?;
+        let client = bot.client();
+
+        // Heal chat rows split across LID/PN keys (older caches created one
+        // row per key) before the TUI can render them: one peer must never
+        // appear twice. Correct on a cold start too — at that point the LID↔PN
+        // mappings are still empty, so each cached LID row is resolved afresh.
+        merge_lid_duplicates(&client, &state, None, None).await;
+
+        Ok(Self {
+            client: Arc::new(std::sync::RwLock::new(client)),
+            bot: Arc::new(Mutex::new(Some(bot))),
+            run_task: Arc::new(Mutex::new(None)),
+            tx,
+            state,
+            shutdown,
+            current_qr,
+            cache_path: chat_cache,
+            store_path: PathBuf::from(store_path),
+        })
+    }
+
+    /// Open (or reopen) the sqlite session store and build a bot wired to the
+    /// shared event sources. Used by [`Messenger::new`] on a cold start and by
+    /// [`Messenger::start`] after a stop: an upstream client is terminal once
+    /// `disconnect`ed, so a restart builds a brand-new bot and client over the
+    /// same durable session path instead of reusing the stopped one.
+    async fn build_bot(
+        store_path: &str,
+        tx: &Sender<BackendEvent>,
+        state: &SharedState,
+        current_qr: &Arc<RwLock<Option<String>>>,
+        cache_path: &Path,
+    ) -> Result<Bot, BackendError> {
+        let store = SqliteStore::new(store_path)
+            .await
+            .map_err(|e| BackendError::Other(format!("WhatsApp: failed to open store: {e}")))?;
+
+        // `wa.db` holds the account's session keys; its `-wal` (write-ahead
+        // log) and `-shm` (shared memory) sidecars hold uncommitted pages of
+        // the same data. SQLite creates them with the process umask, typically
+        // world-readable, so tighten them now — before the first login or sync
+        // can write account data into them. Re-runs on every rebuild: the
+        // sidecars are recreated with the umask when the store reopens.
+        for suffix in ["", "-wal", "-shm"] {
+            let artifact = format!("{store_path}{suffix}");
+            if let Err(e) = crate::file::repair_owner_only(std::path::Path::new(&artifact)) {
+                warn!("WhatsApp: could not tighten {artifact} permissions: {e}");
+            }
+        }
+
         let builder = Bot::builder()
             .with_backend(store)
             // Upstream's `tokio-transport` default commits to the
@@ -146,7 +188,7 @@ impl WhatsAppMessenger {
                 let tx = tx.clone();
                 let state = state.clone();
                 let current_qr = current_qr.clone();
-                let cache_path = chat_cache.clone();
+                let cache_path = cache_path.to_path_buf();
                 move |event, client| {
                     let tx = tx.clone();
                     let state = state.clone();
@@ -159,33 +201,14 @@ impl WhatsAppMessenger {
                 }
             });
 
-        let bot = builder
+        builder
             .build()
             .await
-            .map_err(|e| BackendError::Other(format!("WhatsApp: failed to build bot: {e}")))?;
-
-        let client = bot.client();
-
-        // Heal chat rows split across LID/PN keys (older caches created one
-        // row per key) before the TUI can render them: one peer must never
-        // appear twice. Correct on a cold start too — at that point the LID↔PN
-        // mappings are still empty, so each cached LID row is resolved afresh.
-        merge_lid_duplicates(&client, &state, None, None).await;
-
-        Ok(Self {
-            client,
-            bot: Arc::new(Mutex::new(Some(bot))),
-            run_task: Arc::new(Mutex::new(None)),
-            tx,
-            state,
-            shutdown,
-            current_qr,
-            cache_path: chat_cache,
-        })
+            .map_err(|e| BackendError::Other(format!("WhatsApp: failed to build bot: {e}")))
     }
 
     pub(crate) fn current_client(&self) -> Arc<Client> {
-        self.client.clone()
+        self.client.read().unwrap().clone()
     }
 
     async fn check_logged_in(&self) -> Result<(), BackendError> {
@@ -208,8 +231,9 @@ impl WhatsAppMessenger {
         *self.run_task.lock().unwrap() = Some(run_task);
     }
 
-    /// True once [`Messenger::disconnect`] ran; a shut-down provider must never
-    /// be started again.
+    /// True while a [`Messenger::disconnect`] is in effect: the transport was
+    /// stopped and must stay stopped until the next explicit [`Messenger::start`],
+    /// which clears the flag before it builds a fresh run.
     fn is_shutting_down(&self) -> bool {
         self.shutdown.load(Ordering::SeqCst)
     }
@@ -217,18 +241,61 @@ impl WhatsAppMessenger {
 
 #[async_trait::async_trait]
 impl Messenger for WhatsAppMessenger {
-    /// `dormant -> started`: spawn the bot exactly once, which is the first
-    /// point at which this provider touches the network. Called by the TUI for
-    /// an explicitly enabled provider, after every event receiver is
-    /// registered, so the first `Connected` / `QrCode` event has a subscriber.
-    fn start(&self) {
-        if self.is_shutting_down() {
+    /// `dormant/stopped -> started`: spawn the bot, which is the first point at
+    /// which this provider touches the network. Called by the TUI for an
+    /// explicitly enabled provider, after every event receiver is registered,
+    /// so the first `Connected` / `QrCode` event has a subscriber.
+    ///
+    /// Idempotent while a run is live. After a [`Messenger::disconnect`] it
+    /// builds a fresh bot over the same durable session instead — the old
+    /// client is terminal once disconnected — so a later enable reconnects
+    /// without logout or a new pairing round.
+    async fn start(&self) {
+        if self.run_task.lock().unwrap().is_some() {
             return;
         }
 
-        let Some(bot) = self.take_bot() else {
-            return;
+        let was_stopped = self.is_shutting_down();
+        self.shutdown.store(false, Ordering::SeqCst);
+
+        // The dormant slot is only reusable on a first start. A stopped run
+        // left behind a terminal client (or, if it never ran, a pre-built bot
+        // holding one), so both cases rebuild from the durable session.
+        let bot = match (was_stopped, self.take_bot()) {
+            (false, Some(bot)) => bot,
+            _ => {
+                let store_path = self.store_path.to_string_lossy().into_owned();
+                match Self::build_bot(
+                    &store_path,
+                    &self.tx,
+                    &self.state,
+                    &self.current_qr,
+                    &self.cache_path,
+                )
+                .await
+                {
+                    Ok(bot) => bot,
+                    Err(e) => {
+                        error!(error = %e, "WhatsApp: could not build a fresh run");
+                        let _ = self
+                            .tx
+                            .send(BackendEvent::Error("WhatsApp failed to start".into(), e));
+                        return;
+                    }
+                }
+            }
         };
+
+        // A stop raced this start (shutdown arrives from the event loop only
+        // between awaits, but the invariant is enforced here rather than
+        // assumed): never resurrect a transport the user just disabled.
+        if self.is_shutting_down() {
+            warn!("WhatsApp: start aborted by an intervening stop");
+            return;
+        }
+
+        let client = bot.client();
+        *self.client.write().unwrap() = client;
 
         let handle = bot.spawn();
         let watch_tx = self.tx.clone();
@@ -250,7 +317,7 @@ impl Messenger for WhatsAppMessenger {
     }
 
     async fn is_authenticated(&self) -> bool {
-        self.client.clone().is_logged_in()
+        self.current_client().is_logged_in()
     }
 
     async fn chats(&self) -> Result<Vec<Chat>, BackendError> {
@@ -446,7 +513,7 @@ impl Messenger for WhatsAppMessenger {
     }
 
     async fn status(&self, chat: &ChatId) -> Result<Option<String>, BackendError> {
-        if !self.client.clone().is_logged_in() {
+        if !self.current_client().is_logged_in() {
             return Ok(None);
         }
         let ChatId::WhatsApp(raw) = chat else {
@@ -837,8 +904,10 @@ impl Messenger for WhatsAppMessenger {
     }
 
     async fn disconnect(&mut self) -> Result<(), BackendError> {
-        // Idempotent: only the first call performs the actual teardown, and it
-        // is safe to call on a provider that was never started (disabled).
+        // Stop in place, not logout: the session files stay untouched and a
+        // later `start()` rebuilds a run over them. Idempotent — only the
+        // first call performs the teardown, and calling it on a provider that
+        // was never started (disabled) is safe.
         if self.shutdown.swap(true, Ordering::SeqCst) {
             return Ok(());
         }

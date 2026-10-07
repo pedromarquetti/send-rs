@@ -497,7 +497,8 @@ pub trait Messenger: Send + Sync {
     /// ```text
     /// constructed/dormant -> explicitly enabled -> started -> connected/paired
     /// constructed/dormant -> disabled (no transport, no provider fetch)
-    /// started -> disconnected/reconnecting
+    /// started -> disabled (`disconnect` stops the transport in place)
+    /// stopped -> explicitly enabled again -> fresh start from the same session
     /// started -> graceful shutdown
     /// ```
     ///
@@ -506,11 +507,13 @@ pub trait Messenger: Send + Sync {
     /// poll all stay inert. The TUI calls it once per enabled provider, after
     /// every event receiver is registered, so a late subscription can never drop
     /// the first `Connected` / `QrCode` event. Implementations must be
-    /// idempotent: enabling a provider later may call this again.
+    /// idempotent: enabling a provider later may call this again, including
+    /// after a [`Messenger::disconnect`], which must produce a fresh run built
+    /// from the provider's durable session (no logout, no pairing screen).
     ///
     /// The default is a no-op for providers whose transport is already live by
     /// the time they are constructed.
-    fn start(&self) {}
+    async fn start(&self) {}
     /// Optional provider-specific status for a chat, such as Telegram online/last-seen information.
     /// The default is `None`; a provider may fill this in later without changing the UI contract.
     async fn status(&self, _chat: &ChatId) -> Result<Option<String>, BackendError> {
@@ -525,7 +528,12 @@ pub trait Messenger: Send + Sync {
     async fn reconnect(&self) -> Result<(), BackendError> {
         Ok(())
     }
-    /// Graceful shutdown: flush pending work, close transport, stop background tasks.
+    /// Stop the provider in place: signal the transport to stop reconnecting,
+    /// await the run task, stop background tasks, flush cached state. The
+    /// durable session (`wa.db`/`wp_cache.json` equivalents) is kept — this is
+    /// a disable, not a logout — so a later [`Messenger::start`] may build a
+    /// fresh run from it. Idempotent: repeated calls, including calls during
+    /// startup, reconnect or shutdown, are safe no-ops after the first.
     async fn disconnect(&mut self) -> Result<(), BackendError>;
     /// Abort an in-progress login flow, discarding any pending tokens/state.
     async fn cancel_login(&mut self) {}
@@ -645,7 +653,7 @@ impl MessengerKind {
         , async fn edit(&self, chat: &ChatId, id: &MessageId, text: &str) -> Result<(), BackendError> ;
         , async fn media_bytes(&self, chat: &ChatId, message_id: &MessageId) -> Result<Option<Vec<u8>>, BackendError> ;
         , fn subscribe(&self) -> broadcast::Receiver<BackendEvent> ;
-        , fn start(&self) -> () ;
+        , async fn start(&self) -> () ;
         , async fn status(&self, chat: &ChatId) -> Result<Option<String>, BackendError> ;
         , async fn cancel_chat_refresh(&self) -> () ;
         , async fn reconnect(&self) -> Result<(), BackendError> ;

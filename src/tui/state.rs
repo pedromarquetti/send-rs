@@ -119,6 +119,11 @@ pub struct AppState {
     pub chats_loaded: bool,
 
     pub chat_load_generation: u64,
+    /// Bumped every time a provider is disabled. Background fetches capture it
+    /// when they spawn and discard their result on arrival if it moved on — a
+    /// chat-list snapshot taken before a disable must not repopulate the rows
+    /// the disable just removed.
+    pub lifecycle_epoch: u64,
     pub history_refresh_in_flight: bool,
     pub chatlist_sync_in_flight: bool,
     pub chatlist_sync_pending: usize,
@@ -230,6 +235,7 @@ impl AppState {
             login_state: None,
             chats_loaded: false,
             chat_load_generation: 0,
+            lifecycle_epoch: 0,
             history_refresh_in_flight: false,
             chatlist_sync_in_flight: false,
             chatlist_sync_pending: 0,
@@ -341,6 +347,10 @@ impl AppState {
         let mut seen = HashSet::new();
         let mut chat_list: Vec<Chat> = chats
             .into_iter()
+            .filter(|chat| match &chat.id {
+                ChatId::Myself => true,
+                id => id.to_provider().is_enabled(&self.config.providers),
+            })
             .filter(|chat| seen.insert(chat.id.clone()))
             .map(|chat| {
                 let scroll = saved_scrolls.get(&chat.id).copied().unwrap_or(0);
@@ -390,13 +400,25 @@ impl AppState {
 
     /// Apply the result of a (background) chat fetch: populate the chat list,
     /// mark loading as complete, and surface any provider errors as a popup.
+    /// `epoch` is the lifecycle epoch the fetch was started under: a result
+    /// from before a provider disable still releases the loading state, but
+    /// its payload is discarded rather than repopulating the removed rows.
     /// Shared by the TUI event loop and tests so error-surfacing logic stays in
     /// one place.
-    pub fn apply_fetched(&mut self, chats: Vec<Chat>, errors: Vec<BackendError>) {
-        self.apply_chats(chats);
-
+    pub fn apply_fetched(&mut self, chats: Vec<Chat>, errors: Vec<BackendError>, epoch: u64) {
         self.chats_loaded = true;
         self.finish_loading(LoadingArea::ChatList);
+
+        if epoch != self.lifecycle_epoch {
+            debug!(
+                captured = epoch,
+                current = self.lifecycle_epoch,
+                "Discarding chat fetch from before a lifecycle change"
+            );
+            return;
+        }
+
+        self.apply_chats(chats);
 
         if !errors.is_empty() {
             self.create_popup(PopupKind::Error(
@@ -409,6 +431,51 @@ impl AppState {
         }
 
         self.persist_chats();
+    }
+
+    /// Apply the result of a background chat-list sync for a single provider.
+    /// The sync counter is always released first (it was claimed when the
+    /// fetch spawned), then the payload is dropped if it predates a lifecycle
+    /// change or its provider is disabled — a disabled provider must never be
+    /// reconciled back into the list. Shared by the TUI event loop and tests.
+    pub fn apply_synced_chats(
+        &mut self,
+        provider: Provider,
+        result: Result<Vec<Chat>, BackendError>,
+        epoch: u64,
+    ) {
+        self.chatlist_sync_pending = self.chatlist_sync_pending.saturating_sub(1);
+        self.chatlist_sync_in_flight = self.chatlist_sync_pending > 0;
+
+        if !self.chatlist_sync_in_flight {
+            self.finish_loading(LoadingArea::ChatList);
+        }
+
+        if epoch != self.lifecycle_epoch || !provider.is_enabled(&self.config.providers) {
+            debug!(
+                ?provider,
+                captured = epoch,
+                current = self.lifecycle_epoch,
+                "Discarding chat-list sync from before a lifecycle change"
+            );
+            return;
+        }
+
+        match result {
+            // Skip the persistence write when nothing changed (both messenger
+            // syncs every `chat_list_sync_secs`; identical snapshots must not
+            // churn the cache file).
+            Ok(chats) => {
+                // TODO: hide archived chats from the main list once the TUI has
+                // an Archived section; until then they stay visible to match
+                // the phone.
+                if self.chat_state.reconcile_provider_chats(provider, chats) {
+                    self.persist_chats();
+                }
+                debug!(?provider, "Chat list sync OK");
+            }
+            Err(e) => error!(?provider, error = %e, "Chat list sync failed"),
+        }
     }
 
     /// Persist the current chat list so it survives a cold restart.
@@ -1108,12 +1175,12 @@ impl AppState {
     /// surfaces (no QR/`Connected`, no chat fetch, no notifications) hold.
     /// Enabling a provider later from settings re-enters the same idempotent
     /// [`Messenger::start`] path.
-    pub fn start_enabled_providers(&self) {
+    pub async fn start_enabled_providers(&self) {
         for messenger in self.messengers.iter() {
             let provider = messenger.provider();
             if provider.is_enabled(&self.config.providers) {
                 info!(provider = provider.name(), "starting enabled provider");
-                messenger.start();
+                messenger.start().await;
             } else {
                 info!(
                     provider = provider.name(),
@@ -1180,23 +1247,67 @@ impl AppState {
         true
     }
 
+    /// Invalidate every background fetch started so far: their results land
+    /// after a provider disable and must be discarded instead of repopulating
+    /// the rows the disable removed. Called from each disable path.
+    fn bump_lifecycle_epoch(&mut self) {
+        self.lifecycle_epoch = self.lifecycle_epoch.wrapping_add(1);
+    }
+
     pub async fn toggle_provider(&mut self, provider: Provider) {
         let name = provider.name();
 
         // --- Disabling is always straightforward ---
         if provider.is_enabled(&self.config.providers) {
+            // Invalidate in-flight fetches first, so a chat-list snapshot
+            // taken before the disable cannot land afterwards.
+            self.bump_lifecycle_epoch();
+
             provider.toggle_enabled(&mut self.config.providers);
+
             match self.config.save_config() {
                 Ok(()) => {
+                    // Stop the transport before anything else: disabling must
+                    // immediately silence the reconnect loop, background sync
+                    // tasks and the event source, not merely flip a config
+                    // flag. Telegram is excluded — its listener is governed by
+                    // `set_enabled`, which the re-enable path drives.
+                    if provider != Provider::Telegram
+                        && let Some(messenger) = self.provider_to_messenger_mut(provider)
+                        && let Err(e) = messenger.disconnect().await
+                    {
+                        self.create_popup(PopupKind::Error(e.to_string()));
+                    }
+
+                    // The transport died with the disable, and its
+                    // `Disconnected` event is now gated above — forget the
+                    // connection here so the status line cannot claim a
+                    // disabled provider is connected.
+                    self.provider_connected.remove(&provider);
+
                     // If the user is currently viewing a chat belonging to the
                     // disabled provider, close it so the UI does not retain an
                     // inactive-provider conversation after its chats vanish.
+                    // `ChatId::Myself` is provider-less (`to_provider` panics
+                    // on it), so test for it first and leave it alone.
                     if let Some(open) = &self.chat_state.open_chat
+                        && open.chat.id != ChatId::Myself
                         && open.chat.id.to_provider() == provider
-                        && !matches!(open.chat.id, ChatId::Myself)
                     {
                         self.write.clear();
                         self.chat_state.open_chat = None;
+                    }
+
+                    // A reply still queued against one of the disabled
+                    // provider's messages must not survive into a later send.
+                    // (Rows, unread badges and search results are cleaned by
+                    // the rebuild below: `apply_chats` rejects rows of a
+                    // disabled provider and re-anchors the selection.)
+                    if let Some(reply) = &self.chat_state.pending_reply
+                        && reply.chat_id != ChatId::Myself
+                        && reply.chat_id.to_provider() == provider
+                    {
+                        self.chat_state.pending_reply = None;
                     }
 
                     let errors = self.rebuild_chats().await;
@@ -1220,10 +1331,7 @@ impl AppState {
 
         // --- Enabling ---
         // Verify API credentials exist (mock providers don't need credentials)
-        let is_mock = matches!(
-            self.provider_to_messenger(provider),
-            Some(MessengerKind::Mock(_, _))
-        );
+        let is_mock = self.provider_to_messenger(provider).is_some();
 
         if !is_mock && !provider.has_credentials(&self.config.providers) {
             self.create_popup(PopupKind::Error(format!(
@@ -1243,9 +1351,10 @@ impl AppState {
                     m
                 }
                 // Every other provider opens its transport through the same
-                // idempotent `start()` the startup sequence uses.
+                // idempotent `start()` the startup sequence uses, including a
+                // rebuild after a previous disable stopped it in place.
                 _ => {
-                    m.start();
+                    m.start().await;
                     m
                 }
             },
@@ -1427,16 +1536,25 @@ impl AppState {
             }
 
             // Cancelling an in-progress WhatsApp pairing that never
-            // authenticated disables the provider again (its QR kept coming
-            // from the still-running bot). This keeps the provider disabled
-            // until authentication actually completes.
+            // authenticated disables the provider again. This keeps the
+            // provider disabled until authentication actually completes — and
+            // because a cancelled pairing is a disable, the bot is stopped in
+            // place too, so its QR flow and events go inert rather than
+            // continuing behind a disabled config flag.
             if login.provider == Provider::WhatsApp
                 && login.provider.is_enabled(&self.config.providers)
             {
+                self.bump_lifecycle_epoch();
                 login.provider.toggle_enabled(&mut self.config.providers);
 
                 if let Err(e) = self.config.save_config() {
                     self.create_popup(PopupKind::Error(format!("could not save config: {e}")));
+                }
+
+                if let Some(messenger) = self.provider_to_messenger_mut(login.provider)
+                    && let Err(e) = messenger.disconnect().await
+                {
+                    self.create_popup(PopupKind::Error(e.to_string()));
                 }
             }
         }
@@ -1468,6 +1586,19 @@ impl AppState {
     }
 
     pub fn handle_backend_event(&mut self, provider: Provider, event: BackendEvent) {
+        // A disabled provider is inert. Its transport has been stopped by the
+        // disable, so any event still in flight predates that stop: a late
+        // message, chat snapshot, QR code or `Connected` must not reinsert
+        // rows, raise unread badges or reopen the login screen.
+        if !provider.is_enabled(&self.config.providers) {
+            debug!(
+                ?provider,
+                event = ?std::mem::discriminant(&event),
+                "Ignoring backend event from a disabled provider"
+            );
+            return;
+        }
+
         match event {
             BackendEvent::Connected => {
                 info!(?provider, "Backend connected");
@@ -1476,9 +1607,11 @@ impl AppState {
                 self.backend_status = None;
 
                 // A newly authenticated provider becomes usable: close any
-                // active pairing/login screen and enable it in config. The
-                // chat-list rebuild is kicked off from the TUI event loop,
-                // which owns the UI channel needed to deliver the result.
+                // active pairing/login screen. The chat-list rebuild is kicked
+                // off from the TUI event loop, which owns the UI channel
+                // needed to deliver the result. Re-enabling a provider the
+                // user disabled is not done here — the gate above already
+                // dropped such a `Connected`.
                 if provider == Provider::WhatsApp {
                     let was_pairing = self
                         .login_state
@@ -1489,15 +1622,6 @@ impl AppState {
                         self.login_state = None;
                         self.screen = Screen::Main;
                         self.finish_loading(LoadingArea::FullScreen);
-                    }
-
-                    if !provider.is_enabled(&self.config.providers) {
-                        provider.toggle_enabled(&mut self.config.providers);
-
-                        match self.config.save_config() {
-                            Ok(()) => {}
-                            Err(e) => self.create_popup(PopupKind::Error(e.to_string())),
-                        };
                     }
                 }
             }
@@ -1515,6 +1639,10 @@ impl AppState {
                     self.provider_connected.remove(&provider);
 
                     if provider.is_enabled(&self.config.providers) {
+                        // An invalid session disables the provider: invalidate
+                        // in-flight fetches first so their late results cannot
+                        // bring the pruned rows back.
+                        self.bump_lifecycle_epoch();
                         provider.toggle_enabled(&mut self.config.providers);
 
                         if let Err(e) = self.config.save_config() {
@@ -1985,7 +2113,7 @@ mod tests {
     /// as the TUI event loop does on `ChatsLoaded`.
     async fn fetch_and_apply(state: &mut AppState) {
         let (chats, errors) = fetch_all_chats(&state.messengers, &state.config.providers).await;
-        state.apply_fetched(chats, errors);
+        state.apply_fetched(chats, errors, state.lifecycle_epoch);
     }
 
     /// Build an `AppState` hosting both a Telegram and a WhatsApp mock, with the
@@ -2085,16 +2213,16 @@ mod tests {
         let mut state = app_state().await;
 
         state.start_loading(LoadingArea::ChatList, "Fetching chats...");
-        state.apply_fetched(Vec::new(), Vec::new());
+        state.apply_fetched(Vec::new(), Vec::new(), state.lifecycle_epoch);
         assert!(state.loading.is_none());
     }
 
-    /// A handle to a stub provider's `start()` counter, kept by the test after
-    /// the stub itself was moved into the state.
+    /// A handle to a stub provider's call counter (start/disconnect), kept by
+    /// the test after the stub itself was moved into the state.
     #[derive(Clone)]
-    struct StartCount(Arc<AtomicUsize>);
+    struct CallCount(Arc<AtomicUsize>);
 
-    impl StartCount {
+    impl CallCount {
         fn load(&self) -> usize {
             self.0.load(AtomicOrdering::SeqCst)
         }
@@ -2102,11 +2230,11 @@ mod tests {
 
     /// Build an `AppState` holding one stub per provider, plus a `start()` count
     /// for each so a lifecycle assertion can inspect them after the move.
-    async fn stub_provider_state(whatsapp: bool) -> (AppState, StartCount, StartCount) {
+    async fn stub_provider_state(whatsapp: bool) -> (AppState, CallCount, CallCount) {
         let telegram = StubMessenger::new();
         let whatsapp_stub = StubMessenger::new();
-        let telegram_starts = StartCount(telegram.start_calls.clone());
-        let whatsapp_starts = StartCount(whatsapp_stub.start_calls.clone());
+        let telegram_starts = CallCount(telegram.start_calls.clone());
+        let whatsapp_starts = CallCount(whatsapp_stub.start_calls.clone());
 
         let mut config = Config::default();
         config.providers.telegram.enabled = true;
@@ -2130,7 +2258,7 @@ mod tests {
     async fn startup_starts_only_enabled_providers() {
         let (state, telegram, whatsapp) = stub_provider_state(/* whatsapp */ false).await;
 
-        state.start_enabled_providers();
+        state.start_enabled_providers().await;
 
         assert_eq!(telegram.load(), 1, "enabled Telegram must be started");
         assert_eq!(whatsapp.load(), 0, "a disabled provider must stay dormant");
@@ -2140,7 +2268,7 @@ mod tests {
     async fn startup_starts_whatsapp_when_enabled() {
         let (state, _telegram, whatsapp) = stub_provider_state(/* whatsapp */ true).await;
 
-        state.start_enabled_providers();
+        state.start_enabled_providers().await;
 
         assert_eq!(whatsapp.load(), 1, "enabled WhatsApp must be started");
     }
@@ -2151,7 +2279,7 @@ mod tests {
 
         // Mirrors the startup order in `tui::run`: receivers first, then start.
         let mut rx = state.messengers[0].subscribe();
-        state.start_enabled_providers();
+        state.start_enabled_providers().await;
 
         assert_eq!(telegram.load(), 1, "the subscribed provider must start");
         assert!(
@@ -2172,6 +2300,264 @@ mod tests {
             "the settings toggle must start WhatsApp"
         );
         assert!(state.config.providers.whatsapp);
+    }
+
+    #[tokio::test]
+    async fn disabling_then_re_enabling_whatsapp_stops_then_starts_it() {
+        let tg = StubMessenger::new();
+        let wa = StubMessenger::new();
+        let wa_starts = CallCount(wa.start_calls.clone());
+        let wa_disconnects = CallCount(wa.disconnect_calls.clone());
+
+        let mut config = Config::default();
+        config.providers.telegram.enabled = true;
+        config.providers.whatsapp = true;
+        let keymap = config.keys.parse().unwrap();
+        let mut state = AppState::new(
+            config,
+            keymap,
+            vec![
+                MessengerKind::Stub(Provider::Telegram, Box::new(tg)),
+                MessengerKind::Stub(Provider::WhatsApp, Box::new(wa)),
+            ],
+            false,
+        )
+        .await;
+
+        // A WhatsApp row that is open, with a reply queued against it and the
+        // transport marked connected: all three must not survive the disable.
+        state.chat_state.chats.push(Chat {
+            id: ChatId::WhatsApp("15550000007@s.whatsapp.net".into()),
+            contact_name: "WA Contact".into(),
+            ..Default::default()
+        });
+        let wa_chat = state.chat_state.chats[0].clone();
+        state.chat_state.open_chat = Some(OpenChat {
+            chat: wa_chat.clone(),
+            history: Vec::new(),
+            has_more_history: true,
+        });
+        let mut target = audio_message();
+        target.chat_id = wa_chat.id;
+        state.chat_state.pending_reply = Some(target);
+        state.provider_connected.insert(Provider::WhatsApp);
+        let epoch_before = state.lifecycle_epoch;
+
+        state.toggle_provider(Provider::WhatsApp).await;
+
+        assert_eq!(
+            wa_disconnects.load(),
+            1,
+            "disabling must stop the transport exactly once"
+        );
+        assert_eq!(wa_starts.load(), 0, "disabling must not start anything");
+        assert!(!state.config.providers.whatsapp, "the config flag flips");
+        assert_eq!(
+            state.lifecycle_epoch,
+            epoch_before + 1,
+            "a disable invalidates in-flight fetches"
+        );
+        assert!(
+            state.chat_state.open_chat.is_none(),
+            "an open chat of the disabled provider must close"
+        );
+        assert!(
+            state.chat_state.pending_reply.is_none(),
+            "a reply queued against it must not survive"
+        );
+        assert!(
+            !state.provider_connected.contains(&Provider::WhatsApp),
+            "a stopped transport is not connected"
+        );
+        assert!(
+            state
+                .chat_state
+                .chats
+                .iter()
+                .all(|c| !matches!(c.id, ChatId::WhatsApp(_))),
+            "the disabled provider's rows are gone"
+        );
+
+        // Re-enabling rebuilds a fresh start over the same durable session —
+        // exactly one start(), no second disconnect, no login screen.
+        state.toggle_provider(Provider::WhatsApp).await;
+
+        assert!(
+            state.config.providers.whatsapp,
+            "the config flag flips back"
+        );
+        assert_eq!(
+            wa_starts.load(),
+            1,
+            "re-enable must start the transport once"
+        );
+        assert_eq!(
+            wa_disconnects.load(),
+            1,
+            "re-enabling must not disconnect again"
+        );
+        assert!(
+            state.login_state.is_none(),
+            "re-enabling an authenticated provider must not reopen the login flow"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabling_telegram_never_disconnects_it() {
+        let tg = StubMessenger::new();
+        let tg_disconnects = CallCount(tg.disconnect_calls.clone());
+
+        let mut config = Config::default();
+        config.providers.telegram.enabled = true;
+        let keymap = config.keys.parse().unwrap();
+        let mut state = AppState::new(
+            config,
+            keymap,
+            vec![MessengerKind::Stub(Provider::Telegram, Box::new(tg))],
+            false,
+        )
+        .await;
+
+        state.toggle_provider(Provider::Telegram).await;
+
+        assert!(
+            !state.config.providers.telegram.enabled,
+            "the config flag flips"
+        );
+        assert_eq!(
+            tg_disconnects.load(),
+            0,
+            "Telegram's listener is governed by set_enabled; disconnect would \
+             make the next enable unrecoverable"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_chat_fetch_from_before_a_disable_is_discarded() {
+        let mut state = dual_provider_state(/* whatsapp */ true).await;
+        let rows_before = state.chat_state.chats.clone();
+        assert!(
+            rows_before
+                .iter()
+                .any(|c| matches!(c.id, ChatId::WhatsApp(_))),
+            "the seeded snapshot must contain WhatsApp rows"
+        );
+        let epoch = state.lifecycle_epoch;
+
+        state.toggle_provider(Provider::WhatsApp).await;
+        let rows_after_disable = state.chat_state.chats.len();
+
+        state.apply_fetched(rows_before, Vec::new(), epoch);
+
+        assert_eq!(
+            state.chat_state.chats.len(),
+            rows_after_disable,
+            "the pre-disable snapshot must be dropped wholesale"
+        );
+        assert!(
+            state
+                .chat_state
+                .chats
+                .iter()
+                .all(|c| !matches!(c.id, ChatId::WhatsApp(_))),
+            "a pre-disable fetch must not resurrect the disabled rows"
+        );
+        assert!(
+            state.loading.is_none(),
+            "a stale fetch still releases the loading state"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_chatlist_sync_from_before_a_disable_is_discarded() {
+        let mut state = dual_provider_state(/* whatsapp */ true).await;
+        let epoch = state.lifecycle_epoch;
+        state.chatlist_sync_in_flight = true;
+        state.chatlist_sync_pending = 2;
+        state.start_loading(LoadingArea::ChatList, "Syncing chats...");
+
+        state.toggle_provider(Provider::WhatsApp).await;
+
+        let stale_row = Chat {
+            id: ChatId::WhatsApp("15550000008@s.whatsapp.net".into()),
+            contact_name: "WA Contact".into(),
+            ..Default::default()
+        };
+        state.apply_synced_chats(Provider::WhatsApp, Ok(vec![stale_row.clone()]), epoch);
+
+        assert_eq!(
+            state.chatlist_sync_pending, 1,
+            "a stale sync still advances the counter"
+        );
+        assert!(
+            state.chatlist_sync_in_flight,
+            "another sync is still pending"
+        );
+        assert!(
+            state
+                .chat_state
+                .chats
+                .iter()
+                .all(|c| !matches!(c.id, ChatId::WhatsApp(_))),
+            "a stale sync must not resurrect the disabled rows"
+        );
+
+        // Even a sync that started *after* the disable is rejected: the
+        // provider flag alone must gate the payload.
+        state.apply_synced_chats(
+            Provider::WhatsApp,
+            Ok(vec![stale_row]),
+            state.lifecycle_epoch,
+        );
+
+        assert_eq!(state.chatlist_sync_pending, 0);
+        assert!(!state.chatlist_sync_in_flight);
+        assert!(
+            state.loading.is_none(),
+            "the counter reaching zero releases it"
+        );
+        assert!(
+            state
+                .chat_state
+                .chats
+                .iter()
+                .all(|c| !matches!(c.id, ChatId::WhatsApp(_))),
+            "a disabled provider never reconciles back into the list"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_events_from_a_disabled_provider_change_nothing() {
+        let mut state = dual_provider_state(/* whatsapp */ true).await;
+        state.toggle_provider(Provider::WhatsApp).await;
+        let rows_after_disable = state.chat_state.chats.len();
+
+        let mut late_message = audio_message();
+        late_message.chat_id = ChatId::WhatsApp("15550000009@s.whatsapp.net".into());
+        state.handle_backend_event(
+            Provider::WhatsApp,
+            BackendEvent::MessageReceived(late_message),
+        );
+        state.handle_backend_event(Provider::WhatsApp, BackendEvent::QrCode("qr-data".into()));
+        state.handle_backend_event(Provider::WhatsApp, BackendEvent::Connected);
+
+        assert_eq!(
+            state.chat_state.chats.len(),
+            rows_after_disable,
+            "a late message must not resurrect rows"
+        );
+        assert!(
+            state.login_state.is_none(),
+            "a late QR must not reopen the login flow"
+        );
+        assert!(
+            !state.provider_connected.contains(&Provider::WhatsApp),
+            "a late Connected must not mark a stopped transport as connected"
+        );
+        assert!(
+            !state.config.providers.whatsapp,
+            "stale events never re-enable the config"
+        );
     }
 
     #[tokio::test]
@@ -2659,7 +3045,7 @@ mod tests {
 
         let (telegram_only, _errors) =
             fetch_all_chats(&state.messengers, &state.config.providers).await;
-        state.apply_fetched(telegram_only, Vec::new());
+        state.apply_fetched(telegram_only, Vec::new(), state.lifecycle_epoch);
 
         assert!(
             state
@@ -3460,6 +3846,7 @@ mod tests {
         set_read_result: std::sync::Mutex<Option<Result<(), BackendError>>>,
         cancel_refresh_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         start_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        disconnect_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         tx: broadcast::Sender<BackendEvent>,
     }
 
@@ -3473,6 +3860,7 @@ mod tests {
                 set_read_result: std::sync::Mutex::new(None),
                 cancel_refresh_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 start_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                disconnect_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 tx,
             }
         }
@@ -3589,7 +3977,7 @@ mod tests {
             self.tx.subscribe()
         }
 
-        fn start(&self) {
+        async fn start(&self) {
             self.start_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             // A started provider announces itself on the same channel a real
@@ -3603,6 +3991,8 @@ mod tests {
         }
 
         async fn disconnect(&mut self) -> Result<(), BackendError> {
+            self.disconnect_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
     }
@@ -3966,6 +4356,7 @@ mod tests {
             submitting: false,
         });
 
+        let epoch_before = state.lifecycle_epoch;
         state.cancel_login().await;
 
         // Login dismissed.
@@ -3973,6 +4364,10 @@ mod tests {
         assert!(
             matches!(state.screen, Screen::Main),
             "cancel should return to Main"
+        );
+        assert!(
+            state.lifecycle_epoch > epoch_before,
+            "cancelling a pairing counts as a disable: in-flight fetches die too"
         );
         // Provider disabled.
         assert!(
