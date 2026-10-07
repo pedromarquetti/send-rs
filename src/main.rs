@@ -130,6 +130,8 @@ async fn main() -> Result<()> {
         config.providers.whatsapp = true;
     } else {
         // normal, non-mock run
+        // TODO: Check if grammers can be configured so our client tells Telegram to not send
+        // notifications to other devices while Send-rs is open
         let telegram = &config.providers.telegram;
         if telegram.enabled || telegram.has_credentials() {
             if !telegram.has_credentials() {

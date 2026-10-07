@@ -21,7 +21,6 @@
     - [Telegram Setup](#telegram-setup)
     - [WhatsApp Setup](#whatsapp-setup)
       - [Session and cache files](#session-and-cache-files)
-      - [Disabled provider behavior](#disabled-provider-behavior)
       - [Manual cold-start smoke test](#manual-cold-start-smoke-test)
   - [Controls / Key Bindings](#controls-key-bindings)
   - [Limitations](#limitations)
@@ -104,6 +103,7 @@ can do for itself.
 - [x] Configurable
 - [x] Draft / Myself conversation - using wp/tg integrated self chat
 - [ ] Help menu Popup to show keymaps
+- [ ] crates.io build - Make the binary available in `cargo install`
 - [x] Descriptive error handling
 - [x] WhatsApp integration
 - [x] Message actions (reply, edit, delete) for whatsapp

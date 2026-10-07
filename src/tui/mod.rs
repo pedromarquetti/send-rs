@@ -279,6 +279,10 @@ async fn run_app(
         let forward_tx = tx.clone();
         let provider = messenger.provider();
 
+        // TODO: review provider message receive pipeline: 
+        // Messages are being delivered > notification is firing > but takes a little longer
+        // for the UI to load the new message -> Notifications should only fire if the TUI
+        // already has the msg
         tokio::spawn(async move {
             loop {
                 match backend_rx.recv().await {

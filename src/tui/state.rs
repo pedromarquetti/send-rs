@@ -1366,7 +1366,22 @@ impl AppState {
             }
         };
 
-        // Check if already authenticated — if so, just enable
+        if provider == Provider::WhatsApp {
+            provider.toggle_enabled(&mut self.config.providers);
+            match self.config.save_config() {
+                Ok(()) => {
+                    self.create_popup(PopupKind::Info(format!("{name} enabled")));
+                }
+                Err(e) => {
+                    self.create_popup(PopupKind::Error(format!("could not save config: {e}")))
+                }
+            }
+            return;
+        }
+
+        // Check if already authenticated — if so, just enable. Telegram's
+        // session is settled at construction, so this reading is reliable for
+        // it (unlike WhatsApp's mid-handshake probe above).
         if messenger.is_authenticated().await {
             provider.toggle_enabled(&mut self.config.providers);
             match self.config.save_config() {
@@ -1390,25 +1405,15 @@ impl AppState {
             return;
         }
 
-        // Not authenticated — check if the provider supports login steps. For
-        // WhatsApp this starts the (inactive) transport so its event-driven QR
-        // pairing flow begins generating codes, then navigates to the login
-        // screen. The provider is marked enabled up front (pairing is in
-        // progress); cancelling via Esc disables it again, and the Connected
-        // event leaves it enabled and triggers the chat rebuild.
+        // Not authenticated — check if the provider supports an interactive
+        // login flow (Telegram phone/code/password). The QR *event*, not
+        // `login_steps()`, is the source of truth for WhatsApp pairing.
         let steps = messenger.login_steps();
         if steps.is_empty() {
             self.create_popup(PopupKind::Error(format!(
                 "{name}: not authenticated and no login flow available"
             )));
             return;
-        }
-
-        if provider == Provider::WhatsApp && !provider.is_enabled(&self.config.providers) {
-            provider.toggle_enabled(&mut self.config.providers);
-            if let Err(e) = self.config.save_config() {
-                self.create_popup(PopupKind::Error(format!("could not save config: {e}")));
-            }
         }
 
         // Navigate to login screen
@@ -2300,6 +2305,90 @@ mod tests {
             "the settings toggle must start WhatsApp"
         );
         assert!(state.config.providers.whatsapp);
+        assert!(
+            state.login_state.is_none() && matches!(state.screen, Screen::Main),
+            "enabling must not flash the login screen — pairing is driven by \
+             the QR event, not by a handshake probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn enabling_whatsapp_does_not_open_login_until_a_qr_event() {
+        let (mut state, _, _whatsapp) = stub_provider_state(/* whatsapp */ false).await;
+
+        state.toggle_provider(Provider::WhatsApp).await;
+
+        assert!(
+            state.login_state.is_none() && matches!(state.screen, Screen::Main),
+            "a handshake-less enable must stay on the main screen"
+        );
+
+        // The transport announces itself as genuinely unpaired by emitting a
+        // real QR code; only then does the QR screen open.
+        state.handle_backend_event(Provider::WhatsApp, BackendEvent::QrCode("pair-abc".into()));
+
+        assert_eq!(
+            state.login_state.as_ref().map(|ls| ls.provider),
+            Some(Provider::WhatsApp),
+            "the QR event is the source of truth for opening pairing"
+        );
+        assert!(
+            matches!(state.screen, Screen::Login),
+            "the QR event must hop to the login screen"
+        );
+        assert!(
+            state.config.providers.whatsapp,
+            "pairing stays enabled while the QR screen is shown"
+        );
+    }
+
+    #[tokio::test]
+    async fn paired_reconnect_stays_on_the_main_screen() {
+        let (mut state, _telegram, _whatsapp) = stub_provider_state(/* whatsapp */ false).await;
+
+        state.toggle_provider(Provider::WhatsApp).await;
+        assert!(state.login_state.is_none(), "no login flash on enable");
+
+        // A transport that holds a valid session announces itself by
+        // connecting, never by offering a QR code.
+        state.handle_backend_event(Provider::WhatsApp, BackendEvent::Connected);
+
+        assert!(state.provider_connected.contains(&Provider::WhatsApp));
+        assert!(
+            state.login_state.is_none() && matches!(state.screen, Screen::Main),
+            "a paired reconnect must never open the login screen"
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_disconnect_does_not_open_the_qr_screen() {
+        let (mut state, _telegram, _whatsapp) = stub_provider_state(/* whatsapp */ true).await;
+        state.handle_backend_event(Provider::WhatsApp, BackendEvent::Connected);
+        assert!(
+            state.provider_connected.contains(&Provider::WhatsApp),
+            "precondition: the provider is connected"
+        );
+
+        // StreamEnded is suppressed upstream, so a plain drop amounts to a
+        // transient disconnect; the reconnect that follows must not pop a
+        // pairing screen over a perfectly good session.
+        state.handle_backend_event(
+            Provider::WhatsApp,
+            BackendEvent::Disconnected("WhatsApp: connection lost".into()),
+        );
+
+        assert!(!state.provider_connected.contains(&Provider::WhatsApp));
+        assert!(
+            state.login_state.is_none() && matches!(state.screen, Screen::Main),
+            "a transient disconnect must not open the QR/login screen"
+        );
+
+        state.handle_backend_event(Provider::WhatsApp, BackendEvent::Connected);
+        assert!(state.provider_connected.contains(&Provider::WhatsApp));
+        assert!(
+            state.login_state.is_none(),
+            "reconnect confirms the session and stays on the main screen"
+        );
     }
 
     #[tokio::test]
