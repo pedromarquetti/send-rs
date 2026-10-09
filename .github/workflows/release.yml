@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - 'v*.*.*'
 
 permissions:
   contents: read
@@ -17,9 +17,16 @@ jobs:
     name: Run CI
     uses: ./.github/workflows/ci.yml
 
+  build:
+    name: Build release
+    needs: ci
+    uses: ./.github/workflows/release-build.yml
+    with:
+      version: ${{ needs.ci.outputs.version }}
+
   publish:
     name: Publish release
-    needs: ci
+    needs: [ci, build]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
