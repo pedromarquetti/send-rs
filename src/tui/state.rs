@@ -5932,24 +5932,25 @@ mod tests {
 
     #[tokio::test]
     async fn copies_text_to_clip() {
-        let clipboard = Clipboard::new().ok();
+        let Some(clipboard) = Clipboard::new().ok() else {
+            // Headless environments (e.g. CI runners) expose no clipboard
+            // provider; there is nothing to verify here.
+            return;
+        };
         let mut state = app_state().await;
-        state.clipboard = clipboard;
+        state.clipboard = Some(clipboard);
         let test = String::from("test");
 
-        match state.copy_to_clipboard(test.clone()) {
-            Ok(_) => {
-                let res = state
-                    .clipboard
-                    .expect("Could not get clipboard")
-                    .get_text()
-                    .expect("Could not get_text");
+        state
+            .copy_to_clipboard(test.clone())
+            .expect("copy to clipboard");
 
-                assert_eq!(res, test);
-            }
-            Err(err) => {
-                panic!("{err}")
-            }
-        };
+        let res = state
+            .clipboard
+            .expect("Could not get clipboard")
+            .get_text()
+            .expect("Could not get_text");
+
+        assert_eq!(res, test);
     }
 }
