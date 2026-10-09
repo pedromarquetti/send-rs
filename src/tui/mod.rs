@@ -2133,9 +2133,6 @@ mod tests {
         }
     }
 
-    /// A short synthetic clip, or `None` when ffmpeg is not installed. The
-    /// engine shells out to ffmpeg at runtime, so its tests cannot run without
-    /// it; generating the bytes here keeps this test honest about that.
     fn sample_video_bytes() -> Option<Vec<u8>> {
         use std::process::{Command, Stdio};
 

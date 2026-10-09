@@ -623,8 +623,6 @@ mod tests {
             .collect()
     }
 
-    /// CI installs no ffmpeg, so every test that actually decodes has to opt
-    /// out rather than fail.
     fn ffmpeg_available() -> bool {
         Command::new("ffmpeg")
             .arg("-version")
