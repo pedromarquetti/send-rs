@@ -1,11 +1,13 @@
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::UnboundedSender;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 mod engine;
 
+pub use engine::FfmpegEngine;
 pub use engine::RodioEngine;
 
 use super::UiEvent;
@@ -88,6 +90,14 @@ pub trait MediaEngine {
     /// Poll the engine. `&mut self` so engines can transition on EOF while
     /// sampling (e.g. a sink that has emptied out).
     fn status(&mut self) -> PlayState;
+    /// Whether the user has anything loaded or playing.
+    fn is_busy(&self) -> bool;
+    /// Play a short notification sound through the output.
+    ///
+    /// Must be invisible to the media session: no `status()` transition, no
+    /// change to `position()`, and the loaded session's bytes and position must
+    /// survive. A cue rides its own sink on the same mixer.
+    fn play_cue(&mut self, bytes: &[u8]) -> Result<(), String>;
 }
 
 /// The engine box a player worker is built from. `Send` is required on every
@@ -99,11 +109,22 @@ type EngineBox = Box<dyn MediaEngine>;
 
 /// Commands the UI sends to the player worker.
 enum PlayerCommand {
-    Load { source: PlayKey, bytes: Vec<u8> },
+    Load {
+        source: PlayKey,
+        bytes: Vec<u8>,
+    },
     Play,
     Pause,
-    Seek { delta_secs: f64 },
+    Seek {
+        delta_secs: f64,
+    },
     Stop,
+    /// A notification cue. Bytes only: the notifier already dropped duplicates
+    /// before enqueueing, and a cue is never reported to the UI, so nothing
+    /// here needs to know which message it came from.
+    Cue {
+        bytes: Arc<[u8]>,
+    },
 }
 
 /// How often the worker re-reports a playing session; reports are what make
@@ -150,6 +171,12 @@ impl Player {
 
     pub fn stop(&self) {
         let _ = self.tx.send(PlayerCommand::Stop);
+    }
+
+    /// Queue a notification cue. Non-blocking, like every other command; the
+    /// engine drops it if the user has something loaded or playing.
+    pub fn cue(&self, bytes: Arc<[u8]>) {
+        let _ = self.tx.send(PlayerCommand::Cue { bytes });
     }
 }
 
@@ -222,6 +249,16 @@ impl Worker {
                 debug!("player: stop requested");
                 self.engine.stop();
             }
+            PlayerCommand::Cue { bytes } => {
+                debug!("player: notification cue requested");
+                if let Err(err) = self.engine.play_cue(&bytes) {
+                    warn!(error = %err, "Failed to play notification cue");
+                }
+                // Return before the status sample below: a cue must never
+                // become `source`, so it can never fabricate a
+                // `UiEvent::PlaybackState` and never moves the audio popup.
+                return;
+            }
         }
 
         let status = self.engine.status();
@@ -271,7 +308,7 @@ impl Worker {
 mod tests {
     use super::*;
     use crate::backend::MessageId;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
     use std::time::Duration;
 
     struct StubInner {
@@ -355,6 +392,17 @@ mod tests {
 
         fn status(&mut self) -> PlayState {
             self.0.lock().unwrap().status
+        }
+
+        fn is_busy(&self) -> bool {
+            let inner = self.0.lock().unwrap();
+            inner.status == PlayState::Playing || inner.status == PlayState::Paused
+        }
+
+        fn play_cue(&mut self, _bytes: &[u8]) -> Result<(), String> {
+            let mut inner = self.0.lock().unwrap();
+            inner.calls.push("play_cue");
+            Ok(())
         }
     }
 
@@ -505,5 +553,44 @@ mod tests {
         player.load(key(1, "42"), b"not-audio".to_vec());
         assert_playback(rx.blocking_recv().unwrap(), PlayState::Loading);
         assert_playback(rx.blocking_recv().unwrap(), PlayState::Error);
+    }
+
+    #[tokio::test]
+    async fn a_cue_reaches_the_engine_without_reporting_a_session() {
+        let (engine, inner) = StubEngine::new(8.0);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let player = Player::new(move || Box::new(engine), tx);
+
+        // A loaded session, so a cue arriving here could plausibly be mistaken
+        // for playback of that session.
+        player.load(key(1, "42"), b"fake-ogg".to_vec());
+        assert_playback(rx.recv().await.unwrap(), PlayState::Loading);
+        assert_playback(rx.recv().await.unwrap(), PlayState::Paused);
+
+        player.cue(Arc::from(b"fake-cue".to_vec().into_boxed_slice()));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !inner.lock().unwrap().calls.contains(&"play_cue") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the cue never reached the engine"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // A cue is not a session: it must not fabricate a playback report, or
+        // the audio popup would pop up with someone else's message on it.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), rx.recv())
+                .await
+                .is_err(),
+            "a cue must not emit UiEvent::PlaybackState"
+        );
+
+        assert_eq!(
+            inner.lock().unwrap().calls,
+            ["load", "play_cue"],
+            "the cue must not reach the session commands"
+        );
     }
 }

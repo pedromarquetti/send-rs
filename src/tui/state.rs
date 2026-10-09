@@ -1,4 +1,5 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
+use arboard::Clipboard;
 use ratatui::crossterm::event::KeyEvent;
 use ratatui::style::{Color, Style};
 use ratatui::widgets::ListState;
@@ -13,10 +14,11 @@ use crate::backend::{
     MessengerKind, OutboundMessage, Provider,
 };
 use crate::config::{Config, Keymap};
+use crate::notify::{Notice, to_notice};
 use crate::tui::chat::{ChatState, OpenChat};
 use crate::tui::loading::{LoadingArea, LoadingState};
 use crate::tui::player::PlaybackState;
-use crate::tui::popup::{AudioPopup, ImagePopup, PopupKind};
+use crate::tui::popup::{AudioPopup, ImagePopup, PopupKind, VideoPopup};
 use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +87,11 @@ pub enum Mode {
 
 /// Common application state shared across pages.
 pub struct AppState {
+    /// Whether the terminal window has the OS focus. Orthogonal to `focus`:
+    /// losing the window never changes which pane owns the keyboard, so the
+    /// same pane (and any open chat / half-typed draft) is still there on
+    /// return.
+    pub focused: bool,
     pub mode: Mode,
     pub config: Config,
     pub keymap: Keymap,
@@ -112,6 +119,11 @@ pub struct AppState {
     pub chats_loaded: bool,
 
     pub chat_load_generation: u64,
+    /// Bumped every time a provider is disabled. Background fetches capture it
+    /// when they spawn and discard their result on arrival if it moved on — a
+    /// chat-list snapshot taken before a disable must not repopulate the rows
+    /// the disable just removed.
+    pub lifecycle_epoch: u64,
     pub history_refresh_in_flight: bool,
     pub chatlist_sync_in_flight: bool,
     pub chatlist_sync_pending: usize,
@@ -135,6 +147,12 @@ pub struct AppState {
     /// Latest player report for the active audio session (`None` = no session).
     pub playback: Option<PlaybackState>,
 
+    /// Same as [`Self::playback`] for the video session. Kept separate so an
+    /// audio and a video session can never overwrite each other's snapshot;
+    /// the active engine is chosen by which popup is open, and a report is
+    /// routed by matching [`PlaybackState::source`].
+    pub video: Option<PlaybackState>,
+
     /// An in-flight push-to-talk voice-note recording, if active.
     /// Visible to the TUI module so dispatch tests can install a take without
     /// opening a real mic.
@@ -144,6 +162,8 @@ pub struct AppState {
     /// second press (send) from the auto-repeat stream on terminals that do not
     /// report event types.
     last_record_key: Option<Instant>,
+
+    clipboard: Option<Clipboard>,
 }
 
 pub struct LoginState {
@@ -163,13 +183,14 @@ pub struct PopupState {
     pub popup_type: PopupKind,
     prev_focus: Focus,
     pub scroll_idx: usize,
+    pub focused: bool,
 }
 
-/// A control decided from a key press on the audio popup. The TUI maps it to
-/// `Player` commands; it is a plain value so the mapping is unit-testable
+/// A control decided from a key press on a media (playback) popup. The TUI maps
+/// it to `Player` commands; it is a plain value so the mapping is unit-testable
 /// without a player worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AudioAction {
+pub enum MediaAction {
     PlayPause,
     Seek { delta_secs: i32 },
 }
@@ -183,7 +204,7 @@ impl AppState {
     ) -> Self {
         let mut write = TextArea::default();
         write.set_placeholder_text("Write a message...");
-        write.set_cursor_style(Style::default().fg(Color::Yellow));
+        write.set_cursor_style(Style::default().bg(Color::White).fg(Color::White));
         write.set_cursor_line_style(Style::default());
         write.set_wrap_mode(WrapMode::WordOrGlyph);
 
@@ -192,9 +213,12 @@ impl AppState {
         login_input.set_cursor_line_style(Style::default());
         login_input.set_wrap_mode(WrapMode::WordOrGlyph);
 
+        let clipboard = Clipboard::new().ok();
+
         let mut app = Self {
             mode: Mode::Normal,
             config,
+            focused: true,
             keymap,
             messengers,
             settings_state: ListState::default().with_selected(Some(0)),
@@ -211,6 +235,7 @@ impl AppState {
             login_state: None,
             chats_loaded: false,
             chat_load_generation: 0,
+            lifecycle_epoch: 0,
             history_refresh_in_flight: false,
             chatlist_sync_in_flight: false,
             chatlist_sync_pending: 0,
@@ -220,11 +245,13 @@ impl AppState {
             provider_connected: HashSet::new(),
             loading: None,
             playback: None,
+            video: None,
             recording: None,
             last_record_key: None,
+            clipboard,
         };
 
-        if let Ok(chat_cache) = Config::load_chats() {
+        if let Ok(chat_cache) = crate::file::read_chats() {
             debug!(chat_count = chat_cache.len(), "Loaded persisted chat list");
             app.apply_chats(chat_cache);
         }
@@ -239,6 +266,24 @@ impl AppState {
 
     pub fn selected_chat_idx(&self) -> Option<usize> {
         self.chat_state.chat_list_state.selected()
+    }
+
+    pub fn copy_to_clipboard(&mut self, msg: String) -> Result<()> {
+        if let Some(clipboard) = &mut self.clipboard {
+            clipboard
+                .set_text(msg)
+                .map_err(|err| anyhow!("arboard err: {err}"))
+        } else {
+            Err(anyhow!("No clipboard provider"))
+        }
+    }
+
+    /// Record the terminal's window focus. Only [`AppState::focused`] changes:
+    /// the pane focus is deliberately left alone so regaining the window
+    /// returns the user to the same pane (and the same open chat / draft).
+    pub fn set_window_focus(&mut self, focused: bool) {
+        debug!(focused, "window focus change");
+        self.focused = focused;
     }
 
     /// True while the chat-list search UI is engaged and focused.
@@ -302,6 +347,10 @@ impl AppState {
         let mut seen = HashSet::new();
         let mut chat_list: Vec<Chat> = chats
             .into_iter()
+            .filter(|chat| match &chat.id {
+                ChatId::Myself => true,
+                id => id.to_provider().is_enabled(&self.config.providers),
+            })
             .filter(|chat| seen.insert(chat.id.clone()))
             .map(|chat| {
                 let scroll = saved_scrolls.get(&chat.id).copied().unwrap_or(0);
@@ -351,13 +400,25 @@ impl AppState {
 
     /// Apply the result of a (background) chat fetch: populate the chat list,
     /// mark loading as complete, and surface any provider errors as a popup.
+    /// `epoch` is the lifecycle epoch the fetch was started under: a result
+    /// from before a provider disable still releases the loading state, but
+    /// its payload is discarded rather than repopulating the removed rows.
     /// Shared by the TUI event loop and tests so error-surfacing logic stays in
     /// one place.
-    pub fn apply_fetched(&mut self, chats: Vec<Chat>, errors: Vec<BackendError>) {
-        self.apply_chats(chats);
-
+    pub fn apply_fetched(&mut self, chats: Vec<Chat>, errors: Vec<BackendError>, epoch: u64) {
         self.chats_loaded = true;
         self.finish_loading(LoadingArea::ChatList);
+
+        if epoch != self.lifecycle_epoch {
+            debug!(
+                captured = epoch,
+                current = self.lifecycle_epoch,
+                "Discarding chat fetch from before a lifecycle change"
+            );
+            return;
+        }
+
+        self.apply_chats(chats);
 
         if !errors.is_empty() {
             self.create_popup(PopupKind::Error(
@@ -372,9 +433,54 @@ impl AppState {
         self.persist_chats();
     }
 
+    /// Apply the result of a background chat-list sync for a single provider.
+    /// The sync counter is always released first (it was claimed when the
+    /// fetch spawned), then the payload is dropped if it predates a lifecycle
+    /// change or its provider is disabled — a disabled provider must never be
+    /// reconciled back into the list. Shared by the TUI event loop and tests.
+    pub fn apply_synced_chats(
+        &mut self,
+        provider: Provider,
+        result: Result<Vec<Chat>, BackendError>,
+        epoch: u64,
+    ) {
+        self.chatlist_sync_pending = self.chatlist_sync_pending.saturating_sub(1);
+        self.chatlist_sync_in_flight = self.chatlist_sync_pending > 0;
+
+        if !self.chatlist_sync_in_flight {
+            self.finish_loading(LoadingArea::ChatList);
+        }
+
+        if epoch != self.lifecycle_epoch || !provider.is_enabled(&self.config.providers) {
+            debug!(
+                ?provider,
+                captured = epoch,
+                current = self.lifecycle_epoch,
+                "Discarding chat-list sync from before a lifecycle change"
+            );
+            return;
+        }
+
+        match result {
+            // Skip the persistence write when nothing changed (both messenger
+            // syncs every `chat_list_sync_secs`; identical snapshots must not
+            // churn the cache file).
+            Ok(chats) => {
+                // TODO: hide archived chats from the main list once the TUI has
+                // an Archived section; until then they stay visible to match
+                // the phone.
+                if self.chat_state.reconcile_provider_chats(provider, chats) {
+                    self.persist_chats();
+                }
+                debug!(?provider, "Chat list sync OK");
+            }
+            Err(e) => error!(?provider, error = %e, "Chat list sync failed"),
+        }
+    }
+
     /// Persist the current chat list so it survives a cold restart.
     pub(crate) fn persist_chats(&self) {
-        if let Err(e) = Config::save_chats(&self.chat_state.chats) {
+        if let Err(e) = crate::file::write_chats(&self.chat_state.chats) {
             error!(error = %e, "Failed to persist chat list");
         }
     }
@@ -410,6 +516,7 @@ impl AppState {
             popup_type,
             prev_focus: self.focus,
             scroll_idx: 0,
+            focused: self.focused,
         });
         self.focus = Focus::Popup;
     }
@@ -419,29 +526,33 @@ impl AppState {
             self.focus = popup.prev_focus;
         }
 
-        // Closing any popup ends the audio session: no position is retained,
+        // Closing any popup ends the media session: no position is retained,
         // so reopening starts from a fresh fetch + fresh engine load. Clearing
         // here also makes `apply_playback_state`'s guard drop any late reports.
         self.playback = None;
+        self.video = None;
     }
 
-    /// The message a Message/Image/Audio popup quotes, when it can be replied
-    /// to (confirmed, not pending/failed). The record key over such a popup
-    /// starts a voice-note reply to it.
+    /// The message a Message/Image/Audio/Video popup quotes, when it can be
+    /// replied to (confirmed, not pending/failed). The record key over such a
+    /// popup starts a voice-note reply to it.
     pub fn reply_recording_target(&self) -> Option<MessageId> {
         let popup = self.pop_up.as_ref()?;
         let msg = match &popup.popup_type {
             PopupKind::Message(msg)
             | PopupKind::Image(ImagePopup { msg, .. })
-            | PopupKind::Audio(AudioPopup { msg, .. }) => msg,
+            | PopupKind::Audio(AudioPopup { msg, .. })
+            | PopupKind::Video(VideoPopup { msg, .. }) => msg,
             _ => return None,
         };
         (!msg.pending && !msg.failed).then(|| msg.message_id.clone())
     }
 
-    /// Apply a player report for the audio session. Reports are dropped unless
-    /// a session for the same message is active, so events racing with a
-    /// dismissed popup can never resurrect stale playback state.
+    /// Apply a player report. It is routed to whichever slot holds a session
+    /// for the same message, so an audio and a video session can both be live
+    /// and each report updates only its own snapshot. A report matching neither
+    /// slot is dropped, so events racing with a dismissed popup can never
+    /// resurrect stale playback state.
     pub fn apply_playback_state(&mut self, incoming: PlaybackState) {
         if self
             .playback
@@ -449,28 +560,35 @@ impl AppState {
             .is_some_and(|current| current.source == incoming.source)
         {
             self.playback = Some(incoming);
+        } else if self
+            .video
+            .as_ref()
+            .is_some_and(|current| current.source == incoming.source)
+        {
+            self.video = Some(incoming);
         }
     }
 
-    /// Map a key to an audio-popup control. Returns `None` when the popup on
-    /// screen is not an Audio popup or the key is not bound. `seek_back` /
-    /// `seek_forward` are compared by `KeyCode` only: terminals disagree on
-    /// whether `<`/`>` arrive with a shift modifier.
-    pub fn audio_controls(&self, key: &KeyEvent, keymap: &Keymap) -> Option<AudioAction> {
-        let audio_open = self
+    /// Map a key to a media-popup control. Returns `None` when the popup on
+    /// screen is not a media popup (an Audio or Video popup) or the key is not
+    /// bound. `seek_back` / `seek_forward` are compared by `KeyCode` only:
+    /// terminals disagree on whether `<`/`>` arrive with a shift modifier.
+    pub fn media_controls(&self, key: &KeyEvent, keymap: &Keymap) -> Option<MediaAction> {
+        let media_open = self
             .pop_up
             .as_ref()
-            .is_some_and(|p| matches!(p.popup_type, PopupKind::Audio(_)));
-        if !audio_open {
+            .is_some_and(|p| matches!(p.popup_type, PopupKind::Audio(_) | PopupKind::Video(_)));
+
+        if !media_open {
             return None;
         }
 
         if *key == keymap.play_pause {
-            Some(AudioAction::PlayPause)
+            Some(MediaAction::PlayPause)
         } else if key.code == keymap.seek_back.code {
-            Some(AudioAction::Seek { delta_secs: -5 })
+            Some(MediaAction::Seek { delta_secs: -5 })
         } else if key.code == keymap.seek_forward.code {
-            Some(AudioAction::Seek { delta_secs: 5 })
+            Some(MediaAction::Seek { delta_secs: 5 })
         } else {
             None
         }
@@ -508,6 +626,7 @@ impl AppState {
             Focus::Write => {
                 // Save draft and clear write when exiting chat
                 // + close the current chat
+                // BUG: this is not working? dismissing Write does not persist the message
                 if let Some(chat_id) = self
                     .chat_state
                     .open_chat
@@ -515,6 +634,7 @@ impl AppState {
                     .map(|o| o.chat.id.clone())
                 {
                     let text = self.write.lines().join("\n");
+                    debug!("Saving {text} to draft");
                     self.chat_state.save_draft(&chat_id, text);
                 }
 
@@ -578,6 +698,7 @@ impl AppState {
         self.write.clear();
 
         if let Some(draft) = self.chat_state.load_draft(&chat.id) {
+            debug!("draft '{draft}' present on chat load, inserting...");
             self.write.insert_str(draft);
         }
 
@@ -773,7 +894,7 @@ impl AppState {
         match send_result {
             Ok(confirmed) => {
                 let sent_ts = confirmed.timestamp;
-                let sent_chat_id = confirmed.chat.clone();
+                let sent_chat_id = confirmed.chat_id.clone();
 
                 self.chat_state.upsert_chat(Chat {
                     id: sent_chat_id,
@@ -928,7 +1049,7 @@ impl AppState {
                 self.chat_state.drafts.remove(&draft.chat);
 
                 let sent_ts = confirmed.timestamp;
-                let sent_chat_id = confirmed.chat.clone();
+                let sent_chat_id = confirmed.chat_id.clone();
 
                 self.chat_state.upsert_chat(Chat {
                     id: sent_chat_id,
@@ -1039,6 +1160,61 @@ impl AppState {
         self.messengers.iter().find(|m| m.provider() == provider)
     }
 
+    /// Lifecycle step of the startup sequence: start every provider the
+    /// configuration enables, once all backend event receivers are registered.
+    ///
+    /// A provider the config leaves disabled stays `constructed/dormant` and
+    /// therefore opens no transport, which is what makes the disabled-provider
+    /// surfaces (no QR/`Connected`, no chat fetch, no notifications) hold.
+    /// Enabling a provider later from settings re-enters the same idempotent
+    /// [`Messenger::start`] path.
+    pub async fn start_enabled_providers(&mut self) {
+        let providers: Vec<Provider> = self
+            .messengers
+            .iter()
+            .map(MessengerKind::provider)
+            .collect();
+        for provider in providers {
+            if provider.is_enabled(&self.config.providers) {
+                info!(provider = provider.name(), "starting enabled provider");
+                let result = match self.provider_to_messenger(provider) {
+                    Some(messenger) => messenger.start().await,
+                    None => Ok(()),
+                };
+
+                if let Err(error) = result {
+                    // An enabled provider that failed before creating a run
+                    // must not remain enabled with no transport. Roll back to
+                    // the same dormant state used by the settings path.
+                    provider.toggle_enabled(&mut self.config.providers);
+                    if let Err(save_error) = self.config.save_config() {
+                        self.create_popup(PopupKind::Error(format!(
+                            "{} failed to start ({error}); could not persist the \
+                             rollback: {save_error}",
+                            provider.name()
+                        )));
+                    } else {
+                        self.create_popup(PopupKind::Error(format!(
+                            "{} failed to start: {error}",
+                            provider.name()
+                        )));
+                    }
+                    self.provider_connected.remove(&provider);
+                    self.chat_state.chats.retain(|chat| {
+                        chat.id == ChatId::Myself || chat.id.to_provider() != provider
+                    });
+                    self.chat_state.refresh_search();
+                    self.persist_chats();
+                }
+            } else {
+                info!(
+                    provider = provider.name(),
+                    "provider disabled; left dormant"
+                );
+            }
+        }
+    }
+
     fn provider_to_messenger_mut(&mut self, provider: Provider) -> Option<&mut MessengerKind> {
         self.messengers
             .iter_mut()
@@ -1058,6 +1234,10 @@ impl AppState {
                     remaining.as_secs().max(1)
                 ));
             }
+        }
+
+        if !self.focused {
+            return Some("App not in focus!".to_string());
         }
 
         if let Some(status) = self
@@ -1092,23 +1272,67 @@ impl AppState {
         true
     }
 
+    /// Invalidate every background fetch started so far: their results land
+    /// after a provider disable and must be discarded instead of repopulating
+    /// the rows the disable removed. Called from each disable path.
+    fn bump_lifecycle_epoch(&mut self) {
+        self.lifecycle_epoch = self.lifecycle_epoch.wrapping_add(1);
+    }
+
     pub async fn toggle_provider(&mut self, provider: Provider) {
         let name = provider.name();
 
         // --- Disabling is always straightforward ---
         if provider.is_enabled(&self.config.providers) {
+            // Invalidate in-flight fetches first, so a chat-list snapshot
+            // taken before the disable cannot land afterwards.
+            self.bump_lifecycle_epoch();
+
+            // Stop WhatsApp before changing the persisted configuration. If
+            // teardown fails, keep the provider enabled and retryable instead
+            // of leaving a live transport behind a disabled config flag.
+            if provider == Provider::WhatsApp
+                && let Some(messenger) = self.provider_to_messenger_mut(provider)
+                && let Err(error) = messenger.disconnect().await
+            {
+                self.create_popup(PopupKind::Error(format!(
+                    "could not disable {name}: {error}"
+                )));
+                return;
+            }
+
             provider.toggle_enabled(&mut self.config.providers);
             match self.config.save_config() {
                 Ok(()) => {
+                    // The transport died with the disable, and its
+                    // `Disconnected` event is now gated above — forget the
+                    // connection here so the status line cannot claim a
+                    // disabled provider is connected.
+                    self.provider_connected.remove(&provider);
+
                     // If the user is currently viewing a chat belonging to the
                     // disabled provider, close it so the UI does not retain an
                     // inactive-provider conversation after its chats vanish.
+                    // `ChatId::Myself` is provider-less (`to_provider` panics
+                    // on it), so test for it first and leave it alone.
                     if let Some(open) = &self.chat_state.open_chat
+                        && open.chat.id != ChatId::Myself
                         && open.chat.id.to_provider() == provider
-                        && !matches!(open.chat.id, ChatId::Myself)
                     {
                         self.write.clear();
                         self.chat_state.open_chat = None;
+                    }
+
+                    // A reply still queued against one of the disabled
+                    // provider's messages must not survive into a later send.
+                    // (Rows, unread badges and search results are cleaned by
+                    // the rebuild below: `apply_chats` rejects rows of a
+                    // disabled provider and re-anchors the selection.)
+                    if let Some(reply) = &self.chat_state.pending_reply
+                        && reply.chat_id != ChatId::Myself
+                        && reply.chat_id.to_provider() == provider
+                    {
+                        self.chat_state.pending_reply = None;
                     }
 
                     let errors = self.rebuild_chats().await;
@@ -1124,15 +1348,31 @@ impl AppState {
                     }
                 }
                 Err(e) => {
-                    self.create_popup(PopupKind::Error(format!("could not save config: {e}")))
+                    provider.toggle_enabled(&mut self.config.providers);
+                    let restart = match self.provider_to_messenger(provider) {
+                        Some(messenger) => messenger.start().await,
+                        None => Ok(()),
+                    };
+
+                    match restart {
+                        Ok(()) => self.create_popup(PopupKind::Error(format!(
+                            "could not disable {name}: {e}"
+                        ))),
+                        Err(restart_error) => self.create_popup(PopupKind::Error(format!(
+                            "could not disable {name}: {e}; could not restore the \
+                             provider: {restart_error}"
+                        ))),
+                    }
                 }
             }
             return;
         }
 
         // --- Enabling ---
-        // Verify API credentials exist
-        if !provider.has_credentials(&self.config.providers) {
+        // Verify API credentials exist (mock providers don't need credentials)
+        let is_mock = self.provider_to_messenger(provider).is_some();
+
+        if !is_mock && !provider.has_credentials(&self.config.providers) {
             self.create_popup(PopupKind::Error(format!(
                 "{}: configure credentials in config.toml first",
                 provider.name(),
@@ -1142,20 +1382,14 @@ impl AppState {
 
         // Verify messenger was initialized
         let messenger = match self.provider_to_messenger(provider) {
-            Some(m) => match m {
-                MessengerKind::WhatsApp(w) => {
-                    w.start();
-                    m
-                }
-                MessengerKind::Telegram(t) => {
+            Some(m) => {
+                if let MessengerKind::Telegram(t) = m {
                     // A configured-but-disabled messenger has no running
                     // listener; enabling it kicks one off so updates flow.
                     t.set_enabled(true);
-                    m
                 }
-                #[cfg(test)]
-                MessengerKind::Stub(_, _) => m,
-            },
+                m
+            }
             None => {
                 self.create_popup(PopupKind::Error(format!(
                     "{name}: messenger could not be initialized"
@@ -1164,7 +1398,48 @@ impl AppState {
             }
         };
 
-        // Check if already authenticated — if so, just enable
+        if provider == Provider::WhatsApp {
+            // Order matters: flip and persist the enabled flag *before* opening
+            // the transport. A just-started run may emit `Connected` (paired) or
+            // `PairingQrCode` (unpaired) immediately, and `handle_backend_event`
+            // drops events from a disabled provider — starting first would let
+            // that first event be discarded.
+            provider.toggle_enabled(&mut self.config.providers);
+            match self.config.save_config() {
+                Ok(()) => {
+                    // Reborrow here: the early `messenger` binding is dead on
+                    // this path, so the config mutation above is unconstrained.
+                    let started = match self.provider_to_messenger(provider) {
+                        Some(m) => m.start().await,
+                        None => Ok(()),
+                    };
+                    if let Err(e) = started {
+                        // The run never came up: roll the lifecycle back so the
+                        // persisted config does not claim a provider that is not
+                        // running. `start()` also emitted an `Error` event, but
+                        // the provider is disabled again, so the gate drops it —
+                        // this popup is the single surface for the failure.
+                        provider.toggle_enabled(&mut self.config.providers);
+                        if let Err(e2) = self.config.save_config() {
+                            self.create_popup(PopupKind::Error(format!(
+                                "could not save config: {e2}"
+                            )));
+                        }
+                        self.create_popup(PopupKind::Error(format!("{name} could not start: {e}")));
+                    } else {
+                        self.create_popup(PopupKind::Info(format!("{name} enabled")));
+                    }
+                }
+                Err(e) => {
+                    self.create_popup(PopupKind::Error(format!("could not save config: {e}")))
+                }
+            }
+            return;
+        }
+
+        // Check if already authenticated — if so, just enable. Telegram's
+        // session is settled at construction, so this reading is reliable for
+        // it (unlike WhatsApp's mid-handshake probe above).
         if messenger.is_authenticated().await {
             provider.toggle_enabled(&mut self.config.providers);
             match self.config.save_config() {
@@ -1188,25 +1463,15 @@ impl AppState {
             return;
         }
 
-        // Not authenticated — check if the provider supports login steps. For
-        // WhatsApp this starts the (inactive) transport so its event-driven QR
-        // pairing flow begins generating codes, then navigates to the login
-        // screen. The provider is marked enabled up front (pairing is in
-        // progress); cancelling via Esc disables it again, and the Connected
-        // event leaves it enabled and triggers the chat rebuild.
+        // Not authenticated — check if the provider supports an interactive
+        // login flow (Telegram phone/code/password). The QR *event*, not
+        // `login_steps()`, is the source of truth for WhatsApp pairing.
         let steps = messenger.login_steps();
         if steps.is_empty() {
             self.create_popup(PopupKind::Error(format!(
                 "{name}: not authenticated and no login flow available"
             )));
             return;
-        }
-
-        if provider == Provider::WhatsApp && !provider.is_enabled(&self.config.providers) {
-            provider.toggle_enabled(&mut self.config.providers);
-            if let Err(e) = self.config.save_config() {
-                self.create_popup(PopupKind::Error(format!("could not save config: {e}")));
-            }
         }
 
         // Navigate to login screen
@@ -1334,16 +1599,25 @@ impl AppState {
             }
 
             // Cancelling an in-progress WhatsApp pairing that never
-            // authenticated disables the provider again (its QR kept coming
-            // from the still-running bot). This keeps the provider disabled
-            // until authentication actually completes.
+            // authenticated disables the provider again. This keeps the
+            // provider disabled until authentication actually completes — and
+            // because a cancelled pairing is a disable, the bot is stopped in
+            // place too, so its QR flow and events go inert rather than
+            // continuing behind a disabled config flag.
             if login.provider == Provider::WhatsApp
                 && login.provider.is_enabled(&self.config.providers)
             {
+                self.bump_lifecycle_epoch();
                 login.provider.toggle_enabled(&mut self.config.providers);
 
                 if let Err(e) = self.config.save_config() {
                     self.create_popup(PopupKind::Error(format!("could not save config: {e}")));
+                }
+
+                if let Some(messenger) = self.provider_to_messenger_mut(login.provider)
+                    && let Err(e) = messenger.disconnect().await
+                {
+                    self.create_popup(PopupKind::Error(e.to_string()));
                 }
             }
         }
@@ -1351,7 +1625,43 @@ impl AppState {
         self.finish_loading(LoadingArea::FullScreen);
     }
 
+    /// The notification a new message implies, if it implies one at all.
+    ///
+    /// A read-only question about what the user can currently see, so the event
+    /// loop can ask it before handing the event over: the name is resolved from
+    /// the pre-update chat list, which is the row the event would have read
+    /// anyway.
+    ///
+    /// A message counts as *seen* only when the chat is open **and** the window
+    /// has the OS focus, so looking at the open chat from another workspace
+    /// cannot mute a message the user is not there to read. The two conditions
+    /// deliberately differ: an unfocused window still announces a message in the
+    /// open chat, but [`Self::handle_backend_event`] does not raise an unread
+    /// badge for it, because it is already pushed into the open chat and will be
+    /// on screen when the user comes back.
+    pub fn notice_for_message(&self, provider: Provider, message: &Message) -> Option<Notice> {
+        let contact_name = self
+            .chat_state
+            .display_name_for(&message.chat_id, &message.sender);
+        let visible = self.focused && self.chat_state.is_open(&message.chat_id);
+
+        to_notice(message, provider, &contact_name, visible)
+    }
+
     pub fn handle_backend_event(&mut self, provider: Provider, event: BackendEvent) {
+        // A disabled provider is inert. Its transport has been stopped by the
+        // disable, so any event still in flight predates that stop: a late
+        // message, chat snapshot, QR code or `Connected` must not reinsert
+        // rows, raise unread badges or reopen the login screen.
+        if !provider.is_enabled(&self.config.providers) {
+            debug!(
+                ?provider,
+                event = ?std::mem::discriminant(&event),
+                "Ignoring backend event from a disabled provider"
+            );
+            return;
+        }
+
         match event {
             BackendEvent::Connected => {
                 info!(?provider, "Backend connected");
@@ -1360,9 +1670,11 @@ impl AppState {
                 self.backend_status = None;
 
                 // A newly authenticated provider becomes usable: close any
-                // active pairing/login screen and enable it in config. The
-                // chat-list rebuild is kicked off from the TUI event loop,
-                // which owns the UI channel needed to deliver the result.
+                // active pairing/login screen. The chat-list rebuild is kicked
+                // off from the TUI event loop, which owns the UI channel
+                // needed to deliver the result. Re-enabling a provider the
+                // user disabled is not done here — the gate above already
+                // dropped such a `Connected`.
                 if provider == Provider::WhatsApp {
                     let was_pairing = self
                         .login_state
@@ -1373,15 +1685,6 @@ impl AppState {
                         self.login_state = None;
                         self.screen = Screen::Main;
                         self.finish_loading(LoadingArea::FullScreen);
-                    }
-
-                    if !provider.is_enabled(&self.config.providers) {
-                        provider.toggle_enabled(&mut self.config.providers);
-
-                        match self.config.save_config() {
-                            Ok(()) => {}
-                            Err(e) => self.create_popup(PopupKind::Error(e.to_string())),
-                        };
                     }
                 }
             }
@@ -1399,6 +1702,10 @@ impl AppState {
                     self.provider_connected.remove(&provider);
 
                     if provider.is_enabled(&self.config.providers) {
+                        // An invalid session disables the provider: invalidate
+                        // in-flight fetches first so their late results cannot
+                        // bring the pruned rows back.
+                        self.bump_lifecycle_epoch();
                         provider.toggle_enabled(&mut self.config.providers);
 
                         if let Err(e) = self.config.save_config() {
@@ -1507,32 +1814,21 @@ impl AppState {
                     .chat_state
                     .chats
                     .iter()
-                    .find(|chat| chat.id == message.chat)
+                    .find(|chat| chat.id == message.chat_id)
                     .map(|chat| chat.unread_count)
                     .unwrap_or(0);
 
-                let chatlist_row = self.chat_state.chats.iter().find(|c| c.id == message.chat);
-                let chatlist_found = chatlist_row.is_some();
-                let existing_name = chatlist_row
-                    .map(|c| c.contact_name.clone())
-                    .filter(|n| !n.is_empty() && n != "Unknown" && n != "You");
-
-                // Messages never rename an existing chat list row: for a group
-                // chat the sender is a member, so the member's name would
-                // clobber the group title on every inbound message. The
-                // backend owns titles (ChatList/ChatUpdated); only genuinely
-                // new chats get a sender-derived fallback so something
-                // renders until the first authoritative list arrives.
-                let contact_name = existing_name.unwrap_or_else(|| {
-                    if message.sender == "Unknown" {
-                        String::new()
-                    } else {
-                        message.sender.clone()
-                    }
-                });
+                let chatlist_found = self
+                    .chat_state
+                    .chats
+                    .iter()
+                    .any(|chat| chat.id == message.chat_id);
+                let contact_name = self
+                    .chat_state
+                    .display_name_for(&message.chat_id, &message.sender);
 
                 let mut chat_update = Chat {
-                    id: message.chat.clone(),
+                    id: message.chat_id.clone(),
                     contact_name: contact_name.clone(),
                     last_message_ts: Some(message.timestamp),
                     ..Default::default()
@@ -1554,12 +1850,12 @@ impl AppState {
                 }
 
                 if is_open {
-                    self.chat_state.mark_read(&message.chat);
+                    self.chat_state.mark_read(&message.chat_id);
                 }
 
                 let text_preview: String = message.text.chars().take(60).collect();
                 debug!(
-                    chat = ?message.chat,
+                    chat = ?message.chat_id,
                     from_me = message.from_me,
                     is_open,
                     chatlist_found,
@@ -1569,17 +1865,17 @@ impl AppState {
                 );
 
                 if !message.from_me && !is_open {
-                    debug!(chat = ?message.chat, "TUI set unread");
+                    debug!(chat = ?message.chat_id, "TUI set unread");
                 }
 
                 if !chatlist_found {
-                    debug!(chat = ?message.chat, "TUI MessageReceived: inserted chat list entry from push event");
+                    debug!(chat = ?message.chat_id, "TUI MessageReceived: inserted chat list entry from push event");
                 }
             }
 
             BackendEvent::MessageUpdated(message) => {
                 self.chat_state.update_message(message.clone());
-                self.refresh_chat_list_timestamp(&message.chat);
+                self.refresh_chat_list_timestamp(&message.chat_id);
             }
 
             BackendEvent::MessageDeleted { chat, message_ids } => {
@@ -1740,13 +2036,17 @@ mod tests {
     use crate::backend::mock::MockMessenger;
     use crate::backend::{MediaKind, Message, MessageAction, MessageId, MessageMedia, Messenger};
     use crate::config::KeymapConfig;
-    use crate::tui::image::ImageWidgetState;
+    use crate::tui::image::{ImageWidgetState, VideoWidgetState};
     use crate::tui::player::{PlayKey, PlayState, PlaybackState};
-    use crate::tui::popup::{AudioPopup, ImagePopup, PopUp};
+    use crate::tui::popup::{AudioPopup, ImagePopup, PopUp, VideoPopup};
     use ratatui::buffer::Buffer;
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
     use ratatui::layout::Rect;
     use ratatui::widgets::StatefulWidget;
+    use ratatui_image::picker::Picker;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use tokio::sync::Mutex;
     use tokio::sync::broadcast;
 
     impl AppState {
@@ -1876,7 +2176,7 @@ mod tests {
     /// as the TUI event loop does on `ChatsLoaded`.
     async fn fetch_and_apply(state: &mut AppState) {
         let (chats, errors) = fetch_all_chats(&state.messengers, &state.config.providers).await;
-        state.apply_fetched(chats, errors);
+        state.apply_fetched(chats, errors, state.lifecycle_epoch);
     }
 
     /// Build an `AppState` hosting both a Telegram and a WhatsApp mock, with the
@@ -1976,8 +2276,545 @@ mod tests {
         let mut state = app_state().await;
 
         state.start_loading(LoadingArea::ChatList, "Fetching chats...");
-        state.apply_fetched(Vec::new(), Vec::new());
+        state.apply_fetched(Vec::new(), Vec::new(), state.lifecycle_epoch);
         assert!(state.loading.is_none());
+    }
+
+    /// A handle to a stub provider's call counter (start/disconnect), kept by
+    /// the test after the stub itself was moved into the state.
+    #[derive(Clone)]
+    struct CallCount(Arc<AtomicUsize>);
+
+    impl CallCount {
+        fn load(&self) -> usize {
+            self.0.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    /// Build an `AppState` holding one stub per provider, plus a `start()` count
+    /// for each so a lifecycle assertion can inspect them after the move.
+    async fn stub_provider_state(whatsapp: bool) -> (AppState, CallCount, CallCount) {
+        let telegram = StubMessenger::new();
+        let whatsapp_stub = StubMessenger::new();
+        let telegram_starts = CallCount(telegram.start_calls.clone());
+        let whatsapp_starts = CallCount(whatsapp_stub.start_calls.clone());
+
+        let mut config = Config::default();
+        config.providers.telegram.enabled = true;
+        config.providers.whatsapp = whatsapp;
+        let keymap = config.keys.parse().unwrap();
+        let state = AppState::new(
+            config,
+            keymap,
+            vec![
+                MessengerKind::Stub(Provider::Telegram, Box::new(telegram)),
+                MessengerKind::Stub(Provider::WhatsApp, Box::new(whatsapp_stub)),
+            ],
+            false,
+        )
+        .await;
+
+        (state, telegram_starts, whatsapp_starts)
+    }
+
+    #[tokio::test]
+    async fn startup_starts_only_enabled_providers() {
+        let (mut state, telegram, whatsapp) = stub_provider_state(/* whatsapp */ false).await;
+
+        state.start_enabled_providers().await;
+
+        assert_eq!(telegram.load(), 1, "enabled Telegram must be started");
+        assert_eq!(whatsapp.load(), 0, "a disabled provider must stay dormant");
+    }
+
+    #[tokio::test]
+    async fn startup_starts_whatsapp_when_enabled() {
+        let (mut state, _telegram, whatsapp) = stub_provider_state(/* whatsapp */ true).await;
+
+        state.start_enabled_providers().await;
+
+        assert_eq!(whatsapp.load(), 1, "enabled WhatsApp must be started");
+    }
+
+    #[tokio::test]
+    async fn subscribe_before_start_receives_the_first_event() {
+        let (mut state, telegram, _) = stub_provider_state(/* whatsapp */ false).await;
+
+        // Mirrors the startup order in `tui::run`: receivers first, then start.
+        let mut rx = state.messengers[0].subscribe();
+        state.start_enabled_providers().await;
+
+        assert_eq!(telegram.load(), 1, "the subscribed provider must start");
+        assert!(
+            matches!(rx.recv().await, Ok(BackendEvent::Connected)),
+            "a provider started after subscribing must not lose its first event"
+        );
+    }
+
+    #[tokio::test]
+    async fn enabling_whatsapp_from_settings_starts_it() {
+        let (mut state, _, whatsapp) = stub_provider_state(/* whatsapp */ false).await;
+
+        state.toggle_provider(Provider::WhatsApp).await;
+
+        assert_eq!(
+            whatsapp.load(),
+            1,
+            "the settings toggle must start WhatsApp"
+        );
+        assert!(state.config.providers.whatsapp);
+        assert!(
+            state.login_state.is_none() && matches!(state.screen, Screen::Main),
+            "enabling must not flash the login screen — pairing is driven by \
+             the QR event, not by a handshake probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn enabling_whatsapp_keeps_the_first_event_emitted_by_start() {
+        let (mut state, _, whatsapp) = stub_provider_state(/* whatsapp */ false).await;
+
+        // The event source is subscribed before the enable, exactly as the TUI
+        // event loop does, so the very first event `start()` emits is receivable.
+        let mut rx = state
+            .provider_to_messenger(Provider::WhatsApp)
+            .unwrap()
+            .subscribe();
+
+        state.toggle_provider(Provider::WhatsApp).await;
+        assert_eq!(whatsapp.load(), 1, "the toggle must start WhatsApp");
+
+        // The enable flips and persists the flag *before* opening the transport,
+        // so the first event is not dropped by the disabled-provider gate.
+        assert!(state.config.providers.whatsapp);
+        let event = rx
+            .try_recv()
+            .expect("a freshly started provider must emit its first event");
+        assert!(matches!(event, BackendEvent::Connected));
+        state.handle_backend_event(Provider::WhatsApp, event);
+        assert!(
+            state.provider_connected.contains(&Provider::WhatsApp),
+            "the first event from a just-enabled provider must survive the gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_whatsapp_start_rolls_the_enable_back() {
+        let telegram = StubMessenger::new();
+        let failing = StubMessenger::new().with_start_error(BackendError::Other("no store".into()));
+        let mut config = Config::default();
+        config.providers.telegram.enabled = true;
+        config.providers.whatsapp = false;
+        let keymap = config.keys.parse().unwrap();
+        let mut state = AppState::new(
+            config,
+            keymap,
+            vec![
+                MessengerKind::Stub(Provider::Telegram, Box::new(telegram)),
+                MessengerKind::Stub(Provider::WhatsApp, Box::new(failing)),
+            ],
+            false,
+        )
+        .await;
+
+        state.toggle_provider(Provider::WhatsApp).await;
+
+        assert!(
+            !state.config.providers.whatsapp,
+            "a start that never came up must not leave WhatsApp enabled"
+        );
+        match &state
+            .pop_up
+            .as_ref()
+            .expect("rollback must explain itself")
+            .popup_type
+        {
+            PopupKind::Error(msg) => assert!(msg.contains("could not start")),
+            other => panic!("expected an Error popup, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn enabling_whatsapp_does_not_open_login_until_a_qr_event() {
+        let (mut state, _, _whatsapp) = stub_provider_state(/* whatsapp */ false).await;
+
+        state.toggle_provider(Provider::WhatsApp).await;
+
+        assert!(
+            state.login_state.is_none() && matches!(state.screen, Screen::Main),
+            "a handshake-less enable must stay on the main screen"
+        );
+
+        // The transport announces itself as genuinely unpaired by emitting a
+        // real QR code; only then does the QR screen open.
+        state.handle_backend_event(Provider::WhatsApp, BackendEvent::QrCode("pair-abc".into()));
+
+        assert_eq!(
+            state.login_state.as_ref().map(|ls| ls.provider),
+            Some(Provider::WhatsApp),
+            "the QR event is the source of truth for opening pairing"
+        );
+        assert!(
+            matches!(state.screen, Screen::Login),
+            "the QR event must hop to the login screen"
+        );
+        assert!(
+            state.config.providers.whatsapp,
+            "pairing stays enabled while the QR screen is shown"
+        );
+    }
+
+    #[tokio::test]
+    async fn paired_reconnect_stays_on_the_main_screen() {
+        let (mut state, _telegram, _whatsapp) = stub_provider_state(/* whatsapp */ false).await;
+
+        state.toggle_provider(Provider::WhatsApp).await;
+        assert!(state.login_state.is_none(), "no login flash on enable");
+
+        // A transport that holds a valid session announces itself by
+        // connecting, never by offering a QR code.
+        state.handle_backend_event(Provider::WhatsApp, BackendEvent::Connected);
+
+        assert!(state.provider_connected.contains(&Provider::WhatsApp));
+        assert!(
+            state.login_state.is_none() && matches!(state.screen, Screen::Main),
+            "a paired reconnect must never open the login screen"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_terminal_disconnect_shows_an_error_without_opening_login() {
+        let (mut state, _telegram, _whatsapp) = stub_provider_state(/* whatsapp */ true).await;
+        state.handle_backend_event(Provider::WhatsApp, BackendEvent::Connected);
+        assert!(
+            state.provider_connected.contains(&Provider::WhatsApp),
+            "precondition: the provider is connected"
+        );
+
+        // `Disconnected` from the run-loop watcher / logout handler means the
+        // transport actually died — it is loud (error popup, connection
+        // revoked) but never itself a pairing prompt.
+        state.handle_backend_event(
+            Provider::WhatsApp,
+            BackendEvent::Disconnected("WhatsApp: connection lost".into()),
+        );
+
+        assert!(!state.provider_connected.contains(&Provider::WhatsApp));
+        assert!(
+            state.pop_up.is_some(),
+            "a terminal disconnect must surface an error"
+        );
+        assert!(
+            state.login_state.is_none() && matches!(state.screen, Screen::Main),
+            "a terminal disconnect must not open the QR/login screen"
+        );
+
+        state.handle_backend_event(Provider::WhatsApp, BackendEvent::Connected);
+        assert!(state.provider_connected.contains(&Provider::WhatsApp));
+        assert!(
+            state.login_state.is_none(),
+            "reconnect confirms the session and stays on the main screen"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transient_reconnect_status_keeps_the_provider_connected() {
+        let (mut state, _telegram, _whatsapp) = stub_provider_state(/* whatsapp */ true).await;
+        state.handle_backend_event(Provider::WhatsApp, BackendEvent::Connected);
+        assert!(
+            state.provider_connected.contains(&Provider::WhatsApp),
+            "precondition: the provider is connected"
+        );
+
+        // A clean stream recycle is announced as a transient status, not a
+        // terminal outage: no error popup, the connection is not revoked, the
+        // session is not cleared, and no pairing prompt appears.
+        state.handle_backend_event(
+            Provider::WhatsApp,
+            BackendEvent::Status("WhatsApp reconnecting".into()),
+        );
+
+        assert_eq!(
+            state.backend_status.as_deref(),
+            Some("WhatsApp reconnecting")
+        );
+        assert!(
+            state.provider_connected.contains(&Provider::WhatsApp),
+            "a recycle must not revoke the connection"
+        );
+        assert!(
+            state.pop_up.is_none(),
+            "a recycle must not pop an error dialog"
+        );
+        assert!(state.login_state.is_none());
+
+        // The single `Connected` that follows a successful reconnect clears the
+        // transient status and stays on the main screen.
+        state.handle_backend_event(Provider::WhatsApp, BackendEvent::Connected);
+        assert!(
+            state.backend_status.is_none(),
+            "Connected clears the status"
+        );
+        assert!(state.provider_connected.contains(&Provider::WhatsApp));
+        assert!(state.login_state.is_none());
+    }
+
+    #[tokio::test]
+    async fn disabling_then_re_enabling_whatsapp_stops_then_starts_it() {
+        let tg = StubMessenger::new();
+        let wa = StubMessenger::new();
+        let wa_starts = CallCount(wa.start_calls.clone());
+        let wa_disconnects = CallCount(wa.disconnect_calls.clone());
+
+        let mut config = Config::default();
+        config.providers.telegram.enabled = true;
+        config.providers.whatsapp = true;
+        let keymap = config.keys.parse().unwrap();
+        let mut state = AppState::new(
+            config,
+            keymap,
+            vec![
+                MessengerKind::Stub(Provider::Telegram, Box::new(tg)),
+                MessengerKind::Stub(Provider::WhatsApp, Box::new(wa)),
+            ],
+            false,
+        )
+        .await;
+
+        // A WhatsApp row that is open, with a reply queued against it and the
+        // transport marked connected: all three must not survive the disable.
+        state.chat_state.chats.push(Chat {
+            id: ChatId::WhatsApp("15550000007@s.whatsapp.net".into()),
+            contact_name: "WA Contact".into(),
+            ..Default::default()
+        });
+        let wa_chat = state.chat_state.chats[0].clone();
+        state.chat_state.open_chat = Some(OpenChat {
+            chat: wa_chat.clone(),
+            history: Vec::new(),
+            has_more_history: true,
+        });
+        let mut target = audio_message();
+        target.chat_id = wa_chat.id;
+        state.chat_state.pending_reply = Some(target);
+        state.provider_connected.insert(Provider::WhatsApp);
+        let epoch_before = state.lifecycle_epoch;
+
+        state.toggle_provider(Provider::WhatsApp).await;
+
+        assert_eq!(
+            wa_disconnects.load(),
+            1,
+            "disabling must stop the transport exactly once"
+        );
+        assert_eq!(wa_starts.load(), 0, "disabling must not start anything");
+        assert!(!state.config.providers.whatsapp, "the config flag flips");
+        assert_eq!(
+            state.lifecycle_epoch,
+            epoch_before + 1,
+            "a disable invalidates in-flight fetches"
+        );
+        assert!(
+            state.chat_state.open_chat.is_none(),
+            "an open chat of the disabled provider must close"
+        );
+        assert!(
+            state.chat_state.pending_reply.is_none(),
+            "a reply queued against it must not survive"
+        );
+        assert!(
+            !state.provider_connected.contains(&Provider::WhatsApp),
+            "a stopped transport is not connected"
+        );
+        assert!(
+            state
+                .chat_state
+                .chats
+                .iter()
+                .all(|c| !matches!(c.id, ChatId::WhatsApp(_))),
+            "the disabled provider's rows are gone"
+        );
+
+        // Re-enabling rebuilds a fresh start over the same durable session —
+        // exactly one start(), no second disconnect, no login screen.
+        state.toggle_provider(Provider::WhatsApp).await;
+
+        assert!(
+            state.config.providers.whatsapp,
+            "the config flag flips back"
+        );
+        assert_eq!(
+            wa_starts.load(),
+            1,
+            "re-enable must start the transport once"
+        );
+        assert_eq!(
+            wa_disconnects.load(),
+            1,
+            "re-enabling must not disconnect again"
+        );
+        assert!(
+            state.login_state.is_none(),
+            "re-enabling an authenticated provider must not reopen the login flow"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabling_telegram_never_disconnects_it() {
+        let tg = StubMessenger::new();
+        let tg_disconnects = CallCount(tg.disconnect_calls.clone());
+
+        let mut config = Config::default();
+        config.providers.telegram.enabled = true;
+        let keymap = config.keys.parse().unwrap();
+        let mut state = AppState::new(
+            config,
+            keymap,
+            vec![MessengerKind::Stub(Provider::Telegram, Box::new(tg))],
+            false,
+        )
+        .await;
+
+        state.toggle_provider(Provider::Telegram).await;
+
+        assert!(
+            !state.config.providers.telegram.enabled,
+            "the config flag flips"
+        );
+        assert_eq!(
+            tg_disconnects.load(),
+            0,
+            "Telegram's listener is governed by set_enabled; disconnect would \
+             make the next enable unrecoverable"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_chat_fetch_from_before_a_disable_is_discarded() {
+        let mut state = dual_provider_state(/* whatsapp */ true).await;
+        let rows_before = state.chat_state.chats.clone();
+        assert!(
+            rows_before
+                .iter()
+                .any(|c| matches!(c.id, ChatId::WhatsApp(_))),
+            "the seeded snapshot must contain WhatsApp rows"
+        );
+        let epoch = state.lifecycle_epoch;
+
+        state.toggle_provider(Provider::WhatsApp).await;
+        let rows_after_disable = state.chat_state.chats.len();
+
+        state.apply_fetched(rows_before, Vec::new(), epoch);
+
+        assert_eq!(
+            state.chat_state.chats.len(),
+            rows_after_disable,
+            "the pre-disable snapshot must be dropped wholesale"
+        );
+        assert!(
+            state
+                .chat_state
+                .chats
+                .iter()
+                .all(|c| !matches!(c.id, ChatId::WhatsApp(_))),
+            "a pre-disable fetch must not resurrect the disabled rows"
+        );
+        assert!(
+            state.loading.is_none(),
+            "a stale fetch still releases the loading state"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_chatlist_sync_from_before_a_disable_is_discarded() {
+        let mut state = dual_provider_state(/* whatsapp */ true).await;
+        let epoch = state.lifecycle_epoch;
+        state.chatlist_sync_in_flight = true;
+        state.chatlist_sync_pending = 2;
+        state.start_loading(LoadingArea::ChatList, "Syncing chats...");
+
+        state.toggle_provider(Provider::WhatsApp).await;
+
+        let stale_row = Chat {
+            id: ChatId::WhatsApp("15550000008@s.whatsapp.net".into()),
+            contact_name: "WA Contact".into(),
+            ..Default::default()
+        };
+        state.apply_synced_chats(Provider::WhatsApp, Ok(vec![stale_row.clone()]), epoch);
+
+        assert_eq!(
+            state.chatlist_sync_pending, 1,
+            "a stale sync still advances the counter"
+        );
+        assert!(
+            state.chatlist_sync_in_flight,
+            "another sync is still pending"
+        );
+        assert!(
+            state
+                .chat_state
+                .chats
+                .iter()
+                .all(|c| !matches!(c.id, ChatId::WhatsApp(_))),
+            "a stale sync must not resurrect the disabled rows"
+        );
+
+        // Even a sync that started *after* the disable is rejected: the
+        // provider flag alone must gate the payload.
+        state.apply_synced_chats(
+            Provider::WhatsApp,
+            Ok(vec![stale_row]),
+            state.lifecycle_epoch,
+        );
+
+        assert_eq!(state.chatlist_sync_pending, 0);
+        assert!(!state.chatlist_sync_in_flight);
+        assert!(
+            state.loading.is_none(),
+            "the counter reaching zero releases it"
+        );
+        assert!(
+            state
+                .chat_state
+                .chats
+                .iter()
+                .all(|c| !matches!(c.id, ChatId::WhatsApp(_))),
+            "a disabled provider never reconciles back into the list"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_events_from_a_disabled_provider_change_nothing() {
+        let mut state = dual_provider_state(/* whatsapp */ true).await;
+        state.toggle_provider(Provider::WhatsApp).await;
+        let rows_after_disable = state.chat_state.chats.len();
+
+        let mut late_message = audio_message();
+        late_message.chat_id = ChatId::WhatsApp("15550000009@s.whatsapp.net".into());
+        state.handle_backend_event(
+            Provider::WhatsApp,
+            BackendEvent::MessageReceived(late_message),
+        );
+        state.handle_backend_event(Provider::WhatsApp, BackendEvent::QrCode("qr-data".into()));
+        state.handle_backend_event(Provider::WhatsApp, BackendEvent::Connected);
+
+        assert_eq!(
+            state.chat_state.chats.len(),
+            rows_after_disable,
+            "a late message must not resurrect rows"
+        );
+        assert!(
+            state.login_state.is_none(),
+            "a late QR must not reopen the login flow"
+        );
+        assert!(
+            !state.provider_connected.contains(&Provider::WhatsApp),
+            "a late Connected must not mark a stopped transport as connected"
+        );
+        assert!(
+            !state.config.providers.whatsapp,
+            "stale events never re-enable the config"
+        );
     }
 
     #[tokio::test]
@@ -2096,7 +2933,7 @@ mod tests {
         let older = vec![
             Message {
                 message_id: "older-1".into(),
-                chat: chat_id.clone(),
+                chat_id: chat_id.clone(),
                 sender: "Alice".into(),
                 author_id: None,
                 text: "older still".into(),
@@ -2112,7 +2949,7 @@ mod tests {
             // A duplicate of an already-cached message must be filtered away.
             Message {
                 message_id: first_existing,
-                chat: chat_id.clone(),
+                chat_id: chat_id.clone(),
                 sender: "Alice".into(),
                 author_id: None,
                 text: "duplicate".into(),
@@ -2205,7 +3042,7 @@ mod tests {
             &other_id,
             Ok(vec![Message {
                 message_id: "stale".into(),
-                chat: other_id.clone(),
+                chat_id: other_id.clone(),
                 sender: "Alice".into(),
                 author_id: None,
                 text: "for another chat".into(),
@@ -2465,7 +3302,7 @@ mod tests {
 
         let (telegram_only, _errors) =
             fetch_all_chats(&state.messengers, &state.config.providers).await;
-        state.apply_fetched(telegram_only, Vec::new());
+        state.apply_fetched(telegram_only, Vec::new(), state.lifecycle_epoch);
 
         assert!(
             state
@@ -2502,6 +3339,39 @@ mod tests {
         state.focus = Focus::Chat;
         state.handle_paste("line one\nline two".into());
         assert_eq!(state.write.lines().to_vec(), vec![String::new()]);
+    }
+
+    #[tokio::test]
+    async fn blur_and_refocus_restore_the_exact_pane_and_open_chat() {
+        let mut state = app_state().await;
+        state.chat_state.chat_list_state.select(Some(0));
+        select_chat(&mut state, 0).await;
+        state.focus = Focus::Write;
+        state.write.insert_str("half-typed draft");
+
+        state.set_window_focus(false);
+        assert!(!state.focused);
+        assert_eq!(
+            state.focus,
+            Focus::Write,
+            "losing the window must not move the pane focus"
+        );
+        assert!(state.chat_state.open_chat.is_some());
+
+        state.set_window_focus(true);
+        assert!(state.focused);
+        assert_eq!(state.focus, Focus::Write);
+        assert!(state.chat_state.open_chat.is_some());
+        assert_eq!(state.write.lines().join("\n"), "half-typed draft");
+    }
+
+    #[tokio::test]
+    async fn status_hint_reports_the_blurred_window() {
+        let mut state = app_state().await;
+        assert_ne!(state.status_hint().as_deref(), Some("App not in focus!"));
+
+        state.set_window_focus(false);
+        assert_eq!(state.status_hint().as_deref(), Some("App not in focus!"));
     }
 
     #[tokio::test]
@@ -2549,7 +3419,7 @@ mod tests {
 
         assert_eq!(
             state.chat_state.open_chat.as_ref().unwrap().history.len(),
-            4
+            5
         );
         assert!(!state.chat_state.chats[0].unread);
         assert_eq!(state.chat_state.chats[0].unread_count, 0);
@@ -2558,7 +3428,7 @@ mod tests {
             Provider::Telegram,
             BackendEvent::MessageReceived(Message {
                 message_id: "incoming".into(),
-                chat: ChatId::Telegram(103),
+                chat_id: ChatId::Telegram(103),
                 sender: "Alice".into(),
                 author_id: None,
                 text: "breaking".into(),
@@ -2575,7 +3445,7 @@ mod tests {
 
         assert_eq!(
             state.chat_state.open_chat.as_ref().unwrap().history.len(),
-            5
+            6
         );
         assert_eq!(state.chat_state.chats[0].last_message_ts, Some(1000));
         assert!(!state.chat_state.chats[0].unread);
@@ -2591,7 +3461,7 @@ mod tests {
             Provider::Telegram,
             BackendEvent::MessageReceived(Message {
                 message_id: "incoming".into(),
-                chat: ChatId::Telegram(101),
+                chat_id: ChatId::Telegram(101),
                 sender: "Alice".into(),
                 author_id: None,
                 text: "hi".into(),
@@ -2614,6 +3484,253 @@ mod tests {
             .expect("incoming chat remains in chat list");
         assert!(chat.unread);
         assert_eq!(chat.unread_count, 1);
+    }
+
+    /// The boundary is provider-neutral: the same `MessageReceived` shape must
+    /// badge the WhatsApp row, leave the open Telegram chat alone, and carry
+    /// `Provider::WhatsApp` into the notification the user sees.
+    #[tokio::test]
+    async fn a_whatsapp_message_badges_only_the_whatsapp_row() {
+        let mut state = dual_provider_state(true).await;
+
+        // Open a Telegram chat, so a WhatsApp message is one the user cannot see.
+        let tg_index = state
+            .chat_state
+            .chats
+            .iter()
+            .position(|c| matches!(c.id, ChatId::Telegram(_)))
+            .expect("the merged list holds a Telegram row");
+        select_chat(&mut state, tg_index).await;
+        let open = state.chat_state.open_chat.as_ref().unwrap();
+        let (open_id, open_len) = (open.chat.id.clone(), open.history.len());
+        let telegram_before: Vec<(ChatId, bool, i32, Option<i64>)> = state
+            .chat_state
+            .chats
+            .iter()
+            .filter(|c| matches!(c.id, ChatId::Telegram(_)))
+            .map(|c| (c.id.clone(), c.unread, c.unread_count, c.last_message_ts))
+            .collect();
+
+        let design = ChatId::WhatsApp("5511999990002@s.whatsapp.net".into());
+        let mut incoming = inbound(design.clone(), "Lia", "shipping it");
+        incoming.timestamp = 600;
+
+        let notice = state
+            .notice_for_message(Provider::WhatsApp, &incoming)
+            .expect("an unseen WhatsApp message is worth a notification");
+        assert_eq!(notice.provider, Provider::WhatsApp);
+        assert_eq!(notice.chat, design.clone());
+        assert_eq!(notice.title, "Design Team");
+        assert_eq!(notice.body, "shipping it");
+
+        state.handle_backend_event(Provider::WhatsApp, BackendEvent::MessageReceived(incoming));
+
+        let row = state
+            .chat_state
+            .chats
+            .iter()
+            .find(|c| c.id == design)
+            .expect("the WhatsApp row stays in the list");
+        assert!(row.unread, "the unseen WhatsApp row takes the badge");
+        assert_eq!(row.unread_count, 1);
+        assert_eq!(
+            row.last_message_ts,
+            Some(600),
+            "recency follows the message itself"
+        );
+
+        // A message older than the row's newest activity must not pull the
+        // chat back down the list, but it is still an unread message.
+        let mut stale = inbound(design.clone(), "Lia", "an older message");
+        stale.timestamp = 100;
+        state.handle_backend_event(Provider::WhatsApp, BackendEvent::MessageReceived(stale));
+
+        let row = state
+            .chat_state
+            .chats
+            .iter()
+            .find(|c| c.id == design)
+            .expect("the WhatsApp row stays in the list");
+        assert_eq!(
+            row.last_message_ts,
+            Some(600),
+            "recency never regresses to an older message"
+        );
+        assert_eq!(row.unread_count, 2, "it is still an unread message");
+
+        let open = state.chat_state.open_chat.as_ref().unwrap();
+        assert_eq!(open.chat.id, open_id, "the open Telegram chat is untouched");
+        assert_eq!(
+            open.history.len(),
+            open_len,
+            "the message did not land in the open conversation"
+        );
+
+        let telegram_after: Vec<(ChatId, bool, i32, Option<i64>)> = state
+            .chat_state
+            .chats
+            .iter()
+            .filter(|c| matches!(c.id, ChatId::Telegram(_)))
+            .map(|c| (c.id.clone(), c.unread, c.unread_count, c.last_message_ts))
+            .collect();
+        assert_eq!(
+            telegram_before, telegram_after,
+            "a WhatsApp message must not touch a Telegram row"
+        );
+    }
+
+    /// An inbound message for a chat the user is not reading, built by hand so
+    /// each seam test can vary only what it is about.
+    fn inbound(chat: ChatId, sender: &str, text: &str) -> Message {
+        Message {
+            message_id: "incoming".into(),
+            chat_id: chat,
+            sender: sender.into(),
+            author_id: None,
+            text: text.into(),
+            timestamp: 0,
+            from_me: false,
+            msg_actions: Vec::new(),
+            media: None,
+            reply_to_id: None,
+            reply_ctx: None,
+            pending: false,
+            failed: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_message_for_a_closed_chat_produces_a_notice() {
+        let mut state = app_state().await;
+        state.chat_state.chat_list_state.select(Some(0));
+        select_chat(&mut state, 0).await;
+
+        // Chat 102 ("Family Group") is a background chat while another one is
+        // open, so this is the message that also raises the unread badge.
+        let notice = state
+            .notice_for_message(
+                Provider::Telegram,
+                &inbound(ChatId::Telegram(102), "Bob", "dinner at eight"),
+            )
+            .expect("a message the user cannot see is worth a notification");
+
+        assert_eq!(notice.provider, Provider::Telegram);
+        assert_eq!(notice.chat, ChatId::Telegram(102));
+        // The chat-list name wins over the sender: in a group the sender is just
+        // a member.
+        assert_eq!(notice.title, "Family Group");
+        assert_eq!(notice.body, "dinner at eight");
+    }
+
+    /// The event loop asks for a notice and then applies the event. While the
+    /// window is focused, the two must agree for the same reason: the open chat
+    /// is both unbadged and unannounced. (An unfocused window is the documented
+    /// exception — see `an_unfocused_window_announces_the_open_chat`.)
+    #[tokio::test]
+    async fn unread_state_and_notice_state_never_disagree_while_focused() {
+        let mut state = app_state().await;
+        state.chat_state.chat_list_state.select(Some(0));
+        select_chat(&mut state, 0).await;
+
+        let open_chat = state
+            .chat_state
+            .open_chat
+            .as_ref()
+            .expect("a chat is open")
+            .chat
+            .id
+            .clone();
+
+        // Open chat: no unread badge, no notice.
+        let open_message = inbound(open_chat.clone(), "Alice", "on my way");
+        let open_notice = state.notice_for_message(Provider::Telegram, &open_message);
+        state.handle_backend_event(
+            Provider::Telegram,
+            BackendEvent::MessageReceived(open_message),
+        );
+        assert!(open_notice.is_none());
+        let open = state
+            .chat_state
+            .chats
+            .iter()
+            .find(|chat| chat.id == open_chat)
+            .expect("open chat is in the chat list");
+        assert!(!open.unread);
+
+        // Own message in a closed chat: no unread badge, no notice. The family
+        // group already starts unread in the fixture, so compare the count.
+        let unread_before = state
+            .chat_state
+            .chats
+            .iter()
+            .find(|chat| chat.id == ChatId::Telegram(102))
+            .expect("family group is in the chat list")
+            .unread_count;
+        let mut sent = inbound(ChatId::Telegram(102), "Me", "sent from my laptop");
+        sent.from_me = true;
+        let own_notice = state.notice_for_message(Provider::Telegram, &sent);
+        state.handle_backend_event(Provider::Telegram, BackendEvent::MessageReceived(sent));
+        assert!(own_notice.is_none());
+        let family = state
+            .chat_state
+            .chats
+            .iter()
+            .find(|chat| chat.id == ChatId::Telegram(102))
+            .expect("family group is in the chat list");
+        assert_eq!(family.unread_count, unread_before);
+    }
+
+    /// The open chat is not a reason to stay quiet when the user is not looking:
+    /// the message is still announced. It is deliberately *not* badged, because
+    /// it is already pushed into the open chat and will be on screen when the
+    /// user comes back — so the two disagree on purpose here.
+    #[tokio::test]
+    async fn an_unfocused_window_announces_the_open_chat() {
+        let mut state = app_state().await;
+        state.chat_state.chat_list_state.select(Some(0));
+        select_chat(&mut state, 0).await;
+
+        let open_chat = state
+            .chat_state
+            .open_chat
+            .as_ref()
+            .expect("a chat is open")
+            .chat
+            .id
+            .clone();
+
+        // Same chat, same message, only the window focus differs.
+        state.set_window_focus(false);
+        let message = inbound(open_chat.clone(), "Alice", "still there?");
+        let notice = state.notice_for_message(Provider::Telegram, &message);
+        state.handle_backend_event(Provider::Telegram, BackendEvent::MessageReceived(message));
+
+        assert_eq!(
+            notice.map(|notice| notice.chat),
+            Some(open_chat.clone()),
+            "a message in the open chat is still announced while the user is elsewhere"
+        );
+
+        let open = state
+            .chat_state
+            .chats
+            .iter()
+            .find(|chat| chat.id == open_chat)
+            .expect("open chat is in the chat list");
+        assert!(
+            !open.unread,
+            "but it must not be badged: it is already in the open chat's history"
+        );
+
+        // Refocusing makes the user able to see it again, so the next message in
+        // that chat goes back to being silent.
+        state.set_window_focus(true);
+        assert!(
+            state
+                .notice_for_message(Provider::Telegram, &inbound(open_chat, "Alice", "back now"))
+                .is_none(),
+            "focused again means the open chat is visible again"
+        );
     }
 
     #[tokio::test]
@@ -2700,7 +3817,7 @@ mod tests {
             Provider::Telegram,
             BackendEvent::MessageReceived(Message {
                 message_id: "new-chat".into(),
-                chat: ChatId::Telegram(999),
+                chat_id: ChatId::Telegram(999),
                 sender: "New contact".into(),
                 author_id: None,
                 text: "hello there".into(),
@@ -2737,7 +3854,7 @@ mod tests {
             Provider::Telegram,
             BackendEvent::MessageReceived(Message {
                 message_id: "g-1".into(),
-                chat: ChatId::Telegram(777),
+                chat_id: ChatId::Telegram(777),
                 sender: "A Member".into(),
                 author_id: None,
                 text: "updated".into(),
@@ -2777,7 +3894,7 @@ mod tests {
             Provider::Telegram,
             BackendEvent::MessageReceived(Message {
                 message_id: "transient".into(),
-                chat: ChatId::Telegram(4242),
+                chat_id: ChatId::Telegram(4242),
                 sender: "Unknown".into(),
                 author_id: None,
                 text: "system ping".into(),
@@ -2971,7 +4088,10 @@ mod tests {
         send_result: std::sync::Mutex<Option<Result<(), BackendError>>>,
         history_result: std::sync::Mutex<Option<Result<Vec<Message>, BackendError>>>,
         set_read_result: std::sync::Mutex<Option<Result<(), BackendError>>>,
+        start_error: std::sync::Mutex<Option<BackendError>>,
         cancel_refresh_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        start_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        disconnect_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         tx: broadcast::Sender<BackendEvent>,
     }
 
@@ -2983,9 +4103,17 @@ mod tests {
                 send_result: std::sync::Mutex::new(None),
                 history_result: std::sync::Mutex::new(None),
                 set_read_result: std::sync::Mutex::new(None),
+                start_error: std::sync::Mutex::new(None),
                 cancel_refresh_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                start_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                disconnect_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 tx,
             }
+        }
+
+        fn with_start_error(self, err: BackendError) -> Self {
+            *self.start_error.lock().unwrap() = Some(err);
+            self
         }
 
         fn with_chats_error(self, err: BackendError) -> Self {
@@ -3067,7 +4195,7 @@ mod tests {
                 Some(Err(err)) => Err(err),
                 _ => Ok(Message {
                     message_id: "stub-sent".into(),
-                    chat: chat.clone(),
+                    chat_id: chat.clone(),
                     sender: "You".into(),
                     author_id: None,
                     text,
@@ -3100,12 +4228,26 @@ mod tests {
             self.tx.subscribe()
         }
 
+        async fn start(&self) -> Result<(), BackendError> {
+            self.start_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(err) = self.start_error.lock().unwrap().take() {
+                return Err(err);
+            }
+            // A started provider announces itself on the same channel a real
+            // transport would use for its first `Connected` event.
+            let _ = self.tx.send(BackendEvent::Connected);
+            Ok(())
+        }
+
         async fn cancel_chat_refresh(&self) {
             self.cancel_refresh_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
 
         async fn disconnect(&mut self) -> Result<(), BackendError> {
+            self.disconnect_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
     }
@@ -3172,6 +4314,70 @@ mod tests {
                 assert!(msg.contains("Telegram"), "should mention provider: {msg}");
                 assert!(msg.contains("rate limited"), "should include error: {msg}");
             }
+            other => panic!("expected Error popup, got {other:?}"),
+        }
+    }
+
+    /// A send that fails with a reply pending must not insert a misleading
+    /// local echo: the draft (reply target included) is stashed for retry and
+    /// the error surfaces, but the open chat's history stays untouched.
+    #[tokio::test]
+    async fn failed_reply_send_leaves_no_local_echo() {
+        let chat = Chat {
+            id: ChatId::Telegram(1),
+            contact_name: "Test".into(),
+            ..Default::default()
+        };
+        let stub = StubMessenger::new()
+            .with_chats(vec![chat])
+            .with_send_error(BackendError::Other("unavailable reply target".into()));
+        let mut config = Config::default();
+        config.providers.telegram.enabled = true;
+        let keymap = config.keys.parse().unwrap();
+        let mut state = AppState::new(
+            config,
+            keymap,
+            vec![MessengerKind::Stub(Provider::Telegram, Box::new(stub))],
+            false,
+        )
+        .await;
+        fetch_and_apply(&mut state).await;
+        state.chat_state.chat_list_state.select(Some(0));
+        let chat = state.chat_state.chats[0].clone();
+        state.chat_state.open_chat = Some(OpenChat {
+            chat,
+            history: Vec::new(),
+            has_more_history: true,
+        });
+
+        let target = audio_message();
+        state.chat_state.pending_reply = Some(target.clone());
+        state.write.insert_str("hello");
+        state.send_message().await;
+
+        let draft = state
+            .retry_draft
+            .as_ref()
+            .expect("the failed send keeps its draft for retry");
+        assert_eq!(
+            draft.message_id,
+            Some(target.message_id.clone()),
+            "the retry keeps the reply target"
+        );
+        assert!(
+            state
+                .chat_state
+                .open_chat
+                .as_ref()
+                .is_some_and(|open| open.history.is_empty()),
+            "a failed send must not insert a local echo"
+        );
+        let popup = state
+            .pop_up
+            .as_ref()
+            .expect("send error popup should exist");
+        match &popup.popup_type {
+            PopupKind::Error(msg) => assert!(msg.contains("unavailable reply target")),
             other => panic!("expected Error popup, got {other:?}"),
         }
     }
@@ -3405,6 +4611,7 @@ mod tests {
             submitting: false,
         });
 
+        let epoch_before = state.lifecycle_epoch;
         state.cancel_login().await;
 
         // Login dismissed.
@@ -3412,6 +4619,10 @@ mod tests {
         assert!(
             matches!(state.screen, Screen::Main),
             "cancel should return to Main"
+        );
+        assert!(
+            state.lifecycle_epoch > epoch_before,
+            "cancelling a pairing counts as a disable: in-flight fetches die too"
         );
         // Provider disabled.
         assert!(
@@ -3438,7 +4649,7 @@ mod tests {
             },
             history: vec![Message {
                 message_id: "m".into(),
-                chat: ChatId::Telegram(1),
+                chat_id: ChatId::Telegram(1),
                 sender: "Sender".into(),
                 author_id: None,
                 text: "hello".into(),
@@ -3571,7 +4782,7 @@ mod tests {
             },
             history: vec![Message {
                 message_id: "m".into(),
-                chat: ChatId::Telegram(1),
+                chat_id: ChatId::Telegram(1),
                 sender: "Sender".into(),
                 author_id: None,
                 text: "hello".into(),
@@ -3646,7 +4857,7 @@ mod tests {
             &ChatId::Telegram(4),
             &[Message {
                 message_id: "poll".into(),
-                chat: ChatId::Telegram(4),
+                chat_id: ChatId::Telegram(4),
                 sender: "Dave".into(),
                 author_id: None,
                 text: "new".into(),
@@ -3779,7 +4990,7 @@ mod tests {
     fn image_message() -> Message {
         Message {
             message_id: "img-1".into(),
-            chat: ChatId::Myself,
+            chat_id: ChatId::Myself,
             sender: "Maria".into(),
             author_id: None,
             text: String::new(),
@@ -3811,7 +5022,7 @@ mod tests {
         match &popup.popup_type {
             PopupKind::Image(ImagePopup { msg, .. }) => {
                 assert_eq!(msg.message_id, MessageId::from("img-1"));
-                assert_eq!(msg.chat, ChatId::Myself);
+                assert_eq!(msg.chat_id, ChatId::Myself);
             }
             other => panic!("expected Image popup, got {other:?}"),
         }
@@ -3827,6 +5038,7 @@ mod tests {
             }),
             prev_focus: Focus::Chat,
             scroll_idx: 0,
+            focused: true,
         };
         if let PopupKind::Image(image_popup) = &mut popup.popup_type {
             image_popup.view.set_image(
@@ -3912,12 +5124,122 @@ mod tests {
         msg
     }
 
+    fn video_message(caption: &str) -> Message {
+        let mut msg = image_message();
+        msg.message_id = MessageId::from("video-1");
+        msg.media = Some(MessageMedia {
+            kind: MediaKind::Video,
+            caption: Some(caption.into()),
+            file_name: Some("clip.mp4".into()),
+        });
+        msg.msg_actions = vec![MessageAction::Reply, MessageAction::Delete];
+        msg
+    }
+
+    /// A video popup whose viewport has no frames yet, so the widget renders
+    /// its placeholder instead of an image protocol.
+    fn video_popup_kind(
+        msg: Message,
+        playback: Option<PlaybackState>,
+        error_note: Option<String>,
+    ) -> PopupKind {
+        let frames = Arc::new(Mutex::new(None));
+        let (wake, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let view = VideoWidgetState::new(frames, Picker::halfblocks(), wake);
+
+        PopupKind::Video(VideoPopup {
+            msg,
+            view,
+            playback,
+            error_note,
+        })
+    }
+
+    fn video_popup(
+        msg: Message,
+        playback: Option<PlaybackState>,
+        error_note: Option<String>,
+    ) -> PopupState {
+        PopupState {
+            popup_type: video_popup_kind(msg, playback, error_note),
+            prev_focus: Focus::Chat,
+            scroll_idx: 0,
+            focused: false,
+        }
+    }
+
+    fn video_playback(status: PlayState, position: f64, duration: f64) -> PlaybackState {
+        PlaybackState {
+            source: PlayKey {
+                chat: ChatId::Myself,
+                message_id: MessageId::from("video-1"),
+            },
+            status,
+            position,
+            duration,
+            updated_at: Instant::now(),
+        }
+    }
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::from(code)
     }
 
     #[tokio::test]
-    async fn audio_controls_are_scoped_to_the_audio_popup() {
+    async fn apply_playback_state_routes_to_the_slot_owning_the_session() {
+        let mut state = app_state().await;
+        let audio = PlayKey {
+            chat: ChatId::Telegram(1),
+            message_id: MessageId::from("audio-9"),
+        };
+        let video = PlayKey {
+            chat: ChatId::Telegram(1),
+            message_id: MessageId::from("video-9"),
+        };
+        let report = |source: PlayKey, position| PlaybackState {
+            source,
+            status: PlayState::Playing,
+            position,
+            duration: 5.0,
+            updated_at: Instant::now(),
+        };
+
+        // Both sessions live at once; each report updates only its own slot.
+        state.playback = Some(report(audio.clone(), 1.0));
+        state.video = Some(report(video.clone(), 1.0));
+
+        state.apply_playback_state(report(video.clone(), 4.0));
+        assert_eq!(state.video.as_ref().unwrap().position, 4.0);
+        assert_eq!(
+            state.playback.as_ref().unwrap().position,
+            1.0,
+            "a video report must not disturb the audio slot"
+        );
+
+        state.apply_playback_state(report(audio.clone(), 3.0));
+        assert_eq!(state.playback.as_ref().unwrap().position, 3.0);
+        assert_eq!(state.video.as_ref().unwrap().position, 4.0);
+
+        // A report matching neither slot is dropped.
+        let mut state = state;
+        state.apply_playback_state(report(
+            PlayKey {
+                chat: ChatId::Telegram(1),
+                message_id: MessageId::from("gone"),
+            },
+            9.0,
+        ));
+        assert_eq!(state.playback.as_ref().unwrap().position, 3.0);
+        assert_eq!(state.video.as_ref().unwrap().position, 4.0);
+
+        // Closing any popup ends both sessions.
+        state.dismiss_popup();
+        assert!(state.playback.is_none());
+        assert!(state.video.is_none());
+    }
+
+    #[tokio::test]
+    async fn media_controls_are_scoped_to_media_popups() {
         let mut state = app_state().await;
         let km = KeymapConfig::default().parse().unwrap();
 
@@ -3927,27 +5249,43 @@ mod tests {
             error_note: None,
         }));
         assert_eq!(
-            state.audio_controls(&key(KeyCode::Char(' ')), &km),
-            Some(AudioAction::PlayPause)
+            state.media_controls(&key(KeyCode::Char(' ')), &km),
+            Some(MediaAction::PlayPause)
         );
         assert_eq!(
-            state.audio_controls(&key(KeyCode::Char('<')), &km),
-            Some(AudioAction::Seek { delta_secs: -5 })
+            state.media_controls(&key(KeyCode::Char('<')), &km),
+            Some(MediaAction::Seek { delta_secs: -5 })
         );
         assert_eq!(
-            state.audio_controls(&key(KeyCode::Char('>')), &km),
-            Some(AudioAction::Seek { delta_secs: 5 })
+            state.media_controls(&key(KeyCode::Char('>')), &km),
+            Some(MediaAction::Seek { delta_secs: 5 })
         );
         assert_eq!(
-            state.audio_controls(&key(KeyCode::Char('x')), &km),
+            state.media_controls(&key(KeyCode::Char('x')), &km),
             None,
             "unbound keys map to no action"
         );
 
-        // Without an Audio popup on screen the same keys must not map.
+        // Without a media popup on screen the same keys must not map.
         state.dismiss_popup();
         state.create_popup(PopupKind::Info("hello".into()));
-        assert_eq!(state.audio_controls(&key(KeyCode::Char(' ')), &km), None);
+        assert_eq!(state.media_controls(&key(KeyCode::Char(' ')), &km), None);
+
+        // A Video popup is a media popup too, so the transport keys apply.
+        state.dismiss_popup();
+        state.create_popup(video_popup_kind(video_message("clip"), None, None));
+        assert_eq!(
+            state.media_controls(&key(KeyCode::Char(' ')), &km),
+            Some(MediaAction::PlayPause)
+        );
+        assert_eq!(
+            state.media_controls(&key(KeyCode::Char('<')), &km),
+            Some(MediaAction::Seek { delta_secs: -5 })
+        );
+        assert_eq!(
+            state.media_controls(&key(KeyCode::Char('>')), &km),
+            Some(MediaAction::Seek { delta_secs: 5 })
+        );
     }
 
     #[tokio::test]
@@ -3997,6 +5335,7 @@ mod tests {
             }),
             prev_focus: Focus::Chat,
             scroll_idx: 0,
+            focused: false,
         };
 
         let area = Rect::new(0, 0, 80, 24);
@@ -4012,8 +5351,234 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn video_popup_is_ninety_percent_and_centred() {
+        let mut popup = video_popup(
+            video_message("clip"),
+            Some(video_playback(PlayState::Playing, 3.0, 12.0)),
+            None,
+        );
+
+        let area = Rect::new(0, 0, 100, 30);
+        let mut buf = Buffer::empty(area);
+        let tag = app_state().await.chat_state.get_tag().unwrap_or("");
+        (&mut PopUp::new(tag)).render(area, &mut buf, &mut popup);
+
+        // The popup border is the outermost non-blank cell on each edge; the
+        // 90% clamp plus centring must leave a margin all the way round.
+        let blank = |x: u16, y: u16| buf[(x, y)].symbol() == " ";
+        let left = (0..area.width)
+            .find(|&x| (0..area.height).any(|y| !blank(x, y)))
+            .unwrap();
+        let right = (0..area.width)
+            .rev()
+            .find(|&x| (0..area.height).any(|y| !blank(x, y)))
+            .unwrap();
+        let top = (0..area.height)
+            .find(|&y| (0..area.width).any(|x| !blank(x, y)))
+            .unwrap();
+        let bottom = (0..area.height)
+            .rev()
+            .find(|&y| (0..area.width).any(|x| !blank(x, y)))
+            .unwrap();
+
+        assert_eq!(left, 5, "width clamped to 90% leaves a 5 column margin");
+        assert_eq!(right - left + 1, 90, "popup is not 90% of the width");
+        assert_eq!(right, 94);
+        assert!(top >= 1 && bottom <= 28, "popup not vertically centred");
+    }
+
+    #[tokio::test]
+    async fn video_popup_renders_progress_actions_and_hints() {
+        let mut popup = video_popup(
+            video_message("clip"),
+            Some(video_playback(PlayState::Playing, 3.0, 12.0)),
+            None,
+        );
+
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        let tag = app_state().await.chat_state.get_tag().unwrap_or("");
+        (&mut PopUp::new(tag)).render(area, &mut buf, &mut popup);
+
+        let rendered: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(
+            rendered.contains("Video · 00:03 / 00:12"),
+            "status line missing"
+        );
+        assert!(rendered.contains('█'), "progress strip missing");
+        assert!(rendered.contains("Reply"), "action bar missing");
+        assert!(rendered.contains("Delete"), "action bar missing delete");
+        assert!(rendered.contains("space ▸ play/pause"), "hint line missing");
+        assert!(rendered.contains("esc ▸ close"), "hint line missing close");
+    }
+
+    /// Height of the video frame viewport, derived from where the vertically
+    /// centred placeholder landed: `placeholder_row = top + (height - 1) / 2`.
+    fn frame_viewport_rows(buf: &Buffer, area: Rect, popup_top: u16) -> u16 {
+        let placeholder_row = (0..area.height)
+            .find(|y| (0..area.width).any(|x| buf[(x, *y)].symbol() == "L"))
+            .expect("the loading placeholder should be drawn");
+
+        2 * (placeholder_row - popup_top - 1) + 1
+    }
+
+    #[tokio::test]
+    async fn video_popup_frame_viewport_grows_with_the_terminal() {
+        let render_at = |height: u16| {
+            let mut popup = video_popup(
+                video_message("clip"),
+                Some(video_playback(PlayState::Paused, 0.0, 12.0)),
+                None,
+            );
+            let area = Rect::new(0, 0, 80, height);
+            let mut buf = Buffer::empty(area);
+            (&mut PopUp::new("")).render(area, &mut buf, &mut popup);
+
+            // The popup is centred, so measure from its own left border column
+            // and top row rather than the screen edges.
+            let left = (0..area.width)
+                .find(|&x| (0..area.height).any(|y| buf[(x, y)].symbol() != " "))
+                .expect("popup was rendered");
+            let popup_top = (0..area.height)
+                .find(|&y| buf[(left, y)].symbol() != " ")
+                .expect("popup was rendered");
+            let popup_height = (0..area.height)
+                .filter(|y| buf[(left, *y)].symbol() != " ")
+                .count() as u16;
+
+            // A short caption must not shrink the popup: it takes the full 90%
+            // and the frame gets every row the fixed lines do not.
+            assert_eq!(popup_height, area.height * 9 / 10, "popup is not 90% tall");
+            frame_viewport_rows(&buf, area, popup_top)
+        };
+
+        let short = render_at(24);
+        let tall = render_at(50);
+
+        assert!(short >= 8, "frame viewport collapsed at 24 rows: {short}");
+        assert!(tall >= 30, "frame viewport is tiny at 50 rows: {tall}");
+        assert!(
+            tall > short * 2,
+            "frame viewport did not grow with the terminal: {short} -> {tall}"
+        );
+    }
+
+    #[tokio::test]
+    async fn video_popup_caption_wraps_beside_the_frame() {
+        // Deliberately far more caption than the caption column can hold, with
+        // a numbered word per token so the visible slice is identifiable.
+        let words: Vec<String> = (1..=300).map(|i| format!("w{i:03}")).collect();
+        let caption = words.join(" ");
+        let mut popup = video_popup(
+            video_message(&caption),
+            Some(video_playback(PlayState::Paused, 2.0, 12.0)),
+            None,
+        );
+
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        let tag = app_state().await.chat_state.get_tag().unwrap_or("");
+        (&mut PopUp::new(tag)).render(area, &mut buf, &mut popup);
+
+        let rows: Vec<String> = buf
+            .content
+            .chunks(area.width as usize)
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+            .collect();
+
+        // The caption lives in the right half of the popup (72-wide popup
+        // centred in 80 columns, 70 inner split 50/50 → right half from
+        // column 40) and wraps across as many rows as it needs.
+        let caption_rows: Vec<&String> = rows.iter().filter(|row| row.contains("w0")).collect();
+        assert!(
+            caption_rows.len() >= 2,
+            "caption did not wrap: {caption_rows:?}"
+        );
+        let start = caption_rows
+            .iter()
+            .find(|row| row.contains("w001"))
+            .expect("caption start is not on screen");
+        assert!(
+            !start.chars().take(40).any(|c| c == 'w'),
+            "caption spilled into the frame half: {start:?}"
+        );
+
+        let rendered: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(
+            !rendered.contains("w300"),
+            "the caption spilled past its viewport"
+        );
+
+        // The fixed rows survive the long caption, and the frame viewport is
+        // unaffected by it.
+        assert!(rendered.contains("Reply"), "action bar was squeezed out");
+        assert!(rendered.contains("esc ▸ close"), "hint was squeezed out");
+        assert!(rendered.contains("⏸ Video · 00:02 / 00:12"), "status lost");
+        assert!(rendered.contains('█'), "progress strip was squeezed out");
+        assert!(
+            rendered.contains("Loading"),
+            "frame viewport collapsed under a long caption"
+        );
+        assert!(
+            rows.iter()
+                .filter(|row| row.contains("Reply") || row.contains("esc ▸ close"))
+                .all(|row| !row.contains("w0")),
+            "the caption overran the fixed rows"
+        );
+
+        // The caption column scrolls with the popup, so an over-scrolled
+        // viewport pushes it out of sight instead of pinning it.
+        popup.scroll_idx = 99;
+        let mut buf = Buffer::empty(area);
+        (&mut PopUp::new(tag)).render(area, &mut buf, &mut popup);
+        let scrolled: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(
+            !scrolled.contains("w001"),
+            "the caption ignored the popup scroll"
+        );
+    }
+
+    #[tokio::test]
+    async fn paused_video_without_duration_shows_icon_and_unknown_time() {
+        let mut popup = video_popup(
+            video_message("clip"),
+            Some(video_playback(PlayState::Paused, 0.0, 0.0)),
+            None,
+        );
+
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        let tag = app_state().await.chat_state.get_tag().unwrap_or("");
+        (&mut PopUp::new(tag)).render(area, &mut buf, &mut popup);
+
+        let rendered: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(
+            rendered.contains("⏸ Video · 00:00 / --:--"),
+            "paused icon or unknown duration missing: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn video_popup_renders_error_note_in_bottom_border() {
+        let mut popup = video_popup(
+            video_message("clip"),
+            Some(video_playback(PlayState::Error, 0.0, 0.0)),
+            Some("no ffmpeg on PATH".into()),
+        );
+
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        let tag = app_state().await.chat_state.get_tag().unwrap_or("");
+        (&mut PopUp::new(tag)).render(area, &mut buf, &mut popup);
+
+        let rendered: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(rendered.contains("no ffmpeg on PATH"), "error note missing");
+    }
+
+    #[tokio::test]
     async fn audio_popup_renders_error_note_in_bottom_border() {
         let mut popup = PopupState {
+            focused: false,
             popup_type: PopupKind::Audio(AudioPopup {
                 msg: audio_message(),
                 error_note: Some("download failed: WA not found".into()),
@@ -4052,6 +5617,7 @@ mod tests {
             }),
             prev_focus: Focus::Chat,
             scroll_idx: 0,
+            focused: false,
         };
         let area = Rect::new(0, 0, 80, 24);
         let mut buf = Buffer::empty(area);
@@ -4362,5 +5928,28 @@ mod tests {
             Some(&target.message_id),
             "the voice note must quote the popup message"
         );
+    }
+
+    #[tokio::test]
+    async fn copies_text_to_clip() {
+        let clipboard = Clipboard::new().ok();
+        let mut state = app_state().await;
+        state.clipboard = clipboard;
+        let test = String::from("test");
+
+        match state.copy_to_clipboard(test.clone()) {
+            Ok(_) => {
+                let res = state
+                    .clipboard
+                    .expect("Could not get clipboard")
+                    .get_text()
+                    .expect("Could not get_text");
+
+                assert_eq!(res, test);
+            }
+            Err(err) => {
+                panic!("{err}")
+            }
+        };
     }
 }

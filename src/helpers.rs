@@ -30,8 +30,9 @@ pub fn available_message_actions(message: &crate::backend::Message) -> Vec<Messa
         return Vec::new();
     }
 
-    let mut actions = Vec::with_capacity(3);
+    let mut actions = Vec::with_capacity(4);
     actions.push(MessageAction::Reply);
+    actions.push(MessageAction::Copy);
 
     if message.from_me {
         actions.extend([MessageAction::Edit, MessageAction::Delete]);
@@ -153,7 +154,7 @@ mod tests {
     fn sample_message(from_me: bool, pending: bool, failed: bool) -> Message {
         Message {
             message_id: MessageId::from("msg-1"),
-            chat: ChatId::Myself,
+            chat_id: ChatId::Myself,
             sender: if from_me { "You".into() } else { "Them".into() },
             author_id: None,
             text: "hello".to_string(),
@@ -172,7 +173,7 @@ mod tests {
     fn incoming_messages_only_offer_reply() {
         let message = sample_message(false, false, false);
         let actions = available_message_actions(&message);
-        assert_eq!(actions, vec![MessageAction::Reply]);
+        assert_eq!(actions, vec![MessageAction::Reply, MessageAction::Copy]);
     }
 
     #[test]
@@ -183,6 +184,7 @@ mod tests {
             actions,
             vec![
                 MessageAction::Reply,
+                MessageAction::Copy,
                 MessageAction::Edit,
                 MessageAction::Delete
             ]

@@ -162,7 +162,7 @@ fn normalize_telegram_message(
 
     Message {
         message_id: telegram_message_id(msg),
-        chat: chat.clone(),
+        chat_id: chat.clone(),
         sender,
         author_id: None,
         text,

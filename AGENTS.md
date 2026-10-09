@@ -33,10 +33,16 @@ types.
   `Chat`/`Message`/`BackendEvent`/`BackendError`, `MessageId`/`ChatId` (provider
   routing), the `MessengerKind` delegation enum/macro.
 - `src/backend/telegram.rs` — grammers implementation (reference backend).
-- `src/backend/whatsapp.rs` — whatsapp-rust implementation (stub/in progress).
+- `src/backend/whatsapp/` — whatsapp-rust implementation: `messenger.rs`
+  (lifecycle + `Messenger` impl), `events.rs`, `state.rs`, `ids.rs`,
+  `convert.rs`, `sync.rs`, `transport.rs`, `media.rs`.
 - `src/backend/mock.rs` — `MockMessenger` used by startup mode and tests.
 - `src/config.rs` — keymap parsing, provider config, save/load.
 - `src/main.rs` — logging, config load, provider construction.
+- `src/notify.rs` — `Notice` (what a new message is reduced to: chat name,
+  body, provider), the suppression rules (redelivery dedup, per-messenger
+  cooldown) and the two sinks they dispatch to: cue bytes for the player, and
+  `OsNotifier` for the desktop.
 - `src/tui/mod.rs` — event loop, key dispatch, rendering.
 - `src/tui/state.rs` — `AppState`: focus, selection, drafts, login flow, backend
   events.
@@ -63,6 +69,16 @@ types.
 - Event flow: provider → `BackendEvent` → `AppState::handle_backend_event` →
   `ChatState`. Push updates are authoritative where available; polling
   (`chat_poll_interval_secs`, `chat_list_sync_secs`) is the fallback.
+- Notifications hang off `BackendEvent::MessageReceived` **only**. `to_notice`
+  rejects visible messages, your own messages and the `Myself` conversation. A
+  new provider therefore gets notifications by emitting that one event — it must
+  not add notification code, and must not notify from a poll or history load.
+- A message counts as *visible* (hence never announced) only when its chat is
+  open **and** the terminal window has focus — `AppState::focused`, fed by
+  crossterm `FocusGained`/`FocusLost` via `UiEvent::WindowFocused`. The unread
+  badge keys on `is_open` alone; that divergence is deliberate (an unfocused open
+  chat is announced but not badged, since the message is already in the open
+  chat's history). Don't "fix" either gate to match the other.
 
 ## Backend integration docs — read before editing providers
 
@@ -101,9 +117,10 @@ dep is temporary and must not be treated as authoritative:
   (`Backend` trait).
 - Protocol ground truth: <https://github.com/oxidezap/whatspec> (structured
   WhatsApp Web IR).
-- Pin version expectations to the `whatsapp-rust` entry in `Cargo.toml` and
-  check `Cargo.lock` before assuming any API; verify signatures in the pinned
-  source above rather than guessing from memory.
+- Pin version expectations to the `whatsapp-rust` entry in `Cargo.toml`
+  (currently rev `24652ea9e5fce77b56c2bc7a900ea06209a87da8`) and check
+  `Cargo.lock` before assuming any API; verify signatures in the pinned source
+  above rather than guessing from memory.
 
 Both deps are version-pinned (`grammers-client 0.10`, `whatsapp-rust` entry in
 `Cargo.toml`). Do not suggest APIs from older/newer versions without checking

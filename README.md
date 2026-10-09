@@ -1,27 +1,34 @@
 # Welcome to Sender!
 
 <!--toc:start-->
-
 - [Welcome to Sender!](#welcome-to-sender)
   - [System requirements](#system-requirements)
-    - [Linux](#linux)
-    - [macOS](#macos)
-    - [Windows](#windows)
+    - [Requirements for **audio recording**](#requirements-for-audio-recording)
+      - [Linux](#linux)
+      - [macOS](#macos)
+      - [Windows](#windows)
+    - [Requirements for OS Notifications](#requirements-for-os-notifications)
+      - [Linux](#linux-1)
+      - [macOS — the presenting application is identified by the **bundle](#macos-the-presenting-application-is-identified-by-the-bundle)
+      - [Windows](#windows-1)
   - [Features](#features)
   - [Configuration](#configuration)
     - [Example `config.toml`:](#example-configtoml)
       - [Top-level options](#top-level-options)
+      - [Notifications](#notifications)
       - [Providers](#providers)
     - [Telegram Setup](#telegram-setup)
     - [WhatsApp Setup](#whatsapp-setup)
+      - [Session and cache files](#session-and-cache-files)
+      - [Manual cold-start smoke test](#manual-cold-start-smoke-test)
   - [Controls / Key Bindings](#controls-key-bindings)
   - [Limitations](#limitations)
     - [Telegram (grammers / Telegram protocol)](#telegram-grammers-telegram-protocol)
     - [WhatsApp (whatsapp-rust / WhatsApp Web protocol)](#whatsapp-whatsapp-rust-whatsapp-web-protocol)
+  - [Development](#development)
   - [Built with](#built-with)
   - [Demo](#demo)
   - [Inspirations](#inspirations)
-
 <!--toc:end-->
 
 Sender is an TUI app for interacting with Whatsapp AND telegram (maybe more in
@@ -37,7 +44,9 @@ Building needs only the Rust toolchain plus the system audio libraries used for
 **recording** (Playback needs no extra libs — opus-pure decodes Opus in pure
 Rust):
 
-### Linux
+### Requirements for **audio recording**
+
+#### Linux
 
 1. ALSA dev libraries
 
@@ -46,16 +55,45 @@ Rust):
 
 2. `pkg-config` (cpal uses ALSA for input).
 
-### macOS
+#### macOS
 
 - Xcode Command Line Tools — CoreAudio is linked automatically.
 
-### Windows
+#### Windows
 
 None — WASAPI is linked automatically.
 
 At runtime, a working microphone/input device is required to use voice-note
 recording.
+
+### Requirements for OS Notifications
+
+The **OS notification** goes through each platform's own mechanism, and on every
+platform something outside `senders` has to be there to present it:
+
+#### Linux
+
+A D-Bus **session bus** plus a notification daemon that owns
+`org.freedesktop.Notifications` (GNOME, KDE Plasma...). Sendrs uses
+[notify-rust](https://docs.rs/crate/notify-rust/latest) as a notification sender
+crate, check their docs for details. With no session bus, it fails immediately,
+and `senders` logs it in `sender.log` and carries on. Sound cues are unaffected.
+
+#### macOS — the presenting application is identified by the **bundle
+
+identifier of the running process**, so `senders` has to be shipped inside an
+`.app` bundle to be identified correctly. `appname("sender")` is ignored on
+macOS, and an unbundled binary has no bundle identifier, so the notification
+backend falls back to `com.apple.Finder` and a banner is attributed to the wrong
+application. Sound cues are unaffected.
+
+#### Windows
+
+Toasts are attributed to an **AppUserModelID**. `senders` sets none, so the
+notification backend falls back to PowerShell's ID: the toast still appears, but
+grouped under and attributed to PowerShell. A real AUMID means registering a
+Start-menu shortcut, which is an install-time step rather than something the app
+can do for itself.
 
 ## Features
 
@@ -64,19 +102,22 @@ recording.
 - [x] Configurable
 - [x] Draft / Myself conversation - using wp/tg integrated self chat
 - [ ] Help menu Popup to show keymaps
+- [ ] crates.io build - Make the binary available in `cargo install`
 - [x] Descriptive error handling
-- [ ] WhatsApp integration
-- [ ] Message actions (reply, edit, delete) for whatsapp
-- [ ] Copy messages' text to clipboard
+- [x] WhatsApp integration - Core WhatsApp integration
+- [x] Message actions (reply, edit, delete) for whatsapp
+- [x] Copy messages' text to clipboard
 - [x] Telegram integration
 - [x] Message actions (reply, edit, delete) for telegram
 - [x] **Telegram** - Support for endless chat scroll.
 - [x] **WhatsApp** - Support for endless chat scroll.
 - [x] Image rendering
 - [x] Audio playback
-- [ ] Send images - TODO: check if possible: send images + "paste to send"
-- [ ] Send audio - TODO: check if possible: send audio
-- [ ] Support for notifications
+- [ ] Send images / video / files - the provider backends can upload media, but
+      the TUI has no path to attach them: only audio (voice notes) is composed
+      in-app
+- [x] Send audio
+- [x] Support for notifications
 - [x] Ordered chat list - All chats, ordered by pinned/most recent.
 - [ ] Dedicated chatlist for each provider
 - [x] Chat List/Message search.
@@ -101,19 +142,25 @@ sync_update_state_secs = 60
 chat_list_sync_secs = 10
 
 [keys]
+search_text = "/"
 scroll_up = "k"
 scroll_down = "j"
 select = "enter"
-pane_next = "tab"
 pane_prev = "shift+tab"
+pane_next = "tab"
 dismiss = "esc"
 quit = "ctrl+c"
 open_settings = "s"
 focus_write = "i"
+scroll_to_top = "g"
 scroll_to_bottom = "G"
 send = "enter"
 newline = "shift+enter"
 retry_connection = "r"
+record_voice = "a"
+play_pause = "space"
+seek_back = "<"
+seek_forward = ">"
 
 [providers.telegram]
 enabled = true
@@ -122,6 +169,16 @@ api_hash = "your_api_hash_here"
 
 [providers]
 whatsapp = false
+
+[notifications]
+os = true
+sound = true
+debounce_ms = 1500
+
+[notifications.sounds]
+telegram = "/home/you/sounds/tg.wav"
+# A blank value mutes that messenger only, and deleting the key does the same.
+whatsapp = ""
 ```
 
 > [!NOTE]
@@ -136,6 +193,36 @@ whatsapp = false
 | `chat_poll_interval_secs` | `10`    | Fallback interval (in seconds) for reconciling messages in the **currently open** chat (any provider) when push updates are unavailable. Lower values feel more responsive but use more resources.                                                                                                                                               |
 | `sync_update_state_secs`  | `120`   | Telegram-only. How often (in seconds) the Telegram client persists its internal update-state (pts/qts/seq) to the session file. This does **not** call any Telegram API — it only saves local state so that `catch_up` on restart is faster. I recommend setting a high value, because it does consume Disk IO                                   |
 | `chat_list_sync_secs`     | `10`    | How often (in seconds) the TUI fetches the full chat list from the enabled providers (Telegram and WhatsApp) to detect **unread-count changes across all chats**. This is the mechanism that updates unread indicators on chats you are not currently viewing. Increase this if you notice high CPU usage; decrease it for snappier unread dots. |
+
+#### Notifications
+
+New messages in chats you are **not** currently viewing or if the app is not on
+focus can raise a sound cue and/or your OS's own notification. Both are off by
+default, and every key is optional — a config file without a `[notifications]`
+table stays silent.
+
+| Key                         | Default | Description                                                                                                                                                                                                                                  |
+| --------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `notifications.os`          | `false` | Global on/off switch for the **OS** notification (D-Bus toast / banner). Off means no desktop notification is ever requested, on any platform.                                                                                               |
+| `notifications.sound`       | `false` | Global on/off switch for the **sound cue**. The two switches are independent, so you can run sound-only (no session bus needed) or notifications-only.                                                                                       |
+| `notifications.debounce_ms` | `1500`  | How long one messenger coalesces a burst of new messages into a single notification. A group that drops 20 messages at once produces one sound _and_ one desktop notification. Use `0` to notify on **every** message.                       |
+| `notifications.sounds`      | `{}`    | Per-messenger sound file, keyed by messenger name (`telegram`, `whatsapp`). **A messenger with no entry plays no sound** — this is how you silence one messenger only. A blank value (`""`) counts as no sound, same as leaving the key out. |
+
+> [!NOTE]
+> A cue never interrupts audio: while a voice note is loaded — **including while
+> it is only paused, not playing** — or playing, a cue is **dropped, not
+> queued**, and the voice note keeps its position and stays replayable. A cue
+> dropped this way is not played afterwards, so a busy audio session costs you
+> notifications rather than playback. There is no per-chat mute and no per-chat
+> sound yet.
+
+> [!NOTE]
+> Sound files go through the same decoder as the audio popup, so any format that
+> plays in the popup plays here too (`wav`, `mp3`, `flac`, `m4a`, `ogg`;
+> Opus-in-Ogg is decoded natively). Paths may be absolute or relative to the
+> directory you run `senders` from. A path that cannot be read is reported in
+> `sender.log` at startup and that messenger is then silent — it is not retried
+> per message.
 
 #### Providers
 
@@ -184,6 +271,24 @@ WhatsApp has no credentials — pairing happens through a QR code:
 3. Once linked, the session is stored under `wa.db` in the same directory as the
    config file, so the next launch is already paired (no QR needed).
 
+#### Session and cache files
+
+All state lives in the config directory (see [Configuration](#configuration)):
+
+- `wa.db` (with its `-wal` / `-shm` companions) — the WhatsApp session: your
+  linked-device keys.
+- `wp_cache.json` — the WhatsApp account cache: chat list, message history, push
+  names and media references.
+- `chats.json` — the chat-list rows shared by both providers.
+- `tg_session.sqlite` — the Telegram session.
+
+WhatsApp's `wa.db` and `wp_cache.json` (like `config.toml` and `chats.json`) are
+written owner-only (`0600`) and repaired to that mode whenever they are opened;
+`tg_session.sqlite` is created by SQLite under your process umask. Logs go to
+`sender.log` in the OS data directory (`~/.local/share/sender/` on Linux). Treat
+these files as secrets — they are never committed to the repository, and
+credentials and session keys are never written to the log.
+
 > [!NOTE]
 > Closing Senders gracefully disconnects but **never logs your device out of
 > WhatsApp** — your linked device stays active. To remove it, unlink it from the
@@ -196,22 +301,43 @@ WhatsApp has no credentials — pairing happens through a QR code:
 > seconds and keeps whatever is currently cached (scroll up again later to
 > retry).
 
+#### Manual cold-start smoke test
+
+WhatsApp only starts its transport once the TUI has registered every backend
+event receiver, and only when the provider is enabled; a disabled provider stays
+dormant (no connection, no QR). To exercise the offline-recovery path:
+
+1. Pair a dedicated account.
+2. Close Senders.
+3. Send messages from another account, including one group message with media.
+4. Restart Senders with WhatsApp enabled.
+5. Verify the messages are recovered exactly once — no duplicates — including
+   the group message and its media.
+6. Repeat the steps, interrupting the sync before it finishes, and verify
+   recovery still completes on the next start.
+
 ## Controls / Key Bindings
 
-| Keys        | Pane / Mode   | Action                                                                                                                                                                  |
-| ----------- | ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `j/k`       | -             | go up (k) or down (j)                                                                                                                                                   |
-| `Enter`     | Chat list     | select chat                                                                                                                                                             |
-| `Tab`       | -             | Change pane focus (Chat list → Chat → Write)                                                                                                                            |
-| `Esc`       | -             | Remove focus from 'write message' or dismiss error/info dialog                                                                                                          |
-| `Ctrl+c`    | -             | Quit app                                                                                                                                                                |
-| `s`         | Normal mode   | open settings                                                                                                                                                           |
-| `i`         | Chat          | Focus on 'write message'                                                                                                                                                |
-| `PgUp/PgDn` | Chat          | Page up / down on chat history (fixed, not configurable)                                                                                                                |
-| `Enter`     | Write message | Send message (configurable)                                                                                                                                             |
-| `Alt+Enter` | Write message | Insert newline. `Shift+Enter` also works but only on terminals that report modifier keys on Enter (kitty, foot, WezTerm, Alacritty; not GNOME Terminal or a plain TTY). |
-| `Enter`     | Settings      | Select items (use j/k for scrolling)                                                                                                                                    |
-| `r`         | Normal mode   | Force a reconnect when a provider is stuck in the "connection lost" state (e.g. after consecutive Telegram-stream failures)                                             |
+| Keys        | Pane / Mode      | Action                                                                                                                                                                  |
+| ----------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `j/k`       | -                | go up (k) or down (j)                                                                                                                                                   |
+| `Enter`     | Chat list        | select chat                                                                                                                                                             |
+| `Tab`       | -                | Change pane focus (Chat list → Chat → Write)                                                                                                                            |
+| `Esc`       | -                | Remove focus from 'write message' or dismiss error/info dialog                                                                                                          |
+| `Ctrl+c`    | -                | Quit app                                                                                                                                                                |
+| `s`         | Normal mode      | open settings                                                                                                                                                           |
+| `i`         | Chat             | Focus on 'write message'                                                                                                                                                |
+| `PgUp/PgDn` | Chat             | Page up / down on chat history (fixed, not configurable)                                                                                                                |
+| `Enter`     | Write message    | Send message (configurable)                                                                                                                                             |
+| `Alt+Enter` | Write message    | Insert newline. `Shift+Enter` also works but only on terminals that report modifier keys on Enter (kitty, foot, WezTerm, Alacritty; not GNOME Terminal or a plain TTY). |
+| `Enter`     | Settings         | Select items (use j/k for scrolling)                                                                                                                                    |
+| `r`         | Normal mode      | Force a reconnect when a provider is stuck in the "connection lost" state (e.g. after consecutive Telegram-stream failures)                                             |
+| `/`         | Chat / Chat List | Search for Messages in Chat or Chats in Chat List                                                                                                                       |
+| `g`         | Chat / Chat List | Go to the top of the list                                                                                                                                               |
+| `a`         | Chat / Pop Up    | Press and hold to start audio recording -> release to send. Chat: send audio to chat. Select message: reply to message with audio                                       |
+| `Space`     | Pop Up           | Play/pause media playback in Popup                                                                                                                                      |
+| `<`         | Pop Up           | Seek back                                                                                                                                                               |
+| `>`         | Pop Up           | Seek forward                                                                                                                                                            |
 
 > All keys except `PgUp/PgDn` are configurable in the config file.
 
@@ -241,6 +367,13 @@ libraries already support but senders has not wired up yet are not listed here.
   history-sync blobs uploaded by the linked phone; requesting older messages
   asks the phone and returns nothing while it is offline. Only newsletters are
   served history from the server.
+- **Offline recovery is phone-dependent and bounded.** Messages that arrive
+  while Senders is closed come back only when the linked phone is online and
+  delivers its history/offline sync — there is no server-side replay. The
+  automatic full sync requests at most the last 365 days of history, and an
+  interrupted sync resumes on the next start. The
+  [manual cold-start smoke test](#manual-cold-start-smoke-test) verifies this
+  path end to end.
 - **No server "list chats" API.** There is no endpoint that returns the chat
   list; it must be reconstructed locally from history-sync blobs and push
   events.
@@ -248,6 +381,23 @@ libraries already support but senders has not wired up yet are not listed here.
   account (QR code, pair code or passkey).
 - **Queued offline sending is not possible.** Outbound messages require a live
   WebSocket connection.
+
+## Development
+
+- **Testing:** `cargo test` is fully offline and deterministic: no credentials,
+  no network, fake JIDs — the WhatsApp suite drives real provider events through
+  the real dispatch (adapter → messenger → TUI boundary) and CI runs it
+  unchanged. Anything that needs a real account — QR pairing, reconnect,
+  cold-start recovery — is covered only by the
+  [manual smoke test](#manual-cold-start-smoke-test) and must never run in CI:
+  no credentials, QR captures, `wa.db` or `wp_cache.json` belong in the
+  repository.
+- **Dependency pinning:** `whatsapp-rust` is pinned to rev
+  `24652ea9e5fce77b56c2bc7a900ea06209a87da8` in `Cargo.toml`. It builds with
+  `default-features = false` + `sqlite-storage` (system `libsqlite3`);
+  `sqlite-storage-bundled` must stay off — the bundled library would export a
+  second set of `sqlite3` symbols next to grammers-session's `libsql-ffi` and
+  break linking. CI rejects that feature combination explicitly.
 
 ## Built with
 

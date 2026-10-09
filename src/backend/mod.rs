@@ -1,5 +1,4 @@
-/// The mock provider is used only by tests: it must not ship in the binary.
-#[cfg(test)]
+/// The mock provider is used for testing and demo mode.
 pub mod mock;
 pub mod telegram;
 pub mod whatsapp;
@@ -12,11 +11,12 @@ use tokio::sync::broadcast;
 use whatsapp_rust::Jid;
 
 use crate::{
-    backend::{telegram::TelegramMessenger, whatsapp::WhatsAppMessenger},
+    backend::{mock::MockMessenger, telegram::TelegramMessenger, whatsapp::WhatsAppMessenger},
     config::ProvidersConfig,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
 /// Main struct that defines available Messengers
 pub enum Provider {
     Telegram,
@@ -249,7 +249,7 @@ pub struct ReplyContext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageAction {
     // TODO: implement "forward" -> forward messages to other users
-    // TODO: implement "copy" -> the user should be able to easily copy message contents
+    Copy,
     Reply,
     Edit,
     Delete,
@@ -319,7 +319,7 @@ pub enum OutboundMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub message_id: MessageId,
-    pub chat: ChatId,
+    pub chat_id: ChatId,
     pub sender: String,
     /// The author's raw provider-specific id (e.g. a WhatsApp participant LID).
     /// Opaque to the UI; used to route per-author protocol actions such as
@@ -337,6 +337,8 @@ pub struct Message {
     pub reply_to_id: Option<MessageId>,
 
     /// Set when this message quotes an earlier one (the reply target).
+    /// TODO: Add more context to messages in message list:
+    /// message item in Chat should show "XXX replied to 'yyy'" instead of "{who} replied"
     pub reply_ctx: Option<ReplyContext>,
     /// Truthy for an optimistic outgoing echo still awaiting confirmation.
     /// When `pending` and `failed` are both false the message is confirmed.
@@ -488,6 +490,34 @@ pub trait Messenger: Send + Sync {
     }
     /// Messenger provider >>> Client message handling
     fn subscribe(&self) -> broadcast::Receiver<BackendEvent>;
+    /// Move the provider from `constructed/dormant` to `started`.
+    ///
+    /// The lifecycle every provider follows is:
+    ///
+    /// ```text
+    /// constructed/dormant -> explicitly enabled -> started -> connected/paired
+    /// constructed/dormant -> disabled (no transport, no provider fetch)
+    /// started -> disabled (`disconnect` stops the transport in place)
+    /// stopped -> explicitly enabled again -> fresh start from the same session
+    /// started -> graceful shutdown
+    /// ```
+    ///
+    /// Only this call (and the actions that reach it) may open a transport, so
+    /// `new`, `subscribe`, `is_authenticated` and a disabled-provider chat-list
+    /// poll all stay inert. The TUI calls it once per enabled provider, after
+    /// every event receiver is registered, so a late subscription can never drop
+    /// the first `Connected` / `QrCode` event. Implementations must be
+    /// idempotent: enabling a provider later may call this again, including
+    /// after a [`Messenger::disconnect`], which must produce a fresh run built
+    /// from the provider's durable session (no logout, no pairing screen).
+    ///
+    /// Returns `Err` when the run could not be brought up (e.g. the durable
+    /// store could not be reopened), letting the caller roll the lifecycle
+    /// back. The default is a no-op for providers whose transport is already
+    /// live by the time they are constructed.
+    async fn start(&self) -> Result<(), BackendError> {
+        Ok(())
+    }
     /// Optional provider-specific status for a chat, such as Telegram online/last-seen information.
     /// The default is `None`; a provider may fill this in later without changing the UI contract.
     async fn status(&self, _chat: &ChatId) -> Result<Option<String>, BackendError> {
@@ -502,7 +532,12 @@ pub trait Messenger: Send + Sync {
     async fn reconnect(&self) -> Result<(), BackendError> {
         Ok(())
     }
-    /// Graceful shutdown: flush pending work, close transport, stop background tasks.
+    /// Stop the provider in place: signal the transport to stop reconnecting,
+    /// await the run task, stop background tasks, flush cached state. The
+    /// durable session (`wa.db`/`wp_cache.json` equivalents) is kept — this is
+    /// a disable, not a logout — so a later [`Messenger::start`] may build a
+    /// fresh run from it. Idempotent: repeated calls, including calls during
+    /// startup, reconnect or shutdown, are safe no-ops after the first.
     async fn disconnect(&mut self) -> Result<(), BackendError>;
     /// Abort an in-progress login flow, discarding any pending tokens/state.
     async fn cancel_login(&mut self) {}
@@ -533,6 +568,7 @@ pub trait Messenger: Send + Sync {
 pub enum MessengerKind {
     Telegram(TelegramMessenger),
     WhatsApp(WhatsAppMessenger),
+    Mock(Provider, MockMessenger),
     #[cfg(test)]
     Stub(Provider, Box<dyn Messenger>),
 }
@@ -542,6 +578,7 @@ impl Clone for MessengerKind {
         match self {
             Self::Telegram(m) => Self::Telegram(m.clone()),
             Self::WhatsApp(m) => Self::WhatsApp(m.clone()),
+            Self::Mock(p, m) => Self::Mock(*p, m.clone()),
             #[cfg(test)]
             Self::Stub(..) => panic!("MessengerKind::Stub is not cloneable"),
         }
@@ -553,6 +590,7 @@ macro_rules! delegate_match {
         match $self {
             Self::Telegram(m) => m.$name($($args),*).await,
             Self::WhatsApp(m) => m.$name($($args),*).await,
+            Self::Mock(_, m) => m.$name($($args),*).await,
             #[cfg(test)]
             Self::Stub(_, m) => m.$name($($args),*).await,
         }
@@ -561,6 +599,7 @@ macro_rules! delegate_match {
         match $self {
             Self::Telegram(m) => m.$name($($args),*),
             Self::WhatsApp(m) => m.$name($($args),*),
+            Self::Mock(_, m) => m.$name($($args),*),
             #[cfg(test)]
             Self::Stub(_, m) => m.$name($($args),*),
         }
@@ -600,6 +639,7 @@ impl MessengerKind {
         match self {
             Self::Telegram(_) => Provider::Telegram,
             Self::WhatsApp(_) => Provider::WhatsApp,
+            Self::Mock(p, _) => *p,
             #[cfg(test)]
             Self::Stub(provider, _) => *provider,
         }
@@ -617,6 +657,7 @@ impl MessengerKind {
         , async fn edit(&self, chat: &ChatId, id: &MessageId, text: &str) -> Result<(), BackendError> ;
         , async fn media_bytes(&self, chat: &ChatId, message_id: &MessageId) -> Result<Option<Vec<u8>>, BackendError> ;
         , fn subscribe(&self) -> broadcast::Receiver<BackendEvent> ;
+        , async fn start(&self) -> Result<(), BackendError> ;
         , async fn status(&self, chat: &ChatId) -> Result<Option<String>, BackendError> ;
         , async fn cancel_chat_refresh(&self) -> () ;
         , async fn reconnect(&self) -> Result<(), BackendError> ;
