@@ -1,7 +1,6 @@
 # Welcome to Sender!
 
 <!--toc:start-->
-
 - [Welcome to Sender!](#welcome-to-sender)
   - [System requirements](#system-requirements)
     - [Requirements for **audio recording**](#requirements-for-audio-recording)
@@ -29,7 +28,6 @@
   - [Development](#development)
   - [Built with](#built-with)
   - [Inspirations](#inspirations)
-
 <!--toc:end-->
 
 Sender is an TUI app for interacting with Whatsapp AND telegram (maybe more in

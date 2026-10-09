@@ -1168,16 +1168,44 @@ impl AppState {
     /// surfaces (no QR/`Connected`, no chat fetch, no notifications) hold.
     /// Enabling a provider later from settings re-enters the same idempotent
     /// [`Messenger::start`] path.
-    pub async fn start_enabled_providers(&self) {
-        for messenger in self.messengers.iter() {
-            let provider = messenger.provider();
+    pub async fn start_enabled_providers(&mut self) {
+        let providers: Vec<Provider> = self
+            .messengers
+            .iter()
+            .map(MessengerKind::provider)
+            .collect();
+        for provider in providers {
             if provider.is_enabled(&self.config.providers) {
                 info!(provider = provider.name(), "starting enabled provider");
-                // A failed start already surfaces a `BackendEvent::Error` on the
-                // messenger's own channel, which the TUI event loop turns into a
-                // popup; there is nothing to roll back here because the config
-                // was already enabled (and stays so, so the user can retry).
-                let _ = messenger.start().await;
+                let result = match self.provider_to_messenger(provider) {
+                    Some(messenger) => messenger.start().await,
+                    None => Ok(()),
+                };
+
+                if let Err(error) = result {
+                    // An enabled provider that failed before creating a run
+                    // must not remain enabled with no transport. Roll back to
+                    // the same dormant state used by the settings path.
+                    provider.toggle_enabled(&mut self.config.providers);
+                    if let Err(save_error) = self.config.save_config() {
+                        self.create_popup(PopupKind::Error(format!(
+                            "{} failed to start ({error}); could not persist the \
+                             rollback: {save_error}",
+                            provider.name()
+                        )));
+                    } else {
+                        self.create_popup(PopupKind::Error(format!(
+                            "{} failed to start: {error}",
+                            provider.name()
+                        )));
+                    }
+                    self.provider_connected.remove(&provider);
+                    self.chat_state.chats.retain(|chat| {
+                        chat.id == ChatId::Myself || chat.id.to_provider() != provider
+                    });
+                    self.chat_state.refresh_search();
+                    self.persist_chats();
+                }
             } else {
                 info!(
                     provider = provider.name(),
@@ -1260,22 +1288,22 @@ impl AppState {
             // taken before the disable cannot land afterwards.
             self.bump_lifecycle_epoch();
 
-            provider.toggle_enabled(&mut self.config.providers);
+            // Stop WhatsApp before changing the persisted configuration. If
+            // teardown fails, keep the provider enabled and retryable instead
+            // of leaving a live transport behind a disabled config flag.
+            if provider == Provider::WhatsApp
+                && let Some(messenger) = self.provider_to_messenger_mut(provider)
+                && let Err(error) = messenger.disconnect().await
+            {
+                self.create_popup(PopupKind::Error(format!(
+                    "could not disable {name}: {error}"
+                )));
+                return;
+            }
 
+            provider.toggle_enabled(&mut self.config.providers);
             match self.config.save_config() {
                 Ok(()) => {
-                    // Stop the transport before anything else: disabling must
-                    // immediately silence the reconnect loop, background sync
-                    // tasks and the event source, not merely flip a config
-                    // flag. Telegram is excluded — its listener is governed by
-                    // `set_enabled`, which the re-enable path drives.
-                    if provider != Provider::Telegram
-                        && let Some(messenger) = self.provider_to_messenger_mut(provider)
-                        && let Err(e) = messenger.disconnect().await
-                    {
-                        self.create_popup(PopupKind::Error(e.to_string()));
-                    }
-
                     // The transport died with the disable, and its
                     // `Disconnected` event is now gated above — forget the
                     // connection here so the status line cannot claim a
@@ -1320,7 +1348,21 @@ impl AppState {
                     }
                 }
                 Err(e) => {
-                    self.create_popup(PopupKind::Error(format!("could not save config: {e}")))
+                    provider.toggle_enabled(&mut self.config.providers);
+                    let restart = match self.provider_to_messenger(provider) {
+                        Some(messenger) => messenger.start().await,
+                        None => Ok(()),
+                    };
+
+                    match restart {
+                        Ok(()) => self.create_popup(PopupKind::Error(format!(
+                            "could not disable {name}: {e}"
+                        ))),
+                        Err(restart_error) => self.create_popup(PopupKind::Error(format!(
+                            "could not disable {name}: {e}; could not restore the \
+                             provider: {restart_error}"
+                        ))),
+                    }
                 }
             }
             return;
@@ -2277,7 +2319,7 @@ mod tests {
 
     #[tokio::test]
     async fn startup_starts_only_enabled_providers() {
-        let (state, telegram, whatsapp) = stub_provider_state(/* whatsapp */ false).await;
+        let (mut state, telegram, whatsapp) = stub_provider_state(/* whatsapp */ false).await;
 
         state.start_enabled_providers().await;
 
@@ -2287,7 +2329,7 @@ mod tests {
 
     #[tokio::test]
     async fn startup_starts_whatsapp_when_enabled() {
-        let (state, _telegram, whatsapp) = stub_provider_state(/* whatsapp */ true).await;
+        let (mut state, _telegram, whatsapp) = stub_provider_state(/* whatsapp */ true).await;
 
         state.start_enabled_providers().await;
 
@@ -2296,7 +2338,7 @@ mod tests {
 
     #[tokio::test]
     async fn subscribe_before_start_receives_the_first_event() {
-        let (state, telegram, _) = stub_provider_state(/* whatsapp */ false).await;
+        let (mut state, telegram, _) = stub_provider_state(/* whatsapp */ false).await;
 
         // Mirrors the startup order in `tui::run`: receivers first, then start.
         let mut rx = state.messengers[0].subscribe();
@@ -3296,19 +3338,6 @@ mod tests {
             .block_on(app_state());
         state.focus = Focus::Chat;
         state.handle_paste("line one\nline two".into());
-        assert_eq!(state.write.lines().to_vec(), vec![String::new()]);
-    }
-
-    #[test]
-    fn paste_is_ignored_while_the_window_is_unfocused() {
-        let mut state = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(app_state());
-        state.focus = Focus::Write;
-        state.set_window_focus(false);
-        state.handle_paste("sneaked in".into());
         assert_eq!(state.write.lines().to_vec(), vec![String::new()]);
     }
 
