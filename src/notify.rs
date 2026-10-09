@@ -12,6 +12,7 @@
 //! invented. That is also why the provider is carried *alongside* the chat
 //! rather than derived from it: `ChatId::to_provider` panics for the "Myself"
 //! conversation, which must never be a notification target.
+// TODO: make 'm' mute notifications in-app
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;

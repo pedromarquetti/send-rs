@@ -47,7 +47,9 @@ pub struct WhatsAppMessenger {
     bot: Arc<Mutex<Option<Bot>>>,
     run_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     tx: Sender<BackendEvent>,
-    state: SharedState,
+    /// Shared run state. `pub(super)` so sibling modules (and their tests) can
+    /// reach the same `SharedState` instance the run loop mutates.
+    pub(super) state: SharedState,
     shutdown: Arc<AtomicBool>,
     /// The most recently issued pairing QR payload (if any), kept so the login
     /// screen can query it synchronously on every frame and refresh on expiry.
@@ -250,9 +252,9 @@ impl Messenger for WhatsAppMessenger {
     /// builds a fresh bot over the same durable session instead — the old
     /// client is terminal once disconnected — so a later enable reconnects
     /// without logout or a new pairing round.
-    async fn start(&self) {
+    async fn start(&self) -> Result<(), BackendError> {
         if self.run_task.lock().unwrap().is_some() {
-            return;
+            return Ok(());
         }
 
         let was_stopped = self.is_shutting_down();
@@ -277,10 +279,11 @@ impl Messenger for WhatsAppMessenger {
                     Ok(bot) => bot,
                     Err(e) => {
                         error!(error = %e, "WhatsApp: could not build a fresh run");
-                        let _ = self
-                            .tx
-                            .send(BackendEvent::Error("WhatsApp failed to start".into(), e));
-                        return;
+                        let _ = self.tx.send(BackendEvent::Error(
+                            "WhatsApp failed to start".into(),
+                            e.clone(),
+                        ));
+                        return Err(e);
                     }
                 }
             }
@@ -291,7 +294,7 @@ impl Messenger for WhatsAppMessenger {
         // assumed): never resurrect a transport the user just disabled.
         if self.is_shutting_down() {
             warn!("WhatsApp: start aborted by an intervening stop");
-            return;
+            return Ok(());
         }
 
         let client = bot.client();
@@ -314,6 +317,7 @@ impl Messenger for WhatsAppMessenger {
         });
 
         self.track_run_task(run_task);
+        Ok(())
     }
 
     async fn is_authenticated(&self) -> bool {
@@ -920,6 +924,19 @@ impl Messenger for WhatsAppMessenger {
         let run_task = self.run_task.lock().unwrap().take();
         if let Some(task) = run_task {
             let _ = task.await;
+        }
+
+        // Abort any detached enrichment this run scheduled, then bump the run
+        // epoch. Aborting stops tasks parked on a network await right away; the
+        // epoch makes a task that already slipped past its last await bail
+        // before mutating state. Together they keep a stopped run from touching
+        // state or the network again, or leaking into a later run.
+        {
+            let mut st = self.state.write().await;
+            for task in st.enrich_tasks.drain(..) {
+                task.abort();
+            }
+            st.run_epoch += 1;
         }
 
         // Flush the final session state now that the run task is done and can

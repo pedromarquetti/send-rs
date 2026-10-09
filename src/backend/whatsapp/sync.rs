@@ -564,7 +564,17 @@ pub(super) async fn enrich_chat_names(
     state: &SharedState,
     cache_path: &Path,
     tx: &Sender<BackendEvent>,
+    run_epoch: u64,
 ) {
+    // The epoch is captured by the spawn site (on the run loop) so a stop that
+    // lands before this task is polled still invalidates it. A mismatch means
+    // the generation that scheduled this enrichment has ended: bail before any
+    // network call or state mutation so a stranded task cannot touch the next
+    // run's data.
+    if state.read().await.run_epoch != run_epoch {
+        return;
+    }
+
     let candidates: Vec<Jid> = {
         let st = state.read().await;
         let own: Vec<String> = [client.pn(), client.lid()]
@@ -605,6 +615,9 @@ pub(super) async fn enrich_chat_names(
     let mut updated = false;
 
     for chunk in candidates.chunks(100) {
+        if state.read().await.run_epoch != run_epoch {
+            return;
+        }
         match client.contacts().is_on_whatsapp(chunk).await {
             Ok(results) => {
                 // Read the push-name cache once for the whole batch; the write
@@ -665,6 +678,11 @@ pub(super) async fn enrich_chat_names(
                 }
 
                 let mut st = state.write().await;
+
+                if st.run_epoch != run_epoch {
+                    return;
+                }
+
                 for (asked_key, name, business, pn_key) in applied {
                     st.usync_attempted.insert(asked_key.clone());
                     let mut keys = vec![asked_key];
@@ -703,6 +721,11 @@ pub(super) async fn enrich_chat_names(
         // frozen bare when their history synced before usync knew them, then
         // persist one snapshot covering chats and messages.
         let mut st = state.write().await;
+
+        if st.run_epoch != run_epoch {
+            return;
+        }
+
         let repaired = st.resolve_stale_senders();
         let chats_snapshot = st.chats.clone();
 

@@ -9,6 +9,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 use whatsapp_rust::Client;
 use whatsapp_rust::prelude::{Jid, MessageExt, MessageField, MessageInfo, wa};
@@ -111,6 +112,22 @@ pub(super) struct WhatsAppState {
     /// held — only proto fields that reference CDN URLs.
     #[serde(skip)]
     pub(super) raw_messages: HashMap<String, WaMessage>,
+    /// Runtime run generation, bumped after each run loop stops. Connect-time
+    /// enrichment spawns as a detached task; it captures this value when
+    /// spawned and bails out on any later mismatch, so a task stranded by a
+    /// stop (disable or restart) can never keep doing network work or mutate
+    /// this state after its generation ended — including into a later run.
+    /// Runtime-only, like `pending_edits`/`raw_messages`.
+    #[serde(skip)]
+    pub(super) run_epoch: u64,
+
+    /// Detached enrichment tasks scheduled by the current run. Registered here
+    /// rather than on the messenger so the spawn sites (which only have the
+    /// shared state) can record them; stopped runs abort them so none can keep
+    /// doing network work or leak into a later run. Finished handles are pruned
+    /// on registration so the list cannot grow without bound.
+    #[serde(skip)]
+    pub(super) enrich_tasks: Vec<JoinHandle<()>>,
 }
 
 /// How many unresolved edits to hold before dropping the newest. Generous

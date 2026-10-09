@@ -819,13 +819,6 @@ impl AppState {
 
     /// Inserts pasted text into the write box if it has focus.
     pub fn handle_paste(&mut self, text: String) {
-        // A paste can still be delivered in the gap before the terminal reports
-        // focus, so drop it rather than typing into a box nobody can see.
-        if !self.focused {
-            debug!("paste ignored while the window is unfocused");
-            return;
-        }
-
         if self.focus == Focus::Write {
             self.write.insert_str(&text);
         }
@@ -1180,7 +1173,11 @@ impl AppState {
             let provider = messenger.provider();
             if provider.is_enabled(&self.config.providers) {
                 info!(provider = provider.name(), "starting enabled provider");
-                messenger.start().await;
+                // A failed start already surfaces a `BackendEvent::Error` on the
+                // messenger's own channel, which the TUI event loop turns into a
+                // popup; there is nothing to roll back here because the config
+                // was already enabled (and stays so, so the user can retry).
+                let _ = messenger.start().await;
             } else {
                 info!(
                     provider = provider.name(),
@@ -1343,21 +1340,14 @@ impl AppState {
 
         // Verify messenger was initialized
         let messenger = match self.provider_to_messenger(provider) {
-            Some(m) => match m {
-                MessengerKind::Telegram(t) => {
+            Some(m) => {
+                if let MessengerKind::Telegram(t) = m {
                     // A configured-but-disabled messenger has no running
                     // listener; enabling it kicks one off so updates flow.
                     t.set_enabled(true);
-                    m
                 }
-                // Every other provider opens its transport through the same
-                // idempotent `start()` the startup sequence uses, including a
-                // rebuild after a previous disable stopped it in place.
-                _ => {
-                    m.start().await;
-                    m
-                }
-            },
+                m
+            }
             None => {
                 self.create_popup(PopupKind::Error(format!(
                     "{name}: messenger could not be initialized"
@@ -1367,10 +1357,36 @@ impl AppState {
         };
 
         if provider == Provider::WhatsApp {
+            // Order matters: flip and persist the enabled flag *before* opening
+            // the transport. A just-started run may emit `Connected` (paired) or
+            // `PairingQrCode` (unpaired) immediately, and `handle_backend_event`
+            // drops events from a disabled provider — starting first would let
+            // that first event be discarded.
             provider.toggle_enabled(&mut self.config.providers);
             match self.config.save_config() {
                 Ok(()) => {
-                    self.create_popup(PopupKind::Info(format!("{name} enabled")));
+                    // Reborrow here: the early `messenger` binding is dead on
+                    // this path, so the config mutation above is unconstrained.
+                    let started = match self.provider_to_messenger(provider) {
+                        Some(m) => m.start().await,
+                        None => Ok(()),
+                    };
+                    if let Err(e) = started {
+                        // The run never came up: roll the lifecycle back so the
+                        // persisted config does not claim a provider that is not
+                        // running. `start()` also emitted an `Error` event, but
+                        // the provider is disabled again, so the gate drops it —
+                        // this popup is the single surface for the failure.
+                        provider.toggle_enabled(&mut self.config.providers);
+                        if let Err(e2) = self.config.save_config() {
+                            self.create_popup(PopupKind::Error(format!(
+                                "could not save config: {e2}"
+                            )));
+                        }
+                        self.create_popup(PopupKind::Error(format!("{name} could not start: {e}")));
+                    } else {
+                        self.create_popup(PopupKind::Info(format!("{name} enabled")));
+                    }
                 }
                 Err(e) => {
                     self.create_popup(PopupKind::Error(format!("could not save config: {e}")))
@@ -2310,6 +2326,70 @@ mod tests {
             "enabling must not flash the login screen — pairing is driven by \
              the QR event, not by a handshake probe"
         );
+    }
+
+    #[tokio::test]
+    async fn enabling_whatsapp_keeps_the_first_event_emitted_by_start() {
+        let (mut state, _, whatsapp) = stub_provider_state(/* whatsapp */ false).await;
+
+        // The event source is subscribed before the enable, exactly as the TUI
+        // event loop does, so the very first event `start()` emits is receivable.
+        let mut rx = state
+            .provider_to_messenger(Provider::WhatsApp)
+            .unwrap()
+            .subscribe();
+
+        state.toggle_provider(Provider::WhatsApp).await;
+        assert_eq!(whatsapp.load(), 1, "the toggle must start WhatsApp");
+
+        // The enable flips and persists the flag *before* opening the transport,
+        // so the first event is not dropped by the disabled-provider gate.
+        assert!(state.config.providers.whatsapp);
+        let event = rx
+            .try_recv()
+            .expect("a freshly started provider must emit its first event");
+        assert!(matches!(event, BackendEvent::Connected));
+        state.handle_backend_event(Provider::WhatsApp, event);
+        assert!(
+            state.provider_connected.contains(&Provider::WhatsApp),
+            "the first event from a just-enabled provider must survive the gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_whatsapp_start_rolls_the_enable_back() {
+        let telegram = StubMessenger::new();
+        let failing = StubMessenger::new().with_start_error(BackendError::Other("no store".into()));
+        let mut config = Config::default();
+        config.providers.telegram.enabled = true;
+        config.providers.whatsapp = false;
+        let keymap = config.keys.parse().unwrap();
+        let mut state = AppState::new(
+            config,
+            keymap,
+            vec![
+                MessengerKind::Stub(Provider::Telegram, Box::new(telegram)),
+                MessengerKind::Stub(Provider::WhatsApp, Box::new(failing)),
+            ],
+            false,
+        )
+        .await;
+
+        state.toggle_provider(Provider::WhatsApp).await;
+
+        assert!(
+            !state.config.providers.whatsapp,
+            "a start that never came up must not leave WhatsApp enabled"
+        );
+        match &state
+            .pop_up
+            .as_ref()
+            .expect("rollback must explain itself")
+            .popup_type
+        {
+            PopupKind::Error(msg) => assert!(msg.contains("could not start")),
+            other => panic!("expected an Error popup, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -3979,6 +4059,7 @@ mod tests {
         send_result: std::sync::Mutex<Option<Result<(), BackendError>>>,
         history_result: std::sync::Mutex<Option<Result<Vec<Message>, BackendError>>>,
         set_read_result: std::sync::Mutex<Option<Result<(), BackendError>>>,
+        start_error: std::sync::Mutex<Option<BackendError>>,
         cancel_refresh_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         start_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         disconnect_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -3993,11 +4074,17 @@ mod tests {
                 send_result: std::sync::Mutex::new(None),
                 history_result: std::sync::Mutex::new(None),
                 set_read_result: std::sync::Mutex::new(None),
+                start_error: std::sync::Mutex::new(None),
                 cancel_refresh_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 start_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 disconnect_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 tx,
             }
+        }
+
+        fn with_start_error(self, err: BackendError) -> Self {
+            *self.start_error.lock().unwrap() = Some(err);
+            self
         }
 
         fn with_chats_error(self, err: BackendError) -> Self {
@@ -4112,12 +4199,16 @@ mod tests {
             self.tx.subscribe()
         }
 
-        async fn start(&self) {
+        async fn start(&self) -> Result<(), BackendError> {
             self.start_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(err) = self.start_error.lock().unwrap().take() {
+                return Err(err);
+            }
             // A started provider announces itself on the same channel a real
             // transport would use for its first `Connected` event.
             let _ = self.tx.send(BackendEvent::Connected);
+            Ok(())
         }
 
         async fn cancel_chat_refresh(&self) {

@@ -13,34 +13,52 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::sync::broadcast::Sender;
+use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use whatsapp_rust::Client;
 use whatsapp_rust::prelude::{Event, Server};
 use whatsapp_rust::wacore::types::message::EditAttribute;
 use whatsapp_rust::wacore_binary::JidExt;
 
+/// Register a detached enrichment task with the run's shared state so a later
+/// stop can abort it. Finished handles are pruned first, keeping the list
+/// bounded across many syncs.
+async fn track_enrich(state: &SharedState, handle: JoinHandle<()>) {
+    let mut st = state.write().await;
+    st.enrich_tasks.retain(|h| !h.is_finished());
+    st.enrich_tasks.push(handle);
+}
+
 impl WhatsAppMessenger {
     /// Called once per established connection, from `handle_event`'s `Connected`
     /// arm — the single authoritative path for it. Past here, message routing is
     /// done by `handle_event`.
-    pub(super) fn handle_connect(
+    pub(super) async fn handle_connect(
         client: &Arc<Client>,
         tx: &Sender<BackendEvent>,
         state: &SharedState,
         cache_path: &Path,
+        run_epoch: u64,
     ) {
         info!("WhatsApp connected");
 
         let client = client.clone();
         let tx_for_enrich = tx.clone();
-        let state = state.clone();
+        let enrich_state = state.clone();
         let cache_path = cache_path.to_path_buf();
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             // Backfill names for chats already cached (or seeded from the TUI)
             // right away; this also republishes the list so stale names get
             // replaced without waiting for a sync.
-            enrich_chat_names(&client, &state, &cache_path, &tx_for_enrich).await;
+            enrich_chat_names(
+                &client,
+                &enrich_state,
+                &cache_path,
+                &tx_for_enrich,
+                run_epoch,
+            )
+            .await;
             // Note: no `request_syncd_snapshot_recovery` here. That call asks
             // the primary to re-send the *app-state* `regular_high` collection
             // (contact/chats metadata), not conversation history, and every
@@ -49,6 +67,7 @@ impl WhatsAppMessenger {
             // we were closed, CDN media fields included) is negotiated via the
             // `require_full_sync` device prop instead.
         });
+        track_enrich(state, handle).await;
 
         let _ = tx.send(BackendEvent::Connected);
     }
@@ -94,7 +113,11 @@ impl WhatsAppMessenger {
     ) {
         match &**event {
             Event::Connected(_) => {
-                Self::handle_connect(client, tx, state, cache_path);
+                // Capture the run generation on the run loop (where a stop
+                // cannot interleave), so the enrichment task bails if this run
+                // is stopped before the task is first polled.
+                let run_epoch = state.read().await.run_epoch;
+                Self::handle_connect(client, tx, state, cache_path, run_epoch).await;
             }
             Event::Disconnected(e) => {
                 if e.reason.is_clean_shutdown() {
@@ -253,12 +276,21 @@ impl WhatsAppMessenger {
                         // Backfill names the phone did not sync (pushnames) from
                         // usync, for chat partners without a saved contact name.
                         let client = client.clone();
-                        let state = state.clone();
+                        let enrich_state = state.clone();
                         let cache_path = cache_path.to_path_buf();
-                        let tx = tx.clone();
-                        tokio::spawn(async move {
-                            enrich_chat_names(&client, &state, &cache_path, &tx).await;
+                        let tx_for_enrich = tx.clone();
+                        let run_epoch = state.read().await.run_epoch;
+                        let handle = tokio::spawn(async move {
+                            enrich_chat_names(
+                                &client,
+                                &enrich_state,
+                                &cache_path,
+                                &tx_for_enrich,
+                                run_epoch,
+                            )
+                            .await;
                         });
+                        track_enrich(state, handle).await;
                     }
                     None => {
                         warn!(
@@ -402,11 +434,19 @@ impl WhatsAppMessenger {
                 let state_for_enrich = state.clone();
                 let cache_path = cache_path.to_path_buf();
                 let tx_for_enrich = tx.clone();
+                let run_epoch = state.read().await.run_epoch;
 
-                tokio::spawn(async move {
-                    enrich_chat_names(&client, &state_for_enrich, &cache_path, &tx_for_enrich)
-                        .await;
+                let handle = tokio::spawn(async move {
+                    enrich_chat_names(
+                        &client,
+                        &state_for_enrich,
+                        &cache_path,
+                        &tx_for_enrich,
+                        run_epoch,
+                    )
+                    .await;
                 });
+                track_enrich(state, handle).await;
 
                 let st = state.read().await;
                 let snapshot = st.chats.clone();

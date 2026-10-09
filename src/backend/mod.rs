@@ -511,9 +511,13 @@ pub trait Messenger: Send + Sync {
     /// after a [`Messenger::disconnect`], which must produce a fresh run built
     /// from the provider's durable session (no logout, no pairing screen).
     ///
-    /// The default is a no-op for providers whose transport is already live by
-    /// the time they are constructed.
-    async fn start(&self) {}
+    /// Returns `Err` when the run could not be brought up (e.g. the durable
+    /// store could not be reopened), letting the caller roll the lifecycle
+    /// back. The default is a no-op for providers whose transport is already
+    /// live by the time they are constructed.
+    async fn start(&self) -> Result<(), BackendError> {
+        Ok(())
+    }
     /// Optional provider-specific status for a chat, such as Telegram online/last-seen information.
     /// The default is `None`; a provider may fill this in later without changing the UI contract.
     async fn status(&self, _chat: &ChatId) -> Result<Option<String>, BackendError> {
@@ -653,7 +657,7 @@ impl MessengerKind {
         , async fn edit(&self, chat: &ChatId, id: &MessageId, text: &str) -> Result<(), BackendError> ;
         , async fn media_bytes(&self, chat: &ChatId, message_id: &MessageId) -> Result<Option<Vec<u8>>, BackendError> ;
         , fn subscribe(&self) -> broadcast::Receiver<BackendEvent> ;
-        , async fn start(&self) -> () ;
+        , async fn start(&self) -> Result<(), BackendError> ;
         , async fn status(&self, chat: &ChatId) -> Result<Option<String>, BackendError> ;
         , async fn cancel_chat_refresh(&self) -> () ;
         , async fn reconnect(&self) -> Result<(), BackendError> ;

@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{RwLock, broadcast};
 use whatsapp_rust::prelude::{Event, Jid, MessageBuilderExt, MessageInfo, wa};
 use whatsapp_rust::transport::DisconnectReason;
@@ -2788,6 +2789,60 @@ async fn sqlite_session_survives_dormant_reopen() {
     );
 
     second.disconnect().await.expect("dormant shutdown");
+}
+
+/// Disabling a provider aborts its detached enrichment work: a task parked on a
+/// network await must not survive the stop and mutate state (or leak into the
+/// next run). The run epoch is bumped at the same time so a task that already
+/// slipped past its last await bails before applying anything.
+#[tokio::test]
+async fn stopping_a_run_aborts_its_detached_enrichment() {
+    let (mut messenger, _state, _tx, _qr, _dir) = adapter().await;
+    // `disconnect` stops the run over the messenger's own shared state, so the
+    // task must be registered there (the adapter's extra state is a test-only
+    // copy used by `handle_event`).
+    let state = messenger.state.clone();
+    let epoch_before = state.read().await.run_epoch;
+
+    // A task parked on a slow await, standing in for an enrichment round
+    // blocked on network I/O when the provider is disabled. It signals once it
+    // is actually parked so the test cannot accidentally unblock it before its
+    // wait is registered.
+    let touched = Arc::new(AtomicBool::new(false));
+    let parked = Arc::new(tokio::sync::Notify::new());
+    let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+    let touched_task = touched.clone();
+    let parked_task = parked.clone();
+    let handle = tokio::spawn(async move {
+        let _ = parked_tx.send(());
+        parked_task.notified().await;
+        touched_task.store(true, Ordering::SeqCst);
+    });
+    state.write().await.enrich_tasks.push(handle);
+    parked_rx
+        .await
+        .expect("enrichment task should reach its await");
+
+    messenger.disconnect().await.expect("stop");
+
+    // Unblock the stand-in: an aborted task must never reach its mutation.
+    parked.notify_waiters();
+    tokio::task::yield_now().await;
+    assert!(
+        !touched.load(Ordering::SeqCst),
+        "a stopped run must abort its detached enrichment"
+    );
+
+    let st = state.read().await;
+    assert!(
+        st.enrich_tasks.is_empty(),
+        "a stop must drain the run's registered enrichment tasks"
+    );
+    assert_eq!(
+        st.run_epoch,
+        epoch_before + 1,
+        "a stop must invalidate the run generation"
+    );
 }
 
 /// A dormant `WhatsAppMessenger` with the collaborators `handle_event` needs,
