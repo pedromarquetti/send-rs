@@ -103,7 +103,7 @@ can do for itself.
 - [ ] Help menu Popup to show keymaps
 - [ ] crates.io build - Make the binary available in `cargo install`
 - [x] Descriptive error handling
-- [x] WhatsApp integration
+- [x] WhatsApp integration - Core WhatsApp integration
 - [x] Message actions (reply, edit, delete) for whatsapp
 - [x] Copy messages' text to clipboard
 - [x] Telegram integration
