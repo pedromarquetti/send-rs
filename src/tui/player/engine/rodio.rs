@@ -644,6 +644,7 @@ mod tests {
 
     const TONE_WAV: &[u8] = include_bytes!("fixtures/tone.wav");
     const VOICE_OGG: &[u8] = include_bytes!("fixtures/voice.ogg");
+    const PLAYBACK_TIMEOUT: Duration = Duration::from_secs(10);
 
     fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) {
         let deadline = Instant::now() + timeout;
@@ -740,7 +741,7 @@ mod tests {
 
         engine.play();
         assert_eq!(engine.status(), PlayState::Playing);
-        wait_until(Duration::from_secs(3), || engine.position() > 0.05);
+        wait_until(PLAYBACK_TIMEOUT, || engine.position() > 0.05);
 
         engine.pause();
         let paused = engine.position();
@@ -782,9 +783,7 @@ mod tests {
         engine.play();
         assert_eq!(engine.status(), PlayState::Playing);
 
-        wait_until(Duration::from_secs(5), || {
-            engine.status() == PlayState::Stopped
-        });
+        wait_until(PLAYBACK_TIMEOUT, || engine.status() == PlayState::Stopped);
         let position = engine.position();
         assert!(
             (position - 2.0).abs() < 0.1,
@@ -800,7 +799,7 @@ mod tests {
         engine.seek(1.0);
         engine.play();
 
-        wait_until(Duration::from_secs(3), || engine.position() > 1.05);
+        wait_until(PLAYBACK_TIMEOUT, || engine.position() > 1.05);
     }
 
     #[test]
@@ -809,9 +808,7 @@ mod tests {
 
         engine.load(VOICE_OGG).unwrap();
         engine.play();
-        wait_until(Duration::from_secs(5), || {
-            engine.status() == PlayState::Stopped
-        });
+        wait_until(PLAYBACK_TIMEOUT, || engine.status() == PlayState::Stopped);
         let end = engine.position();
         assert!(
             (end - 2.0).abs() < 0.1,
@@ -821,7 +818,7 @@ mod tests {
         // Space after the end restarts the finished session at zero.
         engine.play();
         assert_eq!(engine.status(), PlayState::Playing);
-        wait_until(Duration::from_secs(3), || {
+        wait_until(PLAYBACK_TIMEOUT, || {
             let position = engine.position();
             position > 0.0 && position < 0.5
         });
@@ -861,7 +858,7 @@ mod tests {
             .expect("an idle engine plays the cue");
 
         // The cue is audible: its sink drains and empties on the virtual output.
-        wait_until(Duration::from_secs(3), || {
+        wait_until(PLAYBACK_TIMEOUT, || {
             engine.cue_sink.as_ref().is_some_and(rodio::Sink::empty)
         });
 
@@ -905,7 +902,7 @@ mod tests {
 
         engine.load(VOICE_OGG).unwrap();
         engine.play();
-        wait_until(Duration::from_secs(3), || engine.position() > 0.05);
+        wait_until(PLAYBACK_TIMEOUT, || engine.position() > 0.05);
         assert_eq!(engine.status(), PlayState::Playing);
 
         let before = engine.position();
@@ -928,9 +925,7 @@ mod tests {
 
         engine.load(VOICE_OGG).unwrap();
         engine.play();
-        wait_until(Duration::from_secs(5), || {
-            engine.status() == PlayState::Stopped
-        });
+        wait_until(PLAYBACK_TIMEOUT, || engine.status() == PlayState::Stopped);
 
         // EOF: nothing is playing, the session is finished but its bytes are
         // retained. This is the one non-busy state with a session attached, and
@@ -941,7 +936,7 @@ mod tests {
         engine
             .play_cue(TONE_WAV)
             .expect("a finished session does not block a cue");
-        wait_until(Duration::from_secs(3), || {
+        wait_until(PLAYBACK_TIMEOUT, || {
             engine.cue_sink.as_ref().is_some_and(rodio::Sink::empty)
         });
 

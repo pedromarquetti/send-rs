@@ -383,62 +383,188 @@ mod tests {
         }))
     }
 
+    /// A [`VideoWidgetState`] with no worker thread: the test owns both channel
+    /// ends, so a dispatched job can be observed and its completion delivered
+    /// on demand. Inferring the worker's progress from thread scheduling was
+    /// the source of the flaky slot-ownership test, so the worker is replaced
+    /// by this explicit seam instead of sleeps or larger fixtures.
+    struct ManualVideo {
+        frames: Arc<Mutex<Option<DynamicImage>>>,
+        state: VideoWidgetState,
+        /// Receives each dispatched encode instead of a background worker.
+        jobs: Receiver<(StatefulProtocol, Size)>,
+        /// Completes a job when the test sends on it.
+        results: mpsc::Sender<Option<StatefulProtocol>>,
+    }
+
+    impl ManualVideo {
+        fn new() -> Self {
+            let frames = Arc::new(Mutex::new(None));
+            let (job_tx, jobs) = mpsc::sync_channel(1);
+            let (result_tx, results) = mpsc::channel();
+
+            Self {
+                frames: Arc::clone(&frames),
+                state: VideoWidgetState {
+                    frames,
+                    picker: Picker::halfblocks(),
+                    encoded: None,
+                    jobs: job_tx,
+                    results,
+                    in_flight: false,
+                    status: "Loading video…".to_string(),
+                },
+                jobs,
+                results: result_tx,
+            }
+        }
+
+        /// Put a decoded frame into the slot the renderer drains.
+        fn decode(&self, frame: DynamicImage) {
+            *self.frames.blocking_lock() = Some(frame);
+        }
+    }
+
     #[test]
     fn a_frame_is_only_taken_from_the_slot_while_the_worker_is_idle() {
-        let (frames, mut state) = video();
-        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 5));
+        let mut video = ManualVideo::new();
+        let area = Rect::new(0, 0, 20, 5);
+        let mut buf = Buffer::empty(area);
 
-        *frames.blocking_lock() = Some(video_frame());
-        VideoWidget.render(buf.area, &mut buf, &mut state);
+        // Idle worker: the first frame is taken from the slot and dispatched.
+        video.decode(video_frame());
+        VideoWidget.render(area, &mut buf, &mut video.state);
         assert!(
-            state.in_flight,
+            video.state.in_flight,
             "the first frame should have been dispatched"
         );
         assert!(
-            frames.try_lock().unwrap().is_none(),
+            video.jobs.try_recv().is_ok(),
+            "the dispatched frame must reach the encode worker"
+        );
+        assert!(
+            video.frames.try_lock().unwrap().is_none(),
             "the dispatched frame must leave the slot"
         );
 
-        // A frame decoded while the worker is busy has to stay put: draining
-        // it every draw would queue frames the renderer never reaches.
-        *frames.blocking_lock() = Some(video_frame());
-        VideoWidget.render(buf.area, &mut buf, &mut state);
+        // The worker has not reported back, so the renderer is still busy: a
+        // frame decoded now has to stay put. Draining it every draw would
+        // queue frames the renderer never reaches.
+        video.decode(video_frame());
+        VideoWidget.render(area, &mut buf, &mut video.state);
+        assert!(video.state.in_flight, "still one encode in flight");
         assert!(
-            frames.try_lock().unwrap().is_some(),
+            video.frames.try_lock().unwrap().is_some(),
             "a backlog must not build up behind the encoder"
         );
-        assert!(state.in_flight, "still one encode in flight");
+        assert!(
+            video.jobs.try_recv().is_err(),
+            "no second job may be queued behind the first"
+        );
     }
 
     #[test]
     fn a_completed_encode_is_drawn_and_a_stale_frame_is_left_alone() {
-        let (frames, mut state) = video();
+        let mut video = ManualVideo::new();
         let area = Rect::new(0, 0, 20, 5);
         let mut buf = Buffer::empty(area);
 
-        *frames.blocking_lock() = Some(video_frame());
-        VideoWidget.render(area, &mut buf, &mut state);
+        video.decode(video_frame());
+        VideoWidget.render(area, &mut buf, &mut video.state);
         let placeholder = buf.clone();
 
-        let mut encoded = false;
-        for _ in 0..200 {
-            VideoWidget.render(area, &mut buf, &mut state);
-            if state.encoded.is_some() {
-                encoded = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        assert!(encoded, "encode worker never produced a frame");
-        assert!(!state.in_flight);
-        assert_ne!(buf, placeholder, "the frame must replace the placeholder");
+        // Complete the encode on the test thread rather than racing a worker.
+        let (mut protocol, size) = video.jobs.try_recv().expect("the encode is dispatched");
+        protocol.resize_encode(&Resize::Fit(None), size);
+        video
+            .results
+            .send(Some(protocol))
+            .expect("the worker reports back");
+
+        VideoWidget.render(area, &mut buf, &mut video.state);
+        assert!(
+            video.state.encoded.is_some(),
+            "the completed frame is drawn"
+        );
+        assert!(!video.state.in_flight, "the worker is idle again");
+        let encoded = buf.clone();
+        assert_ne!(
+            encoded, placeholder,
+            "the frame must replace the placeholder"
+        );
 
         // Nothing new decoded and the area has not moved, so the same frame is
         // drawn again without another encode being dispatched.
-        let shown = buf.clone();
-        VideoWidget.render(area, &mut buf, &mut state);
-        assert!(!state.in_flight, "a stale frame must not be re-encoded");
-        assert_eq!(buf, shown);
+        VideoWidget.render(area, &mut buf, &mut video.state);
+        assert!(
+            !video.state.in_flight,
+            "a stale frame must not be re-encoded"
+        );
+        assert!(
+            video.jobs.try_recv().is_err(),
+            "no redundant encode may be queued"
+        );
+        assert_eq!(buf, encoded);
+    }
+
+    #[test]
+    fn a_failed_encode_clears_the_latch_and_does_not_freeze_playback() {
+        let mut video = ManualVideo::new();
+        let area = Rect::new(0, 0, 20, 5);
+        let mut buf = Buffer::empty(area);
+
+        video.decode(video_frame());
+        VideoWidget.render(area, &mut buf, &mut video.state);
+        assert!(video.state.in_flight);
+        let _ = video.jobs.try_recv().expect("the encode is dispatched");
+
+        // A miss has to clear the in-flight latch, or the widget would stay
+        // busy forever and freeze on its last frame.
+        video.results.send(None).expect("the worker reports back");
+        VideoWidget.render(area, &mut buf, &mut video.state);
+        assert!(
+            !video.state.in_flight,
+            "a failed encode must clear the latch"
+        );
+
+        // A later frame is still dispatched, so the miss did not wedge it.
+        video.decode(video_frame());
+        VideoWidget.render(area, &mut buf, &mut video.state);
+        assert!(
+            video.jobs.try_recv().is_ok(),
+            "playback must resume after a failed encode"
+        );
+    }
+
+    #[test]
+    fn the_previous_frame_stays_visible_while_a_replacement_is_encoded() {
+        let mut video = ManualVideo::new();
+        let area = Rect::new(0, 0, 20, 5);
+        let mut buf = Buffer::empty(area);
+
+        // Draw a first, completed frame.
+        video.decode(video_frame());
+        VideoWidget.render(area, &mut buf, &mut video.state);
+        let (mut protocol, size) = video.jobs.try_recv().expect("the encode is dispatched");
+        protocol.resize_encode(&Resize::Fit(None), size);
+        video
+            .results
+            .send(Some(protocol))
+            .expect("the worker reports back");
+        VideoWidget.render(area, &mut buf, &mut video.state);
+        let first = buf.clone();
+        assert!(video.state.encoded.is_some());
+
+        // A replacement is dispatched, but until the worker reports back the
+        // first frame must stay on screen rather than blanking.
+        video.decode(video_frame());
+        VideoWidget.render(area, &mut buf, &mut video.state);
+        assert!(video.state.in_flight, "the replacement is being encoded");
+        VideoWidget.render(area, &mut buf, &mut video.state);
+        assert_eq!(
+            buf, first,
+            "the previous frame stays visible while encoding"
+        );
     }
 
     #[test]
