@@ -5503,6 +5503,20 @@ mod tests {
             "caption spilled into the frame half: {start:?}"
         );
 
+        // And the frame itself stays in the left half, so the two panes sit
+        // side by side with the video on the left.
+        let frame_row = rows
+            .iter()
+            .find(|row| row.contains("Loading"))
+            .expect("the frame pane is not on screen");
+        let frame_col = frame_row
+            .find("Loading")
+            .expect("the frame placeholder text is missing");
+        assert!(
+            frame_col < 40,
+            "the video pane must stay left of the caption: {frame_row:?}"
+        );
+
         let rendered: String = buf.content.iter().map(|c| c.symbol()).collect();
         assert!(
             !rendered.contains("w300"),

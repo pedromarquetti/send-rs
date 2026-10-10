@@ -313,6 +313,17 @@ impl FfmpegEngine {
         }
     }
 
+    /// Clear the shared frame slot, waiting out whoever holds it.
+    fn clear_frame(&self) {
+        let mut slot = loop {
+            if let Ok(slot) = self.frame_slot.try_lock() {
+                break slot;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        *slot = None;
+    }
+
     /// Spawn `ffmpeg` at `position` plus the thread that paces its frames into
     /// the slot.
     fn spawn_decode(&mut self, path: &Path, position: f64) -> Result<(), String> {
@@ -456,9 +467,7 @@ impl MediaEngine for FfmpegEngine {
 
         // The popup shows the previous session's last frame until the new
         // decode publishes one, so clear it with the new media.
-        if let Ok(mut slot) = self.frame_slot.try_lock() {
-            *slot = None;
-        }
+        self.clear_frame();
         self.temp = Some(temp);
         self.width = width;
         self.height = height;
@@ -548,15 +557,16 @@ impl MediaEngine for FfmpegEngine {
         self.temp = None;
         self.width = 0;
         self.height = 0;
+        self.fps = MAX_FPS;
         self.duration = 0.0;
         self.timing.stop();
         self.status = PlayState::Stopped;
 
         // Forget the last picture too, so a stale frame cannot outlive the
-        // session it belongs to.
-        if let Ok(mut slot) = self.frame_slot.try_lock() {
-            *slot = None;
-        }
+        // session it belongs to. This waits for a busy slot rather than
+        // skipping the clear: the popup is going away and a frame left in
+        // the slot would resurface in the next one.
+        self.clear_frame();
     }
 
     fn is_busy(&self) -> bool {
@@ -820,6 +830,48 @@ mod tests {
         assert!(parse_probe_json("not json").is_err());
     }
 
+    /// Teardown must not depend on winning the slot race: a renderer holding
+    /// it at exactly the wrong moment used to turn the cleanup `try_lock` into
+    /// a silently skipped clear, leaving the stopped session's last picture in
+    /// the shared slot for the next popup to inherit.
+    #[test]
+    fn stop_waits_out_a_held_frame_slot_instead_of_keeping_the_frame() {
+        let slot = Arc::new(Mutex::new(None));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut engine = FfmpegEngine::new(Arc::clone(&slot), tx);
+
+        // Leave a picture behind, as a running decode would.
+        *slot.try_lock().unwrap() = Some(DynamicImage::ImageRgb8(RgbImage::new(2, 2)));
+
+        // The renderer holds the slot across the shutdown.
+        let held = slot.try_lock().unwrap();
+
+        let (announced_tx, announced_rx) = std::sync::mpsc::channel();
+        let stopping = std::thread::spawn(move || {
+            let _ = announced_tx.send(());
+            engine.stop();
+            engine
+        });
+        announced_rx.recv().unwrap();
+
+        // Give `stop` time to reach the clear while the slot is still held:
+        // it has to wait for the slot, not give up on it.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !stopping.is_finished(),
+            "stop gave up on clearing the frame while the slot was held"
+        );
+
+        drop(held);
+        let mut engine = stopping.join().unwrap();
+
+        assert!(
+            slot.try_lock().is_ok_and(|guard| guard.is_none()),
+            "the stopped session's frame survived the shutdown"
+        );
+        assert_eq!(engine.status(), PlayState::Stopped);
+    }
+
     #[test]
     fn undecodable_bytes_report_an_error_status() {
         let mut engine = FfmpegEngine::new(
@@ -910,9 +962,18 @@ mod tests {
 
         wait_until(Duration::from_secs(5), || engine.position() > 0.2);
 
+        // A frame must be in the slot for the pause checks to mean anything.
+        wait_until(Duration::from_secs(5), || {
+            slot.try_lock().is_ok_and(|guard| guard.is_some())
+        });
+
         engine.pause();
         let frozen = engine.position();
         assert_eq!(engine.status(), PlayState::Paused);
+        assert!(
+            slot.try_lock().is_ok_and(|guard| guard.is_some()),
+            "pausing must keep the displayed frame available"
+        );
         std::thread::sleep(Duration::from_millis(200));
         assert!(
             (engine.position() - frozen).abs() < 1e-6,
@@ -934,6 +995,10 @@ mod tests {
         engine.stop();
         assert_eq!(engine.status(), PlayState::Stopped);
         assert!(!scratch.exists(), "stopping must delete the scratch file");
+        assert!(
+            slot.try_lock().is_ok_and(|guard| guard.is_none()),
+            "stop must clear the shared frame slot"
+        );
         assert!(!engine.is_busy());
         assert_eq!(engine.position(), 0.0);
     }
