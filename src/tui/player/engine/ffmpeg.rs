@@ -32,8 +32,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
 
 use super::rodio::Timing;
-use crate::tui::UiEvent;
 use crate::tui::player::{MediaEngine, PlayState};
+use crate::tui::{UiEvent, video_redraw_wake};
 
 /// Cap on the decode frame rate: a source faster than this is decoded at this
 /// rate instead, so a high-fps source does not burn CPU on frames the terminal
@@ -238,15 +238,23 @@ pub struct FfmpegEngine {
     status: PlayState,
     frame_slot: Arc<Mutex<Option<DynamicImage>>>,
     wake: UnboundedSender<UiEvent>,
+    /// Coalescing latch shared with the event loop: `video_redraw_wake` only
+    /// sends a `UiEvent::Redraw` when no video wake is already pending, so a
+    /// renderer that falls behind drops obsolete wakes instead of buffering
+    /// one per decoded frame.
+    redraw_pending: Arc<AtomicBool>,
 }
 
 impl FfmpegEngine {
     /// Build an engine publishing decoded frames into `frame_slot` and asking
     /// the UI to redraw through `wake`. Both are handed over rather than
-    /// wired in later because the player builds its engine on a worker thread.
+    /// wired in later because the player builds its engine on a worker thread;
+    /// `redraw_pending` is the same latch the event loop re-arms on every
+    /// received wake.
     pub fn new(
         frame_slot: Arc<Mutex<Option<DynamicImage>>>,
         wake: UnboundedSender<UiEvent>,
+        redraw_pending: Arc<AtomicBool>,
     ) -> Self {
         Self {
             temp: None,
@@ -262,6 +270,7 @@ impl FfmpegEngine {
             status: PlayState::Stopped,
             frame_slot,
             wake,
+            redraw_pending,
         }
     }
 
@@ -356,6 +365,7 @@ impl FfmpegEngine {
         let (width, height, fps) = (self.width, self.height, self.fps);
         let slot = Arc::clone(&self.frame_slot);
         let wake = self.wake.clone();
+        let redraw_pending = Arc::clone(&self.redraw_pending);
         let (ended, failed) = (Arc::clone(&self.ended), Arc::clone(&self.failed));
 
         self.reader = Some(std::thread::spawn(move || {
@@ -391,7 +401,7 @@ impl FfmpegEngine {
                     // stalling behind the renderer.
                     if let Ok(mut current) = slot.try_lock() {
                         *current = Some(DynamicImage::ImageRgb8(image));
-                        let _ = wake.send(UiEvent::Redraw);
+                        video_redraw_wake(&wake, &redraw_pending);
                     }
                 }
 
@@ -838,7 +848,7 @@ mod tests {
     fn stop_waits_out_a_held_frame_slot_instead_of_keeping_the_frame() {
         let slot = Arc::new(Mutex::new(None));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut engine = FfmpegEngine::new(Arc::clone(&slot), tx);
+        let mut engine = FfmpegEngine::new(Arc::clone(&slot), tx, Arc::new(AtomicBool::new(false)));
 
         // Leave a picture behind, as a running decode would.
         *slot.try_lock().unwrap() = Some(DynamicImage::ImageRgb8(RgbImage::new(2, 2)));
@@ -872,11 +882,71 @@ mod tests {
         assert_eq!(engine.status(), PlayState::Stopped);
     }
 
+    /// The acceptance check for redraw coalescing: a renderer that never gets
+    /// around to acknowledging a wake must not accumulate one pending wake per
+    /// decoded frame — the channel stays at a single wake no matter how much
+    /// video the decoder produces.
+    #[test]
+    fn a_slow_renderer_does_not_pile_up_redraw_wakes() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg is not installed");
+            return;
+        }
+
+        let holder = temp_file().expect("a scratch clip holder");
+        let clip = holder.path().to_path_buf();
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=25:duration=2",
+                "-pix_fmt",
+                "yuv420p",
+                "-y",
+                "-f",
+                "mp4",
+            ])
+            .arg(&clip)
+            .status()
+            .expect("ffmpeg generates the test clip");
+        assert!(status.success());
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let pending = Arc::new(AtomicBool::new(false));
+        let slot = Arc::new(Mutex::new(None));
+        let mut engine = FfmpegEngine::new(Arc::clone(&slot), tx, Arc::clone(&pending));
+
+        let bytes = std::fs::read(&clip).unwrap();
+        engine.load(&bytes).unwrap();
+        engine.play();
+
+        // No event loop is around to re-arm the latch: frames keep replacing
+        // each other in the slot, and only the very first wake is accepted.
+        wait_until(Duration::from_secs(10), || engine.position() > 0.2);
+        assert_eq!(
+            rx.len(),
+            1,
+            "a slow renderer must see one pending wake, not one per decoded frame"
+        );
+        assert!(
+            pending.load(Ordering::SeqCst),
+            "the next wake stays latched"
+        );
+
+        engine.stop();
+    }
+
     #[test]
     fn undecodable_bytes_report_an_error_status() {
         let mut engine = FfmpegEngine::new(
             Arc::new(Mutex::new(None)),
             tokio::sync::mpsc::unbounded_channel().0,
+            Arc::new(AtomicBool::new(false)),
         );
 
         // The engine must never look loaded after a failed load, or the popup
@@ -931,7 +1001,7 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let slot = Arc::new(Mutex::new(None));
-        let mut engine = FfmpegEngine::new(Arc::clone(&slot), tx);
+        let mut engine = FfmpegEngine::new(Arc::clone(&slot), tx, Arc::new(AtomicBool::new(false)));
 
         let bytes = std::fs::read(&clip).unwrap();
         assert!(!bytes.is_empty(), "the generated clip is empty");
@@ -1044,6 +1114,7 @@ mod tests {
         let mut engine = FfmpegEngine::new(
             Arc::new(Mutex::new(None)),
             tokio::sync::mpsc::unbounded_channel().0,
+            Arc::new(AtomicBool::new(false)),
         );
         engine.load(&bytes).unwrap();
         engine.play();
@@ -1110,6 +1181,7 @@ mod tests {
         let mut engine = FfmpegEngine::new(
             Arc::new(Mutex::new(None)),
             tokio::sync::mpsc::unbounded_channel().0,
+            Arc::new(AtomicBool::new(false)),
         );
         engine.load(&bytes).unwrap();
 

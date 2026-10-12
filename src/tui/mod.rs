@@ -12,6 +12,7 @@ use ratatui::widgets::{StatefulWidget, Widget};
 use ratatui::{DefaultTerminal, Frame};
 use ratatui_image::picker::{Picker, ProtocolType};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::{Duration, MissedTickBehavior};
@@ -108,6 +109,20 @@ enum UiEvent {
     /// that message).
     PlaybackState(PlaybackState),
     Resize,
+}
+
+/// Wake the UI for a video redraw without letting wakes pile up while the
+/// renderer falls behind the decoder.
+///
+/// The video path keeps at most one `UiEvent::Redraw` in flight: `pending`
+/// latches until the event loop receives the wake and re-arms it, so a slow
+/// renderer drops obsolete wakes instead of buffering one per decoded frame.
+/// The image widget keeps sending an unconditional wake per (re)encode, so its
+/// behavior is unchanged.
+pub(in crate::tui) fn video_redraw_wake(tx: &mpsc::UnboundedSender<UiEvent>, pending: &AtomicBool) {
+    if !pending.swap(true, Ordering::SeqCst) {
+        let _ = tx.send(UiEvent::Redraw);
+    }
 }
 
 /// Upper bound on backend teardown once the terminal is back. Long enough for
@@ -564,7 +579,11 @@ async fn run_app(
                             });
                         }
                     }
-                    UiEvent::Redraw => {}
+                    UiEvent::Redraw => {
+                        // A video wake was consumed: re-arm the latch so the
+                        // next decoded frame can wake the loop again.
+                        app.video_redraw_pending.store(false, Ordering::SeqCst);
+                    }
                     UiEvent::HistoryRefreshResult(chat_id, result) => {
                         app.state.history_refresh_in_flight = false;
                         if app.state.chat_state.open_chat.as_ref().map(|open| &open.chat.id)
@@ -696,6 +715,12 @@ struct App {
     /// engine never has to hand a frame back (D6).
     video_frames: Arc<Mutex<Option<DynamicImage>>>,
     video_player: Player,
+    /// Shared redraw latch for the video path: the decoder and the encode
+    /// worker both set it before waking through `video_redraw_wake`, and the
+    /// event loop re-arms it every time it receives a `UiEvent::Redraw`, so a
+    /// renderer that falls behind drops obsolete wakes instead of queueing one
+    /// per decoded frame.
+    video_redraw_pending: Arc<AtomicBool>,
     notifier: Notifier,
     tx: mpsc::UnboundedSender<UiEvent>,
     chat_load_task: Option<tokio::task::JoinHandle<()>>,
@@ -717,10 +742,18 @@ impl App {
         // One slot, cloned into the engine factory and later into the popup's
         // widget, so decoded frames flow engine -> widget without a round trip.
         let video_frames = Arc::new(Mutex::new(None));
+        let video_redraw_pending = Arc::new(AtomicBool::new(false));
         let engine_frames = Arc::clone(&video_frames);
         let engine_wake = tx.clone();
+        let engine_pending = Arc::clone(&video_redraw_pending);
         let video_player = Player::new(
-            move || Box::new(FfmpegEngine::new(engine_frames, engine_wake)),
+            move || {
+                Box::new(FfmpegEngine::new(
+                    engine_frames,
+                    engine_wake,
+                    engine_pending,
+                ))
+            },
             tx.clone(),
         );
 
@@ -730,6 +763,7 @@ impl App {
             player: Player::new(|| Box::new(RodioEngine::default()), tx.clone()),
             video_frames,
             video_player,
+            video_redraw_pending,
             notifier,
             tx,
             chat_load_task: None,
@@ -1025,6 +1059,7 @@ impl App {
                 Arc::clone(&self.video_frames),
                 self.picker.clone(),
                 self.tx.clone(),
+                Arc::clone(&self.video_redraw_pending),
             ),
             playback: None,
             error_note: None,
@@ -2079,10 +2114,34 @@ mod tests {
                 Arc::new(Mutex::new(None)),
                 ratatui_image::picker::Picker::halfblocks(),
                 tokio::sync::mpsc::unbounded_channel().0,
+                Arc::new(AtomicBool::new(false)),
             ),
             playback: None,
             error_note: None,
         })
+    }
+
+    #[test]
+    fn video_redraw_wake_coalesces_wakes_until_the_event_loop_rearms() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let pending = AtomicBool::new(false);
+
+        // A burst of decoded frames while the renderer is too slow to keep up:
+        // only the first wake is worth taking.
+        for _ in 0..100 {
+            video_redraw_wake(&tx, &pending);
+        }
+        assert_eq!(rx.len(), 1, "a burst of wakes must coalesce to one pending");
+
+        // The event loop receives the wake and re-arms the latch for the next
+        // frame the renderer is about to draw.
+        assert!(matches!(rx.blocking_recv(), Some(UiEvent::Redraw)));
+        pending.store(false, Ordering::SeqCst);
+
+        for _ in 0..100 {
+            video_redraw_wake(&tx, &pending);
+        }
+        assert_eq!(rx.len(), 1, "each re-armed burst still yields one wake");
     }
 
     /// The `Loading` snapshot `open_video_popup` seeds; worker reports are only

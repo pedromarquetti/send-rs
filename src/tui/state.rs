@@ -2045,6 +2045,7 @@ mod tests {
     use ratatui::widgets::StatefulWidget;
     use ratatui_image::picker::Picker;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use tokio::sync::Mutex;
     use tokio::sync::broadcast;
@@ -5145,7 +5146,12 @@ mod tests {
     ) -> PopupKind {
         let frames = Arc::new(Mutex::new(None));
         let (wake, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let view = VideoWidgetState::new(frames, Picker::halfblocks(), wake);
+        let view = VideoWidgetState::new(
+            frames,
+            Picker::halfblocks(),
+            wake,
+            Arc::new(AtomicBool::new(false)),
+        );
 
         PopupKind::Video(VideoPopup {
             msg,

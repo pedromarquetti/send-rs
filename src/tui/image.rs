@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 
 use image::DynamicImage;
@@ -17,7 +18,7 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::debug;
 
-use super::UiEvent;
+use super::{UiEvent, video_redraw_wake};
 use crate::helpers::wrap_text;
 
 /// Marker widget; all state lives in [`ImageWidgetState`].
@@ -136,11 +137,15 @@ pub struct VideoWidgetState {
 
 impl VideoWidgetState {
     /// Spawn the encode worker; `wake` is signalled with `UiEvent::Redraw`
-    /// whenever a frame is ready so the UI repaints promptly.
+    /// whenever a frame is ready so the UI repaints promptly. Wakes are
+    /// coalesced through `redraw_pending` (the same latch the event loop
+    /// re-arms on every received wake), so a renderer that falls behind drops
+    /// obsolete wakes instead of queueing one per encoded frame.
     pub(super) fn new(
         frames: Arc<Mutex<Option<DynamicImage>>>,
         picker: Picker,
         wake: UnboundedSender<UiEvent>,
+        redraw_pending: Arc<AtomicBool>,
     ) -> Self {
         let (job_tx, jobs) = mpsc::sync_channel::<(StatefulProtocol, Size)>(1);
         let (result_tx, results) = mpsc::channel();
@@ -162,7 +167,7 @@ impl VideoWidgetState {
                 }
 
                 let _ = result_tx.send(encoded.then_some(protocol));
-                let _ = wake.send(UiEvent::Redraw);
+                video_redraw_wake(&wake, &redraw_pending);
             }
         });
 
@@ -372,7 +377,12 @@ mod tests {
     fn video() -> (Arc<Mutex<Option<DynamicImage>>>, VideoWidgetState) {
         let frames = Arc::new(Mutex::new(None));
         let (wake, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let state = VideoWidgetState::new(Arc::clone(&frames), Picker::halfblocks(), wake);
+        let state = VideoWidgetState::new(
+            Arc::clone(&frames),
+            Picker::halfblocks(),
+            wake,
+            Arc::new(AtomicBool::new(false)),
+        );
 
         (frames, state)
     }
