@@ -17,7 +17,7 @@
 //!   child to keep up.
 
 use std::ffi::OsString;
-use std::io::{self, Read};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -298,6 +298,9 @@ pub struct FfmpegEngine {
     /// The running decode, if any.
     child: Option<Child>,
     reader: Option<JoinHandle<()>>,
+    /// Drains the decode child's stderr into the application log, so ffmpeg
+    /// diagnostics never reach the terminal and never block on a full pipe.
+    stderr_reader: Option<JoinHandle<()>>,
     /// Set by the decode thread when its frame pipe ends (`ended`) or breaks
     /// mid-frame (`failed`). `ended` means only that stdout is exhausted; the
     /// engine still checks the child's exit status before calling it a success.
@@ -336,6 +339,7 @@ impl FfmpegEngine {
             duration: 0.0,
             child: None,
             reader: None,
+            stderr_reader: None,
             ended: Arc::new(AtomicBool::new(false)),
             failed: Arc::new(AtomicBool::new(false)),
             timing: Timing::default(),
@@ -382,15 +386,27 @@ impl FfmpegEngine {
         debug!("video poster frame ready, still paused at the start");
     }
 
-    /// Kill the running decode and wait for its reader thread, if any.
+    /// Kill the running decode and wait for its reader threads, if any.
     fn kill_decode(&mut self) {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
 
+        self.join_decode_threads();
+    }
+
+    /// Wait out the frame reader and the stderr drainer.
+    ///
+    /// Separate from [`Self::kill_decode`] because a decode that ended on its
+    /// own has already been reaped, and re-sending a signal to a reaped pid
+    /// could reach an unrelated process.
+    fn join_decode_threads(&mut self) {
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
+        }
+        if let Some(stderr_reader) = self.stderr_reader.take() {
+            let _ = stderr_reader.join();
         }
     }
 
@@ -419,9 +435,10 @@ impl FfmpegEngine {
             ))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            // The process stderr is redirected to the log, so ffmpeg's own
-            // diagnostics are captured instead of corrupting the TUI.
-            .stderr(Stdio::inherit())
+            // Never inherit the terminal: ffmpeg's diagnostics must not paint
+            // over the alternate-screen TUI. They are piped and drained into
+            // the application log instead.
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|err| format!("cannot run ffmpeg: {err}"))?;
 
@@ -429,6 +446,7 @@ impl FfmpegEngine {
             let _ = child.kill();
             return Err("ffmpeg was spawned without a frame pipe".into());
         };
+        let stderr = child.stderr.take();
 
         // Fresh per-session flags: a decode the engine itself killed has
         // already been joined, so it cannot write to these.
@@ -492,6 +510,19 @@ impl FfmpegEngine {
             );
             ended.store(true, Ordering::Relaxed);
         }));
+
+        // Draining stderr keeps the pipe from filling and blocking ffmpeg, and
+        // routes its diagnostics into `sender.log` rather than the terminal.
+        if let Some(stderr) = stderr {
+            self.stderr_reader = Some(std::thread::spawn(move || {
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    let line = line.trim_end();
+                    if !line.is_empty() {
+                        warn!(diagnostic = line, "ffmpeg reported a problem");
+                    }
+                }
+            }));
+        }
 
         self.child = Some(child);
         Ok(())
@@ -708,12 +739,11 @@ impl MediaEngine for FfmpegEngine {
             return self.status;
         };
 
-        // `try_wait` already reaped the child, so only its reader is left to
-        // join; signalling a reaped pid could reach an unrelated process.
+        // `try_wait` already reaped the child, so only its reader threads are
+        // left to join; signalling a reaped pid could reach an unrelated
+        // process.
         self.child = None;
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
-        }
+        self.join_decode_threads();
         self.timing.pause(self.duration);
         self.status = if exit.success() {
             // A clean EOF: the session is finished but its file is kept, so a
@@ -1344,6 +1374,64 @@ mod tests {
             engine.status(),
             PlayState::Error,
             "undecodable media must not look like a clean EOF"
+        );
+
+        engine.stop();
+    }
+
+    /// ffmpeg must never write its diagnostics straight to the terminal: they
+    /// are piped and drained into the application log. The engine's stderr is
+    /// only ever taken into a drain thread when it was piped rather than
+    /// inherited or nulled, so the live thread is the observable proof.
+    #[test]
+    fn decoding_drains_ffmpeg_diagnostics_instead_of_the_terminal() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg is not installed");
+            return;
+        }
+
+        let holder = temp_file().expect("a scratch clip holder");
+        let clip = holder.path().to_path_buf();
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x64:rate=25:duration=1",
+                "-pix_fmt",
+                "yuv420p",
+                "-y",
+                "-f",
+                "mp4",
+            ])
+            .arg(&clip)
+            .status()
+            .expect("ffmpeg generates the test clip");
+        assert!(status.success());
+
+        let bytes = std::fs::read(&clip).unwrap();
+        let mut engine = FfmpegEngine::new(
+            Arc::new(Mutex::new(None)),
+            tokio::sync::mpsc::unbounded_channel().0,
+            Arc::new(AtomicBool::new(false)),
+        );
+        engine.load(&bytes).unwrap();
+        engine.play();
+
+        assert!(
+            engine.stderr_reader.is_some(),
+            "ffmpeg stderr must be drained by a thread, not inherited"
+        );
+        assert!(
+            engine
+                .child
+                .as_ref()
+                .is_some_and(|child| child.stderr.is_none()),
+            "the drain thread must own the child's stderr pipe"
         );
 
         engine.stop();
