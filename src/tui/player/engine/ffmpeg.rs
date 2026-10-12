@@ -298,7 +298,9 @@ pub struct FfmpegEngine {
     /// The running decode, if any.
     child: Option<Child>,
     reader: Option<JoinHandle<()>>,
-    /// Set by the decode thread when the child ended (clean EOF) or died.
+    /// Set by the decode thread when its frame pipe ends (`ended`) or breaks
+    /// mid-frame (`failed`). `ended` means only that stdout is exhausted; the
+    /// engine still checks the child's exit status before calling it a success.
     /// The engine only reads these while it still considers itself playing, so
     /// a decode killed by `pause`/`stop` cannot be mistaken for a failure.
     ended: Arc<AtomicBool>,
@@ -678,18 +680,52 @@ impl MediaEngine for FfmpegEngine {
     }
 
     fn status(&mut self) -> PlayState {
-        if self.status == PlayState::Playing && self.failed.load(Ordering::Relaxed) {
+        if self.status != PlayState::Playing {
+            return self.status;
+        }
+
+        if self.failed.load(Ordering::Relaxed) {
             self.kill_decode();
             self.timing.pause(self.duration);
             self.status = PlayState::Error;
-        } else if self.status == PlayState::Playing && self.ended.load(Ordering::Relaxed) {
-            // EOF: the session is finished but its file is kept, so a later
-            // `play` restarts it from the beginning.
-            self.kill_decode();
-            self.timing.pause(self.duration);
-            self.status = PlayState::Stopped;
+            return self.status;
         }
 
+        if !self.ended.load(Ordering::Relaxed) {
+            return self.status;
+        }
+
+        // stdout reached end of stream, but that alone is not proof of success:
+        // ffmpeg still exits non-zero for media it cannot decode, even when it
+        // has already emitted whole frames. Only the exit status separates a
+        // clean EOF from such a failure.
+        let exit = self
+            .child
+            .as_mut()
+            .and_then(|child| child.try_wait().ok().flatten());
+        let Some(exit) = exit else {
+            // The child is still finalizing; settle on the next poll.
+            return self.status;
+        };
+
+        // `try_wait` already reaped the child, so only its reader is left to
+        // join; signalling a reaped pid could reach an unrelated process.
+        self.child = None;
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+        self.timing.pause(self.duration);
+        self.status = if exit.success() {
+            // A clean EOF: the session is finished but its file is kept, so a
+            // later `play` restarts it from the beginning.
+            PlayState::Stopped
+        } else {
+            warn!(
+                code = exit.code(),
+                "video decode exited with a failure status"
+            );
+            PlayState::Error
+        };
         self.status
     }
 }
@@ -1168,7 +1204,7 @@ mod tests {
             .args(["-display_rotation", "90"])
             .arg("-i")
             .arg(base.path())
-            .args(["-c", "copy"])
+            .args(["-c", "copy", "-f", "mp4"])
             .arg(rotated.path())
             .status()
             .expect("ffmpeg attaches the display rotation");
@@ -1231,6 +1267,86 @@ mod tests {
         // `Stopped` exactly as the audio engine does with nothing loaded.
         engine.play();
         assert_eq!(engine.status(), PlayState::Stopped);
+    }
+
+    /// The dangerous failure: media whose container probes cleanly but whose
+    /// pixels cannot be decoded. ffmpeg exits non-zero without writing a frame,
+    /// and the engine must not mistake the closed pipe for a finished video.
+    #[test]
+    fn a_video_that_probes_cleanly_but_cannot_decode_is_an_error() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg is not installed");
+            return;
+        }
+
+        let holder = temp_file().expect("a scratch image holder");
+        let image = holder.path().to_path_buf();
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x48:rate=25:duration=1",
+                "-frames:v",
+                "1",
+                // The scratch file has no meaningful extension, so the muxer
+                // has to be named.
+                "-f",
+                "image2",
+                "-c:v",
+                "png",
+                "-y",
+            ])
+            .arg(&image)
+            .status()
+            .expect("ffmpeg generates the test image");
+        assert!(status.success(), "ffmpeg failed to build the test image");
+
+        let mut bytes = std::fs::read(&image).unwrap();
+
+        // Scramble only an `IDAT` payload, leaving every chunk length and the
+        // `IHDR` intact, so the header still probes even though decoding fails.
+        let mut offset = 8;
+        while offset + 8 <= bytes.len() {
+            let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+            if &bytes[offset + 4..offset + 8] == b"IDAT" {
+                let end = (offset + 8 + length).min(bytes.len());
+                for byte in &mut bytes[offset + 8..end] {
+                    *byte ^= 0x55;
+                }
+                break;
+            }
+            offset += 12 + length;
+        }
+
+        let mut engine = FfmpegEngine::new(
+            Arc::new(Mutex::new(None)),
+            tokio::sync::mpsc::unbounded_channel().0,
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        // The probe accepts the container, so the load itself must succeed: the
+        // failure only appears once ffmpeg tries to decode.
+        engine.load(&bytes).expect("the header is still readable");
+        assert_eq!(engine.status(), PlayState::Paused);
+
+        engine.play();
+        assert_eq!(engine.status(), PlayState::Playing);
+
+        wait_until(Duration::from_secs(10), || {
+            matches!(engine.status(), PlayState::Error | PlayState::Stopped)
+        });
+        assert_eq!(
+            engine.status(),
+            PlayState::Error,
+            "undecodable media must not look like a clean EOF"
+        );
+
+        engine.stop();
     }
 
     #[test]
