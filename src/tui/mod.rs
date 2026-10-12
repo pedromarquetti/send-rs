@@ -97,7 +97,6 @@ enum UiEvent {
     /// Result of a backgrounded `Messenger::media_bytes` fetch for the video
     /// popup; bytes are handed to the video player worker (guarded by the
     /// popup still showing that message).
-    /// BUG: check video rotation logic: landscape videos are not being shown as such, all videos
     /// are being rendered as portrait
     VideoMedia {
         chat: ChatId,

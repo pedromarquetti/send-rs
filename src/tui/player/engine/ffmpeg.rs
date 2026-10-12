@@ -51,10 +51,6 @@ const MAX_WIDTH: u32 = 1280;
 /// leaving the popup on its placeholder.
 const POSTER_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The `ffprobe` command that reports the first video stream's geometry.
-///
-/// `-show_entries` is repeatable and ffprobe merges the flags, so the stream
-/// and format durations come from one invocation.
 fn probe_args(path: &Path) -> Vec<OsString> {
     [
         "-v",
@@ -65,6 +61,10 @@ fn probe_args(path: &Path) -> Vec<OsString> {
         "v:0",
         "-show_entries",
         "stream=width,height,avg_frame_rate,duration,nb_frames",
+        "-show_entries",
+        "stream_side_data=rotation",
+        "-show_entries",
+        "stream_tags=rotate",
         "-show_entries",
         "format=duration",
     ]
@@ -79,7 +79,19 @@ fn probe_args(path: &Path) -> Vec<OsString> {
 ///
 /// The scale is explicit rather than an expression like `scale=-2` because the
 /// reader has to know the exact byte count of a frame before reading it.
-fn decode_args(path: &Path, position: f64, width: u32, height: u32, fps: f64) -> Vec<OsString> {
+///
+/// Autorotation is turned off and the container's display rotation is applied
+/// with an explicit filter instead, before the scale and against the displayed
+/// (post-rotation) geometry. `-noautorotate` is an input option, so it must
+/// precede the `-i` it applies to.
+fn decode_args(
+    path: &Path,
+    position: f64,
+    width: u32,
+    height: u32,
+    fps: f64,
+    rotation: i32,
+) -> Vec<OsString> {
     let mut args: Vec<OsString> = ["-hide_banner", "-loglevel", "error"]
         .iter()
         .map(OsString::from)
@@ -88,6 +100,10 @@ fn decode_args(path: &Path, position: f64, width: u32, height: u32, fps: f64) ->
     // `-nostdin` is mandatory: the child shares the TUI's stdin and would
     // otherwise swallow keystrokes.
     args.push("-nostdin".into());
+
+    // The explicit `orientation_filter` below is the only rotation; leaving
+    // ffmpeg's own autorotation on would rotate a rotated source twice.
+    args.push("-noautorotate".into());
 
     if position > 0.0 {
         args.push("-ss".into());
@@ -100,7 +116,12 @@ fn decode_args(path: &Path, position: f64, width: u32, height: u32, fps: f64) ->
     args.push("-an".into());
     args.push("-sn".into());
     args.push("-vf".into());
-    args.push(format!("scale={width}:{height}").into());
+    let scale = format!("scale={width}:{height}");
+    let filter = match orientation_filter(rotation) {
+        Some(orientation) => format!("{orientation},{scale}"),
+        None => scale,
+    };
+    args.push(filter.into());
     args.push("-fps_mode".into());
     args.push("cfr".into());
     args.push("-r".into());
@@ -123,6 +144,27 @@ fn parse_frame_rate(raw: &str) -> Option<f64> {
     (numerator > 0.0 && denominator > 0.0).then(|| numerator / denominator)
 }
 
+/// The ffmpeg filter that undoes the container's display rotation, or `None`
+/// when the frame is already upright.
+fn orientation_filter(rotation: i32) -> Option<&'static str> {
+    match rotation.rem_euclid(360) {
+        90 => Some("transpose=2"),
+        180 => Some("hflip,vflip"),
+        270 => Some("transpose=1"),
+        _ => None,
+    }
+}
+
+/// The dimensions a frame is displayed at once the container's rotation is
+/// applied: a quarter turn swaps the coded width and height.
+fn display_dimensions(width: u32, height: u32, rotation: i32) -> (u32, u32) {
+    if matches!(rotation.rem_euclid(360), 90 | 270) {
+        (height, width)
+    } else {
+        (width, height)
+    }
+}
+
 /// Fit the source inside `max_width` without upscaling, preserving the aspect
 /// ratio. Dimensions are rounded to even numbers because a `yuv420p` source
 /// scaled to an odd width trips chroma subsampling on some builds.
@@ -134,18 +176,40 @@ fn scaled_dimensions(src_width: u32, src_height: u32, max_width: u32) -> (u32, u
     let width = src_width.min(max_width);
     let scaled = u64::from(src_height) * u64::from(width) / u64::from(src_width);
 
+    // Both sides are pinned to at least 2: even-rounding a one-pixel edge down
+    // to zero would make `scale` reject the graph.
     (
-        width - (width % 2),
+        (width - (width % 2)).max(2),
         ((scaled as u32) - ((scaled as u32) % 2)).max(2),
     )
 }
 
-/// Read geometry, frame rate and duration out of `ffprobe`'s JSON.
+/// Container-declared display rotation, in degrees.
+///
+/// Modern mp4/mov store it as `Display Matrix` side data; older containers use
+/// a `rotate` tag. A value that is absent, unparsable or not a quarter turn
+/// reads as no rotation.
+fn parse_rotation(stream: &serde_json::Value) -> i32 {
+    let matrix = stream["side_data_list"]
+        .as_array()
+        .and_then(|sides| sides.iter().find_map(|side| side["rotation"].as_f64()));
+    let tag = stream["tags"]["rotate"]
+        .as_str()
+        .and_then(|raw| raw.trim().parse::<f64>().ok());
+
+    matrix
+        .or(tag)
+        .map(|deg| ((deg / 90.0).round() as i32 * 90).rem_euclid(360))
+        .unwrap_or(0)
+}
+
+/// Read coded geometry, frame rate, duration and display rotation out of
+/// `ffprobe`'s JSON.
 ///
 /// Only a video stream with usable dimensions is playable; a missing or
 /// unparsable frame rate or duration falls back rather than failing the load,
 /// because neither is needed to start decoding.
-fn parse_probe_json(json: &str) -> Result<(u32, u32, f64, f64), String> {
+fn parse_probe_json(json: &str) -> Result<(u32, u32, f64, f64, i32), String> {
     let probe: serde_json::Value = serde_json::from_str(json)
         .map_err(|err| format!("cannot read the ffprobe output: {err}"))?;
 
@@ -166,6 +230,8 @@ fn parse_probe_json(json: &str) -> Result<(u32, u32, f64, f64), String> {
         .and_then(parse_frame_rate)
         .map_or(MAX_FPS, |rate| rate.min(MAX_FPS));
 
+    let rotation = parse_rotation(stream);
+
     // A stream's own duration is more accurate than the container's, but many
     // mp4s only fill one of the two.
     let duration = stream["duration"]
@@ -175,7 +241,7 @@ fn parse_probe_json(json: &str) -> Result<(u32, u32, f64, f64), String> {
         .filter(|secs| *secs > 0.0)
         .unwrap_or(0.0);
 
-    Ok((width, height, fps, duration))
+    Ok((width, height, fps, duration, rotation))
 }
 
 /// Fill `buf` from `reader`, reporting how many bytes arrived before the pipe
@@ -224,6 +290,9 @@ pub struct FfmpegEngine {
     /// bytes, which is what lets the reader size its buffer up front.
     width: u32,
     height: u32,
+    /// Display rotation declared by the container, in degrees; applied as an
+    /// explicit filter so the decoded frames are upright.
+    rotation: i32,
     fps: f64,
     duration: f64,
     /// The running decode, if any.
@@ -260,6 +329,7 @@ impl FfmpegEngine {
             temp: None,
             width: 0,
             height: 0,
+            rotation: 0,
             fps: MAX_FPS,
             duration: 0.0,
             child: None,
@@ -343,6 +413,7 @@ impl FfmpegEngine {
                 self.width,
                 self.height,
                 self.fps,
+                self.rotation,
             ))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -429,7 +500,7 @@ impl MediaEngine for FfmpegEngine {
     fn load(&mut self, bytes: &[u8]) -> Result<f64, String> {
         self.kill_decode();
 
-        let loaded = (|| -> Result<(NamedTempFile, u32, u32, f64, f64), String> {
+        let loaded = (|| -> Result<(NamedTempFile, u32, u32, f64, f64, i32), String> {
             let temp = temp_file()
                 .map_err(|err| format!("cannot create a temporary file for the video: {err}"))?;
             std::fs::write(temp.path(), bytes)
@@ -447,14 +518,19 @@ impl MediaEngine for FfmpegEngine {
                 return Err(format!("ffprobe could not read the video: {reason}"));
             }
 
-            let (src_width, src_height, fps, duration) =
+            let (src_width, src_height, fps, duration, rotation) =
                 parse_probe_json(&String::from_utf8_lossy(&output.stdout))?;
-            let (width, height) = scaled_dimensions(src_width, src_height, MAX_WIDTH);
+            // The scale targets the displayed geometry: autorotation is off, so
+            // the explicit rotation filter below turns the coded frame before
+            // it reaches `scale`.
+            let (display_width, display_height) =
+                display_dimensions(src_width, src_height, rotation);
+            let (width, height) = scaled_dimensions(display_width, display_height, MAX_WIDTH);
 
-            Ok((temp, width, height, fps, duration))
+            Ok((temp, width, height, fps, duration, rotation))
         })();
 
-        let (temp, width, height, fps, duration) = match loaded {
+        let (temp, width, height, fps, duration, rotation) = match loaded {
             Ok(loaded) => loaded,
             Err(err) => {
                 // `temp` never escaped the closure, so the file (if it was
@@ -462,6 +538,7 @@ impl MediaEngine for FfmpegEngine {
                 self.temp = None;
                 self.width = 0;
                 self.height = 0;
+                self.rotation = 0;
                 self.duration = 0.0;
                 self.timing.stop();
                 self.status = PlayState::Error;
@@ -472,7 +549,7 @@ impl MediaEngine for FfmpegEngine {
 
         debug!(
             width,
-            height, fps, duration, "video loaded, paused at the start"
+            height, rotation, fps, duration, "video loaded, paused at the start"
         );
 
         // The popup shows the previous session's last frame until the new
@@ -481,6 +558,7 @@ impl MediaEngine for FfmpegEngine {
         self.temp = Some(temp);
         self.width = width;
         self.height = height;
+        self.rotation = rotation;
         self.fps = fps;
         self.duration = duration;
         self.timing.stop();
@@ -694,6 +772,10 @@ mod tests {
                 "-show_entries",
                 "stream=width,height,avg_frame_rate,duration,nb_frames",
                 "-show_entries",
+                "stream_side_data=rotation",
+                "-show_entries",
+                "stream_tags=rotate",
+                "-show_entries",
                 "format=duration",
                 "/tmp/clip.bin",
             ]
@@ -708,6 +790,7 @@ mod tests {
             320,
             240,
             12.0,
+            0,
         ));
 
         assert_eq!(
@@ -718,6 +801,8 @@ mod tests {
                 "error",
                 // The child shares the TUI's stdin, so it must never read it.
                 "-nostdin",
+                // Rotation is applied by the explicit filter, never implicitly.
+                "-noautorotate",
                 "-ss",
                 "1.500",
                 "-i",
@@ -740,8 +825,36 @@ mod tests {
     }
 
     #[test]
+    fn decode_args_rotate_before_scaling_a_rotated_source() {
+        // A 90-degree source is decoded upright before the scale, and the
+        // scale targets the displayed (portrait) geometry.
+        let args = args_of(&decode_args(
+            Path::new("/tmp/clip.bin"),
+            0.0,
+            240,
+            320,
+            25.0,
+            90,
+        ));
+
+        let filter = args
+            .windows(2)
+            .find_map(|pair| (pair[0] == "-vf").then(|| pair[1].clone()))
+            .expect("the decode carries a filter");
+        assert_eq!(filter, "transpose=2,scale=240:320");
+        assert!(args.contains(&"-noautorotate".to_string()));
+    }
+
+    #[test]
     fn decode_args_omit_a_seek_at_the_start() {
-        let args = args_of(&decode_args(Path::new("/tmp/clip.bin"), 0.0, 64, 48, 12.0));
+        let args = args_of(&decode_args(
+            Path::new("/tmp/clip.bin"),
+            0.0,
+            64,
+            48,
+            12.0,
+            0,
+        ));
 
         assert!(!args.contains(&"-ss".to_string()));
     }
@@ -770,6 +883,34 @@ mod tests {
         // A degenerate source has no playable dimensions.
         assert_eq!(scaled_dimensions(0, 240, 1280), (0, 0));
         assert_eq!(scaled_dimensions(320, 0, 1280), (0, 0));
+        // A one-pixel source must not even-round down to a zero-width `scale`.
+        assert_eq!(scaled_dimensions(1, 100, 1280), (2, 100));
+        assert_eq!(scaled_dimensions(100, 1, 1280), (100, 2));
+    }
+
+    #[test]
+    fn orientation_filter_maps_each_cardinal_rotation_like_autorotate() {
+        // The exact filters ffmpeg's own `-autorotate` would have inserted, so
+        // disabling it and applying these yields identical pixels.
+        assert_eq!(orientation_filter(0), None);
+        assert_eq!(orientation_filter(90), Some("transpose=2"));
+        assert_eq!(orientation_filter(180), Some("hflip,vflip"));
+        assert_eq!(orientation_filter(270), Some("transpose=1"));
+        // Negative and out-of-range values normalise to a quarter turn.
+        assert_eq!(orientation_filter(-90), Some("transpose=1"));
+        assert_eq!(orientation_filter(-180), Some("hflip,vflip"));
+        assert_eq!(orientation_filter(450), Some("transpose=2"));
+        // A non-cardinal angle has no transposition to apply.
+        assert_eq!(orientation_filter(45), None);
+    }
+
+    #[test]
+    fn display_dimensions_swap_only_for_a_quarter_turn() {
+        assert_eq!(display_dimensions(320, 240, 0), (320, 240));
+        assert_eq!(display_dimensions(320, 240, 90), (240, 320));
+        assert_eq!(display_dimensions(320, 240, 180), (320, 240));
+        assert_eq!(display_dimensions(320, 240, 270), (240, 320));
+        assert_eq!(display_dimensions(320, 240, -90), (240, 320));
     }
 
     #[test]
@@ -789,10 +930,11 @@ mod tests {
   "format": { "duration": "2.000000" }
 }"#;
 
-        let (width, height, fps, duration) = parse_probe_json(json).unwrap();
+        let (width, height, fps, duration, rotation) = parse_probe_json(json).unwrap();
         assert_eq!((width, height), (320, 240));
         assert_eq!(fps, 25.0, "a rate below the cap passes through untouched");
         assert_eq!(duration, 2.0);
+        assert_eq!(rotation, 0, "an unrotated source has no display rotation");
 
         // A rate above the cap is decoded at the cap instead.
         let json = r#"{
@@ -806,8 +948,49 @@ mod tests {
   ],
   "format": { "duration": "2.000000" }
 }"#;
-        let (_, _, fps, _) = parse_probe_json(json).unwrap();
+        let (_, _, fps, _, _) = parse_probe_json(json).unwrap();
         assert_eq!(fps, MAX_FPS, "decode is capped at MAX_FPS");
+    }
+
+    #[test]
+    fn probe_json_reads_the_display_matrix_rotation() {
+        // The shape `ffprobe -show_entries stream_side_data=rotation` produces
+        // for a portrait clip encoded as landscape plus a display matrix.
+        let json = r#"{
+  "streams": [
+    {
+      "width": 320,
+      "height": 240,
+      "avg_frame_rate": "25/1",
+      "side_data_list": [ { "rotation": 90 } ]
+    }
+  ]
+}"#;
+        let (width, height, _, _, rotation) = parse_probe_json(json).unwrap();
+        assert_eq!((width, height), (320, 240), "the coded frame is landscape");
+        assert_eq!(rotation, 90);
+        assert_eq!(display_dimensions(width, height, rotation), (240, 320));
+
+        // ffprobe reports the opposite quarter turns as negative values.
+        for (raw, expected) in [("-90", 270), ("-180", 180), ("270", 270)] {
+            let json = format!(
+                r#"{{ "streams": [ {{ "width": 320, "height": 240, "side_data_list": [ {{ "rotation": {raw} }} ] }} ] }}"#
+            );
+            let (_, _, _, _, rotation) = parse_probe_json(&json).unwrap();
+            assert_eq!(rotation, expected, "rotation tag {raw}");
+        }
+    }
+
+    #[test]
+    fn probe_json_reads_the_legacy_rotate_tag() {
+        // Containers without a display matrix fall back to the `rotate` tag.
+        let json = r#"{
+  "streams": [
+    { "width": 640, "height": 480, "tags": { "rotate": "90" } }
+  ]
+}"#;
+        let (_, _, _, _, rotation) = parse_probe_json(json).unwrap();
+        assert_eq!(rotation, 90);
     }
 
     #[test]
@@ -818,7 +1001,7 @@ mod tests {
   "streams": [ { "width": 640, "height": 480, "avg_frame_rate": "0/0" } ],
   "format": { "duration": "0.000000" }
 }"#;
-        let (width, height, fps, duration) = parse_probe_json(json).unwrap();
+        let (width, height, fps, duration, _) = parse_probe_json(json).unwrap();
         assert_eq!((width, height), (640, 480));
         assert_eq!(fps, MAX_FPS);
         assert_eq!(duration, 0.0);
@@ -828,7 +1011,7 @@ mod tests {
   "streams": [ { "width": 640, "height": 480, "avg_frame_rate": "30/1" } ],
   "format": { "duration": "7.500000" }
 }"#;
-        let (_, _, fps, duration) = parse_probe_json(json).unwrap();
+        let (_, _, fps, duration, _) = parse_probe_json(json).unwrap();
         assert_eq!(fps, 30.0, "30 fps is below the cap, so it passes through");
         assert_eq!(duration, 7.5);
     }
@@ -936,6 +1119,94 @@ mod tests {
         assert!(
             pending.load(Ordering::SeqCst),
             "the next wake stays latched"
+        );
+
+        engine.stop();
+    }
+
+    /// The acceptance check for display orientation: a portrait clip stored as
+    /// landscape plus a 90-degree display matrix must decode to a portrait
+    /// frame whose content is actually rotated — not merely reshaped.
+    #[test]
+    fn a_rotated_portrait_clip_decodes_upright() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg is not installed");
+            return;
+        }
+
+        // A landscape black clip with a white square in its top-left corner:
+        // after a correct 90-degree rotation the square belongs in the
+        // bottom-left corner of the portrait frame.
+        let base = temp_file().expect("a scratch holder for the base clip");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=black:size=320x240:rate=25:duration=1",
+                "-vf",
+                "drawbox=x=0:y=0:w=64:h=64:color=white:t=fill",
+                "-pix_fmt",
+                "yuv420p",
+                "-y",
+                "-f",
+                "mp4",
+            ])
+            .arg(base.path())
+            .status()
+            .expect("ffmpeg generates the base clip");
+        assert!(status.success(), "ffmpeg failed to build the base clip");
+
+        // Copy the stream while attaching the display-matrix rotation.
+        let rotated = temp_file().expect("a scratch holder for the rotated clip");
+        let status = Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
+            .args(["-display_rotation", "90"])
+            .arg("-i")
+            .arg(base.path())
+            .args(["-c", "copy"])
+            .arg(rotated.path())
+            .status()
+            .expect("ffmpeg attaches the display rotation");
+        if !status.success() {
+            eprintln!("skipping: this ffmpeg cannot attach a display rotation");
+            return;
+        }
+
+        let slot = Arc::new(Mutex::new(None));
+        let mut engine = FfmpegEngine::new(
+            Arc::clone(&slot),
+            tokio::sync::mpsc::unbounded_channel().0,
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        let bytes = std::fs::read(rotated.path()).unwrap();
+        engine.load(&bytes).unwrap();
+
+        wait_until(Duration::from_secs(10), || {
+            slot.try_lock().is_ok_and(|guard| guard.is_some())
+        });
+        let frame = slot.try_lock().unwrap().take().unwrap();
+        let rgb = frame.to_rgb8();
+
+        assert_eq!(
+            rgb.dimensions(),
+            (240, 320),
+            "a rotated portrait clip must decode portrait, not landscape"
+        );
+
+        let white = |x: u32, y: u32| rgb.get_pixel(x, y).0[0] > 128;
+        assert!(
+            white(8, 320 - 9),
+            "the top-left corner square must rotate to the bottom-left"
+        );
+        assert!(
+            !white(240 - 9, 8),
+            "the opposite corner must stay black after the rotation"
         );
 
         engine.stop();
