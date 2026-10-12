@@ -659,13 +659,31 @@ impl MediaEngine for FfmpegEngine {
         self.kill_decode();
         self.timing.seek(target, playing);
 
-        // A paused session rebases its clock and shows the frame the next
-        // `play` decodes; a playing one has to be respawned at the new offset,
-        // since the child cannot be told to jump in its output stream.
-        if playing && let Err(err) = self.spawn_decode(&path, target) {
-            warn!(error = %err, "video seek could not restart the decode");
-            self.status = PlayState::Error;
+        if playing {
+            if let Err(err) = self.spawn_decode(&path, target) {
+                warn!(error = %err, "video seek could not restart the decode");
+                self.status = PlayState::Error;
+            }
+            return;
         }
+
+        // A paused session must show the frame at the sought position: decode
+        // exactly one frame, publish it, and stop the decode again.
+        if let Err(err) = self.spawn_decode(&path, target) {
+            warn!(error = %err, "paused seek could not decode a frame");
+            self.status = PlayState::Error;
+            return;
+        }
+
+        let deadline = Instant::now() + POSTER_FRAME_TIMEOUT;
+        while Instant::now() < deadline {
+            if self.frame_slot.try_lock().is_ok_and(|slot| slot.is_some()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        self.kill_decode();
+        // status remains `PlayState::Paused`.
     }
 
     fn stop(&mut self) {
