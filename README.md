@@ -103,6 +103,7 @@ can do for itself.
 - [x] Draft / Myself conversation - using wp/tg integrated self chat
 - [ ] Help menu Popup to show keymaps
 - [ ] crates.io build - Make the binary available in `cargo install`
+- [ ] View contact/group info 
 - [x] Descriptive error handling
 - [x] WhatsApp integration - Core WhatsApp integration
 - [x] Message actions (reply, edit, delete) for whatsapp

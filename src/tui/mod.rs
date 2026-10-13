@@ -31,8 +31,8 @@ use crate::tui::image::{ImageWidgetState, VideoWidgetState};
 use crate::tui::loading::{LoadingArea, LoadingWidget};
 // Re-exported so the notifier can key its deduplication on the same message
 // identity the player uses, without reaching into a private module.
-pub use crate::tui::player::PlayKey;
 use crate::tui::player::{FfmpegEngine, PlayState, PlaybackState, Player, RodioEngine};
+pub use crate::tui::player::{PlayKey, PlayTrack};
 use crate::tui::popup::{AudioPopup, ImagePopup, PopupKind, VideoPopup};
 use crate::tui::settings::Settings;
 use crate::tui::state::{AppState, Focus, MediaAction, Mode, Screen};
@@ -714,6 +714,7 @@ struct App {
     /// engine never has to hand a frame back (D6).
     video_frames: Arc<Mutex<Option<DynamicImage>>>,
     video_player: Player,
+    video_audio_player: Player,
     /// Shared redraw latch for the video path: the decoder and the encode
     /// worker both set it before waking through `video_redraw_wake`, and the
     /// event loop re-arms it every time it receives a `UiEvent::Redraw`, so a
@@ -762,6 +763,7 @@ impl App {
             player: Player::new(|| Box::new(RodioEngine::default()), tx.clone()),
             video_frames,
             video_player,
+            video_audio_player: Player::new(|| Box::new(RodioEngine::default()), tx.clone()),
             video_redraw_pending,
             notifier,
             tx,
@@ -939,7 +941,11 @@ impl App {
             return;
         }
 
-        let source = PlayKey { chat, message_id };
+        let source = PlayKey {
+            chat,
+            message_id,
+            track: PlayTrack::Media,
+        };
 
         // Failure reasons differ: `Ok(None)` means the provider has no media
         // (e.g. WhatsApp still lacks a cached CDN reference), `Err` is a real
@@ -1005,6 +1011,7 @@ impl App {
             source: PlayKey {
                 chat: chat.clone(),
                 message_id: message_id.clone(),
+                track: PlayTrack::Media,
             },
             status: PlayState::Loading,
             position: 0.0,
@@ -1045,6 +1052,7 @@ impl App {
             source: PlayKey {
                 chat: chat.clone(),
                 message_id: message_id.clone(),
+                track: PlayTrack::VideoFrames,
             },
             status: PlayState::Loading,
             position: 0.0,
@@ -1093,7 +1101,11 @@ impl App {
             return;
         }
 
-        let source = PlayKey { chat, message_id };
+        let source = PlayKey {
+            chat,
+            message_id,
+            track: PlayTrack::VideoFrames,
+        };
 
         // Same split as audio: `Ok(None)` is the provider having no bytes yet,
         // `Err` is a genuine download/decrypt failure. Both become a note in
@@ -1104,7 +1116,14 @@ impl App {
                 debug!(chat = ?source.chat, msg = %source.message_id, "Video media loaded, awaiting play");
                 // Load only; playback starts on the first space press, so
                 // opening a video never starts decoding unasked.
-                self.video_player.load(source, bytes);
+                self.video_player.load(source.clone(), bytes.clone());
+                self.video_audio_player.load(
+                    PlayKey {
+                        track: PlayTrack::VideoAudio,
+                        ..source.clone()
+                    },
+                    bytes,
+                );
                 return;
             }
             Ok(None) => {
@@ -1127,7 +1146,10 @@ impl App {
         }
 
         self.state.video = Some(PlaybackState {
-            source,
+            source: PlayKey {
+                track: PlayTrack::VideoFrames,
+                ..source
+            },
             status: PlayState::Error,
             position: 0.0,
             duration: 0.0,
@@ -1158,6 +1180,7 @@ impl App {
         if was_video {
             debug!("video popup dismissed, stopping playback");
             self.video_player.stop();
+            self.video_audio_player.stop();
         }
     }
 
@@ -1165,6 +1188,7 @@ impl App {
         self.cancel_chat_load();
         self.player.stop();
         self.video_player.stop();
+        self.video_audio_player.stop();
 
         for messenger in &mut self.state.messengers {
             if let Err(err) = messenger.disconnect().await {
@@ -1626,13 +1650,22 @@ impl App {
 
                     if playing {
                         player.pause();
+                        if is_video {
+                            self.video_audio_player.pause();
+                        }
                     } else {
                         player.play();
+                        if is_video {
+                            self.video_audio_player.play();
+                        }
                     }
                 }
                 MediaAction::Seek { delta_secs } => {
                     debug!(video = is_video, "Seeking {delta_secs}");
                     player.seek_by(f64::from(delta_secs));
+                    if is_video {
+                        self.video_audio_player.seek_by(f64::from(delta_secs));
+                    }
                 }
             }
             return;
@@ -2048,8 +2081,9 @@ mod tests {
         // Mirrors `open_audio_popup`: the same-source session is seeded so the
         // worker's reports are accepted (see `apply_playback_state` guard).
         let seeded_source = PlayKey {
-            chat: ChatId::Myself,
+            chat: audio_chat().id,
             message_id: MessageId::from("audio-1"),
+            track: PlayTrack::Media,
         };
         app.state.playback = Some(PlaybackState {
             source: seeded_source,
@@ -2149,6 +2183,7 @@ mod tests {
         let source = PlayKey {
             chat: ChatId::Myself,
             message_id: MessageId::from("video-1"),
+            track: PlayTrack::VideoFrames,
         };
         app.state.video = Some(PlaybackState {
             source: source.clone(),
@@ -2401,6 +2436,9 @@ mod tests {
 
         let mut saw_loading = false;
         wait_for_playback(&mut app, &mut rx, |state| {
+            if state.source != source {
+                return false;
+            }
             if state.status == PlayState::Loading {
                 saw_loading = true;
                 return false;

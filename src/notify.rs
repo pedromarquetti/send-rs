@@ -23,7 +23,7 @@ use tracing::{debug, warn};
 
 use crate::backend::{ChatId, Message, MessageId, Provider};
 use crate::config::NotificationsConfig;
-use crate::tui::PlayKey;
+use crate::tui::{PlayKey, PlayTrack};
 
 /// Longest title a notice carries, in characters.
 const MAX_TITLE_CHARS: usize = 60;
@@ -281,6 +281,7 @@ impl Notifier {
         let key = PlayKey {
             chat: notice.chat.clone(),
             message_id: notice.message_id.clone(),
+            track: PlayTrack::Media,
         };
 
         // Remember the id *before* the cooldown check, so a message suppressed

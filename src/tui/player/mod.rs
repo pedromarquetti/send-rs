@@ -26,11 +26,23 @@ pub enum PlayState {
     Error,
 }
 
-/// Identifies which message an audio session belongs to.
+/// Identifies which message a playback session belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayTrack {
+    /// Audio popup or general media playback (notifications excluded).
+    Media,
+    /// Video frame decoding session (FFmpeg raw frames).
+    VideoFrames,
+    /// Video track audio session (separate from frame decoding).
+    VideoAudio,
+}
+
+/// Identifies which message a playback session belongs to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlayKey {
     pub chat: ChatId,
     pub message_id: MessageId,
+    pub track: PlayTrack,
 }
 
 /// A snapshot of the audio session reported by the player worker to the UI.
@@ -410,6 +422,7 @@ mod tests {
         PlayKey {
             chat: ChatId::Telegram(chat),
             message_id: MessageId(id.to_string()),
+            track: PlayTrack::Media,
         }
     }
 

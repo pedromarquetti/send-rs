@@ -1,3 +1,4 @@
+use crate::tui::player::PlayTrack;
 use anyhow::{Result, anyhow};
 use arboard::Clipboard;
 use ratatui::crossterm::event::KeyEvent;
@@ -153,6 +154,12 @@ pub struct AppState {
     /// routed by matching [`PlaybackState::source`].
     pub video: Option<PlaybackState>,
 
+    /// Dedicated playback snapshot for the video track's audio (if any). Kept
+    /// separate so frame state and audio state do not interfere, and so the
+    /// video popup can continue showing frames even if the audio track is
+    /// missing or fails.
+    pub video_audio: Option<PlaybackState>,
+
     /// An in-flight push-to-talk voice-note recording, if active.
     /// Visible to the TUI module so dispatch tests can install a take without
     /// opening a real mic.
@@ -246,6 +253,7 @@ impl AppState {
             loading: None,
             playback: None,
             video: None,
+            video_audio: None,
             recording: None,
             last_record_key: None,
             clipboard,
@@ -531,6 +539,7 @@ impl AppState {
         // here also makes `apply_playback_state`'s guard drop any late reports.
         self.playback = None;
         self.video = None;
+        self.video_audio = None;
     }
 
     /// The message a Message/Image/Audio/Video popup quotes, when it can be
@@ -554,18 +563,34 @@ impl AppState {
     /// slot is dropped, so events racing with a dismissed popup can never
     /// resurrect stale playback state.
     pub fn apply_playback_state(&mut self, incoming: PlaybackState) {
-        if self
-            .playback
-            .as_ref()
-            .is_some_and(|current| current.source == incoming.source)
-        {
-            self.playback = Some(incoming);
-        } else if self
-            .video
-            .as_ref()
-            .is_some_and(|current| current.source == incoming.source)
-        {
-            self.video = Some(incoming);
+        match incoming.source.track {
+            PlayTrack::VideoAudio => {
+                if self
+                    .video_audio
+                    .as_ref()
+                    .is_some_and(|current| current.source == incoming.source)
+                {
+                    self.video_audio = Some(incoming);
+                }
+            }
+            PlayTrack::VideoFrames => {
+                if self
+                    .video
+                    .as_ref()
+                    .is_some_and(|current| current.source == incoming.source)
+                {
+                    self.video = Some(incoming);
+                }
+            }
+            PlayTrack::Media => {
+                if self
+                    .playback
+                    .as_ref()
+                    .is_some_and(|current| current.source == incoming.source)
+                {
+                    self.playback = Some(incoming);
+                }
+            }
         }
     }
 
@@ -2037,7 +2062,7 @@ mod tests {
     use crate::backend::{MediaKind, Message, MessageAction, MessageId, MessageMedia, Messenger};
     use crate::config::KeymapConfig;
     use crate::tui::image::{ImageWidgetState, VideoWidgetState};
-    use crate::tui::player::{PlayKey, PlayState, PlaybackState};
+    use crate::tui::player::{PlayKey, PlayState, PlayTrack, PlaybackState};
     use crate::tui::popup::{AudioPopup, ImagePopup, PopUp, VideoPopup};
     use ratatui::buffer::Buffer;
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
@@ -5077,6 +5102,7 @@ mod tests {
         let source = PlayKey {
             chat: ChatId::Telegram(1),
             message_id: MessageId::from("42"),
+            track: PlayTrack::Media,
         };
         let report = |status| PlaybackState {
             source: source.clone(),
@@ -5100,6 +5126,7 @@ mod tests {
             source: PlayKey {
                 chat: ChatId::Telegram(2),
                 message_id: MessageId::from("43"),
+                track: PlayTrack::Media,
             },
             status: PlayState::Playing,
             position: 1.0,
@@ -5179,6 +5206,7 @@ mod tests {
             source: PlayKey {
                 chat: ChatId::Myself,
                 message_id: MessageId::from("video-1"),
+                track: PlayTrack::VideoFrames,
             },
             status,
             position,
@@ -5197,10 +5225,17 @@ mod tests {
         let audio = PlayKey {
             chat: ChatId::Telegram(1),
             message_id: MessageId::from("audio-9"),
+            track: PlayTrack::Media,
         };
         let video = PlayKey {
             chat: ChatId::Telegram(1),
             message_id: MessageId::from("video-9"),
+            track: PlayTrack::VideoFrames,
+        };
+        let video_audio = PlayKey {
+            chat: ChatId::Telegram(1),
+            message_id: MessageId::from("video-9"),
+            track: PlayTrack::VideoAudio,
         };
         let report = |source: PlayKey, position| PlaybackState {
             source,
@@ -5213,6 +5248,7 @@ mod tests {
         // Both sessions live at once; each report updates only its own slot.
         state.playback = Some(report(audio.clone(), 1.0));
         state.video = Some(report(video.clone(), 1.0));
+        state.video_audio = Some(report(video_audio.clone(), 1.0));
 
         state.apply_playback_state(report(video.clone(), 4.0));
         assert_eq!(state.video.as_ref().unwrap().position, 4.0);
@@ -5220,6 +5256,14 @@ mod tests {
             state.playback.as_ref().unwrap().position,
             1.0,
             "a video report must not disturb the audio slot"
+        );
+
+        state.apply_playback_state(report(video_audio.clone(), 2.0));
+        assert_eq!(state.video_audio.as_ref().unwrap().position, 2.0);
+        assert_eq!(
+            state.video.as_ref().unwrap().position,
+            4.0,
+            "a video-audio report must not disturb the frame slot"
         );
 
         state.apply_playback_state(report(audio.clone(), 3.0));
@@ -5232,6 +5276,7 @@ mod tests {
             PlayKey {
                 chat: ChatId::Telegram(1),
                 message_id: MessageId::from("gone"),
+                track: PlayTrack::Media,
             },
             9.0,
         ));
@@ -5242,6 +5287,7 @@ mod tests {
         state.dismiss_popup();
         assert!(state.playback.is_none());
         assert!(state.video.is_none());
+        assert!(state.video_audio.is_none());
     }
 
     #[tokio::test]
@@ -5306,6 +5352,7 @@ mod tests {
             source: PlayKey {
                 chat: ChatId::Myself,
                 message_id: MessageId::from("audio-1"),
+                track: PlayTrack::Media,
             },
             status: PlayState::Playing,
             position: 3.0,
@@ -5332,6 +5379,7 @@ mod tests {
                     source: PlayKey {
                         chat: ChatId::Myself,
                         message_id: MessageId::from("audio-1"),
+                        track: PlayTrack::Media,
                     },
                     status: PlayState::Paused,
                     position: 12.0,
@@ -5606,6 +5654,7 @@ mod tests {
                     source: PlayKey {
                         chat: ChatId::Myself,
                         message_id: MessageId::from("audio-1"),
+                        track: PlayTrack::Media,
                     },
                     status: PlayState::Error,
                     position: 0.0,
