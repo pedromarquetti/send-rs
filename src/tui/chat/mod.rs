@@ -32,9 +32,13 @@ pub struct ChatState {
     /// view is selected through `SearchState::map_to_source`.
     pub search: SearchState,
     /// Reusable search state for messages in the open chat (matches by message
-    /// text). `visible_indices` hold history indices of the matching messages.
+    /// text). `visible_indices` hold history indices of the matching messages
+    /// (source/history indices). While a filter is active, `message_list_state`
+    /// tracks the selected index in visible space (0..matches.len()-1); while
+    /// unfiltered, `message_list_state` tracks the selected index in
+    /// history/source space.
     pub message_search: SearchState,
-    /// History index selected when message search began, restored on cancel.
+    /// Source/history index selected when message search began, restored on cancel.
     message_search_anchor: Option<usize>,
     /// responsible for keeping track of the actual visible page page on a chat
     pub visible_page: usize,
@@ -158,7 +162,10 @@ impl ChatState {
             return;
         }
 
-        self.message_search_anchor = self.message_list_state.selected();
+        self.message_search_anchor = self
+            .message_list_state
+            .selected()
+            .and_then(|v| self.visible_to_source_index(v));
         self.message_search.begin();
         self.refresh_message_search();
     }
@@ -172,6 +179,9 @@ impl ChatState {
     /// Cancel message search. While the user was still typing (nothing
     /// accepted), the selection returns to the message that was selected when
     /// the search began; once committed, the selected match is kept.
+    ///
+    /// When returning to unfiltered view, `message_list_state` is set back to
+    /// history/source index space.
     pub fn clear_message_search(&mut self) {
         let was_inserting = self.message_search.is_inserting();
         self.message_search.clear();
@@ -205,16 +215,39 @@ impl ChatState {
     /// Background path: the open chat's history changed while a message search
     /// is active (incoming message, poll result, prepend, edit). Recompute the
     /// match indices so highlights stay correct, but never move the user's
-    /// selection — only live typing auto-jumps.
+    /// selection — only live typing auto-jumps. While filtered, the selection
+    /// is maintained in visible index space.
     fn refresh_message_search_if_active(&mut self) {
         if !self.message_search.is_active() {
             return;
         }
 
         let needle = self.message_search.query_text().trim().to_lowercase();
+        let indices = self.message_search_indices(&needle);
+        let selected_source = self.message_list_state.selected().and_then(|visible| {
+            if !self.message_search.indices().is_empty() {
+                self.message_search.indices().get(visible).copied()
+            } else {
+                Some(visible)
+            }
+        });
 
-        self.message_search
-            .set_visible(self.message_search_indices(&needle));
+        self.message_search.set_visible(indices.clone());
+
+        if indices.is_empty() {
+            self.message_list_state.select(None);
+            return;
+        }
+
+        let new_visible = selected_source
+            .and_then(|src| indices.iter().position(|&idx| idx == src))
+            .or_else(|| {
+                // If we can't map back to same message, keep current visible if valid.
+                self.message_list_state
+                    .selected()
+                    .filter(|&v| v < indices.len())
+            });
+        self.message_list_state.select(new_visible);
     }
 
     fn apply_message_search(&mut self) {
@@ -227,6 +260,7 @@ impl ChatState {
 
         if needle.is_empty() {
             // Unfiltered view: restore the anchor (or the last message).
+            // Switch back to history/source index space.
             self.message_search.set_visible(Vec::new());
             self.message_list_state
                 .select(self.message_search_anchor.or(history_len.checked_sub(1)));
@@ -234,17 +268,32 @@ impl ChatState {
         }
 
         let indices = self.message_search_indices(&needle);
+        let selected_source = self.message_list_state.selected().and_then(|visible| {
+            if !self.message_search.indices().is_empty() {
+                self.message_search.indices().get(visible).copied()
+            } else {
+                Some(visible)
+            }
+        });
 
-        // Keep the selected message when it still matches, else the first match.
-        let current = self.message_list_state.selected();
-        let selected = if current.is_some_and(|idx| indices.contains(&idx)) {
-            current
+        self.message_search.set_visible(indices.clone());
+
+        // Preserve the currently selected message by source index if possible.
+        let selected_visible = if let Some(src) = selected_source
+            && let Some(pos) = indices.iter().position(|&idx| idx == src)
+        {
+            Some(pos)
         } else {
-            indices.first().copied()
+            indices.first().map(|_| 0)
         };
 
-        self.message_search.set_visible(indices);
-        self.message_list_state.select(selected);
+        // If no matches, clear selection.
+        if indices.is_empty() {
+            self.message_list_state.select(None);
+            return;
+        }
+
+        self.message_list_state.select(selected_visible);
     }
 
     /// Source indices of the messages matching `needle` in the open chat's
@@ -418,13 +467,51 @@ impl ChatState {
             .and_then(|open| open.history.iter().find(|m| m.message_id == *id))
     }
 
+    /// Translate a visible message index (position in the rendered list) to the
+    /// corresponding source/history index in `OpenChat::history`.
+    ///
+    /// - When no message filter is active, the visible list equals the full
+    ///   history; this is the identity mapping.
+    /// - When a message filter is active, `message_search.indices()` contains
+    ///   source indices in history order; the visible index `v` maps to
+    ///   `message_search.indices()[v]`.
+    pub fn visible_to_source_index(&self, visible_idx: usize) -> Option<usize> {
+        if self.message_search.is_filtered() {
+            self.message_search.indices().get(visible_idx).copied()
+        } else {
+            Some(visible_idx)
+        }
+    }
+
+    /// Translate a source/history index to its visible index in the filtered
+    /// message list, if the message at that source index matches the active
+    /// filter.
+    ///
+    /// Returns `None` if there is no active filter (visible == source in that
+    /// sense, but callers usually want identity in unfiltered mode), or if the
+    /// source message is not among the current matches.
+    pub fn source_to_visible_index(&self, source_idx: usize) -> Option<usize> {
+        if !self.message_search.is_filtered() {
+            return None;
+        }
+        self.message_search
+            .indices()
+            .iter()
+            .position(|&idx| idx == source_idx)
+    }
+
     /// The message currently selected in the open chat's list, if any.
+    ///
+    /// The selection is stored in visible-index space while filtering is active,
+    /// and in history/source-index space while unfiltered. This helper resolves
+    /// the selected visible index to the underlying source message.
     pub fn selected_message(&self) -> Option<&Message> {
-        let idx = self.message_list_state.selected()?;
+        let visible_idx = self.message_list_state.selected()?;
+        let source_idx = self.visible_to_source_index(visible_idx)?;
 
         self.open_chat
             .as_ref()
-            .and_then(|open| open.history.get(idx))
+            .and_then(|open| open.history.get(source_idx))
     }
 
     pub fn find_mut(&mut self, id: &ChatId) -> Option<(usize, &mut Chat)> {
@@ -621,18 +708,34 @@ impl ChatState {
 
             let new_len = chat.history.len();
 
-            // Preserve the user's current scroll position, clamped to bounds.
-            let new_selected = match old_selected {
-                Some(idx) if new_len > 0 => Some(idx.min(new_len - 1)),
-                _ if new_len > 0 => Some(new_len - 1),
-                _ => None,
-            };
+            // Preserve the user's current scroll position in source/index terms.
+            if self.message_search.is_filtered() {
+                let selected_source = old_selected.and_then(|v| self.visible_to_source_index(v));
+                if let Some(src) = selected_source
+                    && let Some(visible) = self.source_to_visible_index(src)
+                {
+                    self.message_list_state.select(Some(visible));
+                } else if let Some(v) = old_selected {
+                    self.message_list_state.select(Some(v));
+                } else if !self.message_search.indices().is_empty() {
+                    self.message_list_state.select(Some(0));
+                } else {
+                    self.message_list_state.select(None);
+                }
+            } else {
+                // Preserve the user's current scroll position, clamped to bounds.
+                let new_selected = match old_selected {
+                    Some(idx) if new_len > 0 => Some(idx.min(new_len - 1)),
+                    _ if new_len > 0 => Some(new_len - 1),
+                    _ => None,
+                };
 
-            self.message_list_state.select(new_selected);
+                self.message_list_state.select(new_selected);
 
-            // If the user was already at the bottom and new messages arrived, follow them.
-            if old_len > 0 && old_selected == Some(old_len - 1) && new_len > old_len {
-                self.message_list_state.select(Some(new_len - 1));
+                // If the user was already at the bottom and new messages arrived, follow them.
+                if old_len > 0 && old_selected == Some(old_len - 1) && new_len > old_len {
+                    self.message_list_state.select(Some(new_len - 1));
+                }
             }
         }
 
@@ -670,15 +773,34 @@ impl ChatState {
             open.history.splice(0..0, merged);
             open.history.sort_by_key(|message| message.timestamp);
 
-            let selected = self.message_list_state.selected().unwrap_or(0);
+            if self.message_search.is_filtered() {
+                let selected_source = self
+                    .message_list_state
+                    .selected()
+                    .and_then(|v| self.visible_to_source_index(v));
+                if let Some(src) = selected_source
+                    && let Some(visible) = self.source_to_visible_index(src)
+                {
+                    self.message_list_state.select(Some(visible));
+                } else if let Some(v) = self.message_list_state.selected() {
+                    let max = self.message_search.indices().len().saturating_sub(1);
+                    self.message_list_state.select(Some(v.min(max)));
+                } else if !self.message_search.indices().is_empty() {
+                    self.message_list_state.select(Some(0));
+                } else {
+                    self.message_list_state.select(None);
+                }
+            } else {
+                let selected = self.message_list_state.selected().unwrap_or(0);
 
-            self.message_list_state.select(Some(
-                (selected + prepend_count).min(open.history.len().saturating_sub(1)),
-            ));
+                self.message_list_state.select(Some(
+                    (selected + prepend_count).min(open.history.len().saturating_sub(1)),
+                ));
 
-            if current_len == 0 {
-                self.message_list_state
-                    .select(Some(open.history.len().saturating_sub(1)));
+                if current_len == 0 {
+                    self.message_list_state
+                        .select(Some(open.history.len().saturating_sub(1)));
+                }
             }
         }
 
@@ -703,16 +825,27 @@ impl ChatState {
     }
 
     /// Save the current message selection for the open chat.
+    ///
+    /// The saved value is the source/history index of the selected message so
+    /// it can be restored consistently when switching chats or returning to
+    /// an unfiltered view.
     pub fn save_message_selection(&mut self) {
-        if let (Some(chat_id), Some(idx)) = (
-            self.open_chat.as_ref().map(|o| o.chat.id.clone()),
-            self.message_list_state.selected(),
-        ) {
-            self.selected_messages.insert(chat_id, idx);
+        if let Some(chat_id) = self.open_chat.as_ref().map(|o| o.chat.id.clone())
+            && let Some(visible_idx) = self.message_list_state.selected()
+            && let Some(source_idx) = self.visible_to_source_index(visible_idx)
+        {
+            self.selected_messages.insert(chat_id, source_idx);
         }
+        // If the selection cannot be resolved (e.g. no matches), do not
+        // overwrite the persisted selection.
     }
 
     /// Restore the message selection for a chat, defaulting to the last message.
+    ///
+    /// The persisted selection is stored in source/history index space. When a
+    /// message filter is active at restore time, the selection will be mapped
+    /// to the corresponding visible index; if the message is no longer a match,
+    /// the caller is expected to reconcile.
     pub fn restore_message_selection(&mut self, history_len: usize) {
         if history_len == 0 {
             self.message_list_state.select(None);
@@ -728,6 +861,17 @@ impl ChatState {
             .copied()
             .unwrap_or(history_len - 1)
             .min(history_len - 1);
+
+        if self.message_search.is_filtered() {
+            if let Some(visible) = self.source_to_visible_index(idx) {
+                self.message_list_state.select(Some(visible));
+                return;
+            }
+            // If the saved message no longer matches, leave selection to be
+            // reconciled by the filter logic.
+            return;
+        }
+
         self.message_list_state.select(Some(idx));
     }
 }
@@ -1878,7 +2022,7 @@ mod tests {
         assert_eq!(state.message_search.indices(), &[0, 2]);
         assert_eq!(
             state.message_list_state.selected(),
-            Some(2),
+            Some(1),
             "the selected 'foobar' still matches, so selection is kept"
         );
 
@@ -2011,6 +2155,50 @@ mod tests {
     }
 
     #[test]
+    fn message_selection_translates_between_visible_and_history_indices() {
+        let mut state = ChatState {
+            open_chat: Some(OpenChat {
+                chat: chat(ChatId::Telegram(1), "A"),
+                history: (0..6)
+                    .map(|idx| message_with_text(ChatId::Telegram(1), &format!("message {idx}")))
+                    .collect(),
+                has_more_history: true,
+            }),
+            ..Default::default()
+        };
+
+        state.message_search.begin();
+        state.message_search_input(KeyEvent::from(KeyCode::Char('m')));
+        state.message_search.set_visible(vec![2, 5]);
+
+        assert_eq!(state.visible_to_source_index(0), Some(2));
+        assert_eq!(state.visible_to_source_index(1), Some(5));
+        assert_eq!(state.visible_to_source_index(2), None);
+        assert_eq!(state.source_to_visible_index(2), Some(0));
+        assert_eq!(state.source_to_visible_index(5), Some(1));
+        assert_eq!(state.source_to_visible_index(4), None);
+    }
+
+    #[test]
+    fn unfiltered_message_selection_uses_history_indices_directly() {
+        let state = ChatState {
+            open_chat: Some(OpenChat {
+                chat: chat(ChatId::Telegram(1), "A"),
+                history: vec![
+                    message_with_text(ChatId::Telegram(1), "first"),
+                    message_with_text(ChatId::Telegram(1), "second"),
+                ],
+                has_more_history: true,
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(state.visible_to_source_index(0), Some(0));
+        assert_eq!(state.visible_to_source_index(1), Some(1));
+        assert_eq!(state.source_to_visible_index(1), None);
+    }
+
+    #[test]
     fn incoming_message_refreshes_an_active_message_search() {
         let mut state = ChatState {
             open_chat: Some(OpenChat {
@@ -2137,6 +2325,10 @@ mod tests {
             &[2],
             "after the prepend, 'hello' (the only 'h' match) sits at index 2"
         );
-        assert_eq!(state.message_list_state.selected(), Some(2));
+        assert_eq!(
+            state.message_list_state.selected(),
+            Some(0),
+            "the only visible match is selected at visible index zero"
+        );
     }
 }

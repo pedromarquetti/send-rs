@@ -3015,9 +3015,6 @@ async fn an_edit_updates_and_broadcasts_the_stored_message() {
     messenger.disconnect().await.expect("dormant shutdown");
 }
 
-/// The Phase 4 deferral guarantee, observed at the boundary: an edit that
-/// arrives before the message it rewrites is held, then applied and broadcast
-/// the moment that message lands.
 #[tokio::test]
 async fn an_edit_that_outruns_its_base_converges_at_the_boundary() {
     let (mut messenger, state, tx, qr, dir) = adapter().await;
