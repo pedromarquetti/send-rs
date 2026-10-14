@@ -829,7 +829,9 @@ impl AppState {
                 if !filtered.is_empty() {
                     let count = filtered.len();
                     self.chat_state.prepend_history(chat_id, filtered);
-                    self.chat_state.message_list_state.select(Some(count));
+                    if !self.chat_state.message_search.is_filtered() {
+                        self.chat_state.message_list_state.select(Some(count));
+                    }
                 }
             }
             Ok(_) => {
@@ -1822,13 +1824,6 @@ impl AppState {
             BackendEvent::MessageReceived(message) => {
                 let is_open = self.chat_state.push_incoming(message.clone());
 
-                if is_open
-                    && let Some(len) = self.chat_state.open_chat.as_ref().map(|o| o.history.len())
-                {
-                    // FIX: don't change selected idx when new messages come
-                    self.chat_state.message_list_state.select(Some(len - 1));
-                }
-
                 let open_chat_id = self
                     .chat_state
                     .open_chat
@@ -1916,19 +1911,9 @@ impl AppState {
 
                 if let Some(open) = self.chat_state.open_chat.as_ref()
                     && open.chat.id == chat
+                    && self.chat_state.message_list_len() == 0
                 {
                     self.chat_state.message_list_state.select(None);
-                    let len = self
-                        .chat_state
-                        .open_chat
-                        .as_ref()
-                        .map(|o| o.history.len())
-                        .unwrap_or(0);
-                    if len > 0 {
-                        self.chat_state
-                            .message_list_state
-                            .select(Some(len.saturating_sub(1)));
-                    }
                 }
             }
 

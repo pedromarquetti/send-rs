@@ -500,6 +500,43 @@ impl ChatState {
             .position(|&idx| idx == source_idx)
     }
 
+    /// Number of messages currently represented by the message list.
+    pub fn message_list_len(&self) -> usize {
+        if self.message_search.is_filtered() {
+            self.message_search.indices().len()
+        } else {
+            self.open_chat
+                .as_ref()
+                .map(|open| open.history.len())
+                .unwrap_or(0)
+        }
+    }
+
+    /// Restore the list selection to a message after history has been rebuilt.
+    /// The message ID remains stable while source indices can change.
+    fn select_message_by_id(&mut self, id: &MessageId) -> bool {
+        let Some(source) = self
+            .open_chat
+            .as_ref()
+            .and_then(|open| open.history.iter().position(|message| message.message_id == *id))
+        else {
+            return false;
+        };
+
+        let selected = if self.message_search.is_filtered() {
+            self.source_to_visible_index(source)
+        } else {
+            Some(source)
+        };
+
+        if let Some(index) = selected {
+            self.message_list_state.select(Some(index));
+            true
+        } else {
+            false
+        }
+    }
+
     /// The message currently selected in the open chat's list, if any.
     ///
     /// The selection is stored in visible-index space while filtering is active,
@@ -674,12 +711,17 @@ impl ChatState {
     /// current scroll position.
     pub fn refresh_chat_history(&mut self, chat_id: &ChatId, history: Vec<Message>) {
         let mut handled = false;
+        let selected_id = self.selected_message().map(|message| message.message_id.clone());
+        let old_selected = self.message_list_state.selected();
+        let old_len = self
+            .open_chat
+            .as_ref()
+            .map(|open| open.history.len())
+            .unwrap_or(0);
         if let Some(chat) = &mut self.open_chat
             && chat.chat.id == *chat_id
         {
             handled = true;
-            let old_len = chat.history.len();
-            let old_selected = self.message_list_state.selected();
             let mut merged = chat.history.clone();
 
             for message in history {
@@ -707,33 +749,18 @@ impl ChatState {
             chat.history = merged;
 
             let new_len = chat.history.len();
-
-            // Preserve the user's current scroll position in source/index terms.
-            if self.message_search.is_filtered() {
-                let selected_source = old_selected.and_then(|v| self.visible_to_source_index(v));
-                if let Some(src) = selected_source
-                    && let Some(visible) = self.source_to_visible_index(src)
-                {
-                    self.message_list_state.select(Some(visible));
-                } else if let Some(v) = old_selected {
-                    self.message_list_state.select(Some(v));
-                } else if !self.message_search.indices().is_empty() {
-                    self.message_list_state.select(Some(0));
-                } else {
-                    self.message_list_state.select(None);
-                }
-            } else {
-                // Preserve the user's current scroll position, clamped to bounds.
+            if !self.message_search.is_active() {
                 let new_selected = match old_selected {
-                    Some(idx) if new_len > 0 => Some(idx.min(new_len - 1)),
+                    Some(index) if new_len > 0 => Some(index.min(new_len - 1)),
                     _ if new_len > 0 => Some(new_len - 1),
                     _ => None,
                 };
-
                 self.message_list_state.select(new_selected);
 
-                // If the user was already at the bottom and new messages arrived, follow them.
-                if old_len > 0 && old_selected == Some(old_len - 1) && new_len > old_len {
+                if old_len > 0
+                    && old_selected == Some(old_len - 1)
+                    && new_len > old_len
+                {
                     self.message_list_state.select(Some(new_len - 1));
                 }
             }
@@ -741,6 +768,13 @@ impl ChatState {
 
         if handled {
             self.refresh_message_search_if_active();
+            if self.message_search.is_filtered()
+                && let Some(id) = selected_id
+                && !self.select_message_by_id(&id)
+                && self.message_list_len() == 0
+            {
+                self.message_list_state.select(None);
+            }
         }
     }
 
@@ -748,6 +782,7 @@ impl ChatState {
     /// current selection or duplicate entries. This is the foundation for lazy
     pub fn prepend_history(&mut self, chat_id: &ChatId, older: Vec<Message>) {
         let mut handled = false;
+        let selected_id = self.selected_message().map(|message| message.message_id.clone());
         if let Some(open) = &mut self.open_chat
             && open.chat.id == *chat_id
         {
@@ -773,31 +808,12 @@ impl ChatState {
             open.history.splice(0..0, merged);
             open.history.sort_by_key(|message| message.timestamp);
 
-            if self.message_search.is_filtered() {
-                let selected_source = self
-                    .message_list_state
-                    .selected()
-                    .and_then(|v| self.visible_to_source_index(v));
-                if let Some(src) = selected_source
-                    && let Some(visible) = self.source_to_visible_index(src)
-                {
-                    self.message_list_state.select(Some(visible));
-                } else if let Some(v) = self.message_list_state.selected() {
-                    let max = self.message_search.indices().len().saturating_sub(1);
-                    self.message_list_state.select(Some(v.min(max)));
-                } else if !self.message_search.indices().is_empty() {
-                    self.message_list_state.select(Some(0));
-                } else {
-                    self.message_list_state.select(None);
-                }
-            } else {
+            if !self.message_search.is_filtered() {
                 let selected = self.message_list_state.selected().unwrap_or(0);
-
                 self.message_list_state.select(Some(
                     (selected + prepend_count).min(open.history.len().saturating_sub(1)),
                 ));
-
-                if current_len == 0 {
+                if current_len == 0 && !open.history.is_empty() {
                     self.message_list_state
                         .select(Some(open.history.len().saturating_sub(1)));
                 }
@@ -806,6 +822,13 @@ impl ChatState {
 
         if handled {
             self.refresh_message_search_if_active();
+            if self.message_search.is_filtered()
+                && let Some(id) = selected_id
+                && !self.select_message_by_id(&id)
+                && self.message_list_len() == 0
+            {
+                self.message_list_state.select(None);
+            }
         }
     }
 
@@ -2196,6 +2219,67 @@ mod tests {
         assert_eq!(state.visible_to_source_index(0), Some(0));
         assert_eq!(state.visible_to_source_index(1), Some(1));
         assert_eq!(state.source_to_visible_index(1), None);
+    }
+
+    #[test]
+    fn filtered_selection_resolves_to_the_rendered_message() {
+        let mut state = ChatState {
+            open_chat: Some(OpenChat {
+                chat: chat(ChatId::Telegram(1), "A"),
+                history: vec![
+                    message_with_text(ChatId::Telegram(1), "plain"),
+                    message_with_text(ChatId::Telegram(1), "needle one"),
+                    message_with_text(ChatId::Telegram(1), "plain"),
+                    message_with_text(ChatId::Telegram(1), "needle two"),
+                ],
+                has_more_history: true,
+            }),
+            ..Default::default()
+        };
+
+        state.begin_message_search();
+        state.message_search_input(KeyEvent::from(KeyCode::Char('d')));
+        state.message_list_state.select(Some(1));
+
+        assert_eq!(
+            state.selected_message().map(|message| message.text.as_str()),
+            Some("needle two")
+        );
+    }
+
+    #[test]
+    fn filtered_prepend_preserves_selected_message_id() {
+        let chat_id = ChatId::Telegram(1);
+        let mut selected = message_with_text(chat_id.clone(), "selected message");
+        selected.message_id = MessageId::from("selected");
+        let mut state = ChatState {
+            open_chat: Some(OpenChat {
+                chat: chat(chat_id.clone(), "A"),
+                history: vec![
+                    message_with_id(chat_id.clone(), "other", 0),
+                    selected.clone(),
+                ],
+                has_more_history: true,
+            }),
+            ..Default::default()
+        };
+
+        state.begin_message_search();
+        state.message_search_input(KeyEvent::from(KeyCode::Char('s')));
+        assert_eq!(state.message_search.indices(), &[1]);
+        state.message_list_state.select(Some(0));
+
+        state.prepend_history(
+            &chat_id,
+            vec![message_with_id(chat_id.clone(), "older", -1)],
+        );
+
+        assert_eq!(
+            state.selected_message().map(|message| &message.message_id),
+            Some(&selected.message_id)
+        );
+        assert_eq!(state.message_search.indices(), &[2]);
+        assert_eq!(state.message_list_state.selected(), Some(0));
     }
 
     #[test]
