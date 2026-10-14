@@ -1477,14 +1477,29 @@ impl App {
                 }
 
                 if key == km.scroll_up {
-                    if self
+                    let is_at_visible_top = self
                         .state
                         .chat_state
                         .message_list_state
                         .selected()
-                        .is_some_and(|current| current == 0)
-                    {
-                        self.load_more_history();
+                        .is_some_and(|current| current == 0);
+                    if is_at_visible_top {
+                        let should_load = if self.state.chat_state.message_search.is_filtered() {
+                            // Check if the top visible message corresponds to history index 0 (oldest)
+                            let source_top = self
+                                .state
+                                .chat_state
+                                .visible_to_source_index(0)
+                                .unwrap_or(0);
+                            source_top == 0
+                        } else {
+                            true
+                        };
+                        if should_load {
+                            self.load_more_history();
+                        } else {
+                            self.state.chat_state.message_list_state.select_previous();
+                        }
                     } else {
                         self.state.chat_state.message_list_state.select_previous();
                     }
@@ -1493,13 +1508,34 @@ impl App {
                 } else if key == km.scroll_to_top {
                     self.state.chat_state.message_list_state.select_first();
                 } else if key == km.scroll_to_bottom {
-                    let last = self
-                        .state
-                        .chat_state
-                        .open_chat
-                        .as_ref()
-                        .map(|o| o.history.len().saturating_sub(1));
-                    self.state.chat_state.message_list_state.select(last);
+                    if self.state.chat_state.message_search.is_filtered() {
+                        let last_visible = self
+                            .state
+                            .chat_state
+                            .message_search
+                            .indices()
+                            .len()
+                            .saturating_sub(1);
+                        if last_visible == usize::MAX
+                            || last_visible == 0
+                                && self.state.chat_state.message_search.indices().is_empty()
+                        {
+                            self.state.chat_state.message_list_state.select(None);
+                        } else {
+                            self.state
+                                .chat_state
+                                .message_list_state
+                                .select(Some(last_visible));
+                        }
+                    } else {
+                        let last = self
+                            .state
+                            .chat_state
+                            .open_chat
+                            .as_ref()
+                            .map(|o| o.history.len().saturating_sub(1));
+                        self.state.chat_state.message_list_state.select(last);
+                    }
                 } else if key.code == KeyCode::PageUp {
                     if let Some(current) = self.state.chat_state.message_list_state.selected()
                         && current > 0
@@ -1520,21 +1556,27 @@ impl App {
                         .selected()
                         .unwrap_or(0);
                     let new = current.saturating_add(page);
-                    let max = self
-                        .state
-                        .chat_state
-                        .open_chat
-                        .as_ref()
-                        .map(|o| o.history.len().saturating_sub(1))
-                        .unwrap_or(0);
+                    let max = if self.state.chat_state.message_search.is_filtered() {
+                        self.state
+                            .chat_state
+                            .message_search
+                            .indices()
+                            .len()
+                            .saturating_sub(1)
+                    } else {
+                        self.state
+                            .chat_state
+                            .open_chat
+                            .as_ref()
+                            .map(|o| o.history.len().saturating_sub(1))
+                            .unwrap_or(0)
+                    };
                     self.state
                         .chat_state
                         .message_list_state
-                        .select(Some(new.min(max)));
+                        .select(Some(if max == usize::MAX { 0 } else { new.min(max) }));
                 } else if key == km.select
-                    && let Some(idx) = self.state.chat_state.message_list_state.selected()
-                    && let Some(open) = &self.state.chat_state.open_chat
-                    && let Some(msg) = open.history.get(idx)
+                    && let Some(msg) = self.state.chat_state.selected_message()
                 {
                     let mut msg = msg.clone();
                     if msg.reply_ctx.is_none()
