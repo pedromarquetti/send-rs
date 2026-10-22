@@ -1,6 +1,7 @@
 # Welcome to Sender!
 
 <!--toc:start-->
+
 - [Welcome to Sender!](#welcome-to-sender)
   - [System requirements](#system-requirements)
     - [Requirements for **audio recording**](#requirements-for-audio-recording)
@@ -29,6 +30,7 @@
   - [Built with](#built-with)
   - [Demo](#demo)
   - [Inspirations](#inspirations)
+
 <!--toc:end-->
 
 Sender is an TUI app for interacting with Whatsapp AND telegram (maybe more in
@@ -101,9 +103,11 @@ can do for itself.
       all.
 - [x] Configurable
 - [x] Draft / Myself conversation - using wp/tg integrated self chat
+- [ ] **Formatted text** - Check Backend compatibility + implement TUI text
+      message formatting
 - [ ] Help menu Popup to show keymaps
 - [ ] crates.io build - Make the binary available in `cargo install`
-- [ ] View contact/group info 
+- [ ] View contact/group info
 - [x] Descriptive error handling
 - [x] WhatsApp integration - Core WhatsApp integration
 - [x] Message actions (reply, edit, delete) for whatsapp
@@ -415,9 +419,8 @@ libraries already support but senders has not wired up yet are not listed here.
 <img width="50%" alt="Editing Message" src="https://github.com/user-attachments/assets/c59dcaa5-b2a8-4296-9e2a-d8bdcf947f12" />
 <img width="50%"  alt="Recording Audio" src="https://github.com/user-attachments/assets/e1407344-cb0e-4365-a495-6646632d025d" />
 <img width="50%"  alt="Playing recorded audio" src="https://github.com/user-attachments/assets/5a07d0c1-db52-4be9-9994-50ad31a0382d" />
-  
-</details>
 
+</details>
 
 ## Inspirations
 
