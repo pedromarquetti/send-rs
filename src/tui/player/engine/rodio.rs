@@ -602,7 +602,9 @@ impl MediaEngine for RodioEngine {
 /// wall-clock position, so draining faster than real time would end the cue
 /// before the engine believes it played.
 #[cfg(test)]
-fn drain_in_real_time(mut output: SourcesQueueOutput) -> (Arc<AtomicBool>, JoinHandle<()>) {
+pub(super) fn drain_in_real_time(
+    mut output: SourcesQueueOutput,
+) -> (Arc<AtomicBool>, JoinHandle<()>) {
     let done = Arc::new(AtomicBool::new(false));
     let finished = done.clone();
 

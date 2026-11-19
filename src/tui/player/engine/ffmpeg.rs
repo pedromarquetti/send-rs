@@ -267,7 +267,7 @@ fn read_full(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
 /// Created owner-only; `NamedTempFile` unlinks it when dropped, which is what
 /// makes `stop` the "forget the session" path. The extension is cosmetic —
 /// ffmpeg probes the container from content.
-fn temp_file() -> io::Result<NamedTempFile> {
+pub(super) fn temp_file() -> io::Result<NamedTempFile> {
     Builder::new()
         .prefix("senders-video-")
         .suffix(".bin")

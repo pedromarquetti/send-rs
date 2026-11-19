@@ -31,7 +31,9 @@ use crate::tui::image::{ImageWidgetState, VideoWidgetState};
 use crate::tui::loading::{LoadingArea, LoadingWidget};
 // Re-exported so the notifier can key its deduplication on the same message
 // identity the player uses, without reaching into a private module.
-use crate::tui::player::{FfmpegEngine, PlayState, PlaybackState, Player, RodioEngine};
+use crate::tui::player::{
+    FfmpegAudioEngine, FfmpegEngine, PlayState, PlaybackState, Player, RodioEngine,
+};
 pub use crate::tui::player::{PlayKey, PlayTrack};
 use crate::tui::popup::{AudioPopup, ImagePopup, PopupKind, VideoPopup};
 use crate::tui::settings::Settings;
@@ -763,7 +765,7 @@ impl App {
             player: Player::new(|| Box::new(RodioEngine::default()), tx.clone()),
             video_frames,
             video_player,
-            video_audio_player: Player::new(|| Box::new(RodioEngine::default()), tx.clone()),
+            video_audio_player: Player::new(|| Box::new(FfmpegAudioEngine::new()), tx.clone()),
             video_redraw_pending,
             notifier,
             tx,
@@ -3028,14 +3030,18 @@ mod tests {
         app.handle_popup_key(space).await;
 
         wait_for_playback(&mut app, &mut rx, |state| {
-            state.status == PlayState::Playing
+            state.source == source && state.status == PlayState::Playing
         })
         .await;
         assert_eq!(app.state.video.as_ref().unwrap().status, PlayState::Playing);
 
         // The clip is a second long, so the engine reaches EOF on its own and
-        // stops; that must not be mistaken for a failure.
+        // stops; that must not be mistaken for a failure. This clip has no
+        // audio track, so video-audio reports are ignored here.
         wait_for_playback(&mut app, &mut rx, |state| {
+            if state.source != source {
+                return false;
+            }
             if state.status == PlayState::Playing {
                 return false;
             }
