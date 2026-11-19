@@ -657,20 +657,6 @@ impl Messenger for WhatsAppMessenger {
         let jid = Jid::from_str(jid_str)
             .map_err(|e| BackendError::Other(format!("WhatsApp: invalid chat jid: {e}")))?;
 
-        debug!(
-            chat = ?message.chat_id,
-            from_me = message.from_me,
-            is_open,
-            chatlist_found,
-            open_chat_id = ?open_chat_id,
-            text_preview = %text_preview,
-            reply_to_id = ?message.reply_to_id,
-            sender = message.sender,
-            author_id = ?message.author_id,
-            sender = message.sender,
-            "TUI MessageReceived",
-        );
-
         // Resolve the reply context once, before any upload: both arms embed
         // this same `ContextInfo`, so attribution (quoted author / group
         // participant) can never diverge between message kinds, and an

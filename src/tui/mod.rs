@@ -639,7 +639,7 @@ async fn run_app(
                         result,
                     } => app.apply_video_media(chat, message_id, result).await,
                     UiEvent::PlaybackState(playback) => {
-                        app.state.apply_playback_state(playback);
+                        app.handle_playback_state(playback);
                     }
                     UiEvent::Resize=>{}
                 }
@@ -1046,6 +1046,13 @@ impl App {
         let chat = msg.chat_id.clone();
         let message_id = msg.message_id.clone();
 
+        // A new video must never inherit the previous one's frame decoder or
+        // audio track. Both workers are stopped before the new source is
+        // seeded; their late reports are dropped by the source guard below.
+        self.video_player.stop();
+        self.video_audio_player.stop();
+        self.state.video_audio = None;
+
         // Seed the session so early worker reports are accepted by
         // `apply_playback_state`'s same-source guard, which routes to this slot.
         self.state.video = Some(PlaybackState {
@@ -1114,16 +1121,26 @@ impl App {
         let note = match result {
             Ok(Some(bytes)) => {
                 debug!(chat = ?source.chat, msg = %source.message_id, "Video media loaded, awaiting play");
+                let audio_source = PlayKey {
+                    track: PlayTrack::VideoAudio,
+                    ..source.clone()
+                };
+
+                // Seed the audio slot before enqueueing the load: its first
+                // reports arrive as soon as the worker starts and would
+                // otherwise be dropped by the same-source guard.
+                self.state.video_audio = Some(PlaybackState {
+                    source: audio_source.clone(),
+                    status: PlayState::Loading,
+                    position: 0.0,
+                    duration: 0.0,
+                    updated_at: Instant::now(),
+                });
+
                 // Load only; playback starts on the first space press, so
                 // opening a video never starts decoding unasked.
                 self.video_player.load(source.clone(), bytes.clone());
-                self.video_audio_player.load(
-                    PlayKey {
-                        track: PlayTrack::VideoAudio,
-                        ..source.clone()
-                    },
-                    bytes,
-                );
+                self.video_audio_player.load(audio_source, bytes);
                 return;
             }
             Ok(None) => {
@@ -1155,6 +1172,54 @@ impl App {
             duration: 0.0,
             updated_at: Instant::now(),
         });
+    }
+
+    /// Apply one player report and arbitrate the shared video lifecycle.
+    ///
+    /// Frames are authoritative: when the visible video fails, its audio
+    /// session is stopped too. The reverse is deliberately not true — a
+    /// missing or unsupported audio track must never turn a valid frame
+    /// session into a video error. Reports from a different source are dropped
+    /// by `AppState::apply_playback_state` before they can touch either slot.
+    fn handle_playback_state(&mut self, playback: PlaybackState) {
+        let track = playback.source.track;
+        let status = playback.status;
+        let source = playback.source.clone();
+
+        let previous_status = self
+            .state
+            .video
+            .as_ref()
+            .filter(|current| current.source == source)
+            .map(|current| current.status);
+
+        self.state.apply_playback_state(playback);
+
+        let frames_active = self
+            .state
+            .video
+            .as_ref()
+            .is_some_and(|current| current.source == source);
+        if !frames_active || track != PlayTrack::VideoFrames {
+            return;
+        }
+
+        // A worker stopped by `open_video_popup`'s reset reports `Stopped`
+        // while the new session is still `Loading`; that is not the video
+        // ending, so it must not touch the freshly loaded audio track.
+        let reset_report =
+            status == PlayState::Stopped && matches!(previous_status, Some(PlayState::Loading));
+
+        if !reset_report && status == PlayState::Error {
+            debug!("video session failed, stopping its audio");
+            self.video_audio_player.stop();
+        } else if !reset_report && status == PlayState::Stopped {
+            // EOF is not a failure: pause instead of stopping so the replay
+            // path can seek both sessions back to the start with their bytes
+            // intact.
+            debug!("video session ended, pausing its audio");
+            self.video_audio_player.pause();
+        }
     }
 
     /// Dismiss the current popup, stopping an active media session. Closing an
@@ -1668,6 +1733,20 @@ impl App {
                             self.video_audio_player.pause();
                         }
                     } else {
+                        // Replaying a finished video starts a fresh session:
+                        // bring both workers back to zero before play so the
+                        // retained audio bytes cannot resume at the old EOF.
+                        if is_video
+                            && session
+                                .as_ref()
+                                .is_some_and(|current| current.status == PlayState::Stopped)
+                        {
+                            self.video_player.pause();
+                            self.video_audio_player.pause();
+                            self.video_player.seek_to(0.0);
+                            self.video_audio_player.seek_to(0.0);
+                        }
+
                         player.play();
                         if is_video {
                             self.video_audio_player.play();
@@ -1676,9 +1755,37 @@ impl App {
                 }
                 MediaAction::Seek { delta_secs } => {
                     debug!(video = is_video, "Seeking {delta_secs}");
-                    player.seek_by(f64::from(delta_secs));
-                    if is_video {
-                        self.video_audio_player.seek_by(f64::from(delta_secs));
+                    if !is_video {
+                        player.seek_by(f64::from(delta_secs));
+                        return;
+                    }
+
+                    // Frames are the seek authority. Compute one absolute
+                    // target from the visible session, then pause, seek and
+                    // conditionally resume both workers so they cannot drift
+                    // by sampling their positions at different moments.
+                    let now = Instant::now();
+                    let (position, duration) = session
+                        .as_ref()
+                        .map(|current| (current.display_position(now), current.duration))
+                        .unwrap_or((0.0, 0.0));
+                    let wanted = position + f64::from(delta_secs);
+                    let target = if duration > 0.0 {
+                        wanted.clamp(0.0, duration)
+                    } else {
+                        wanted.max(0.0)
+                    };
+                    let was_playing = session
+                        .as_ref()
+                        .is_some_and(|current| current.status == PlayState::Playing);
+
+                    self.video_player.pause();
+                    self.video_audio_player.pause();
+                    self.video_player.seek_to(target);
+                    self.video_audio_player.seek_to(target);
+                    if was_playing {
+                        self.video_player.play();
+                        self.video_audio_player.play();
                     }
                 }
             }
@@ -1969,6 +2076,148 @@ mod tests {
         .await
     }
 
+    use crate::tui::player::MediaEngine;
+    use std::sync::Mutex as StdMutex;
+
+    struct RecordingCalls {
+        calls: Vec<(&'static str, f64)>,
+        position: f64,
+        duration: f64,
+        status: PlayState,
+    }
+
+    impl Default for RecordingCalls {
+        fn default() -> Self {
+            Self {
+                calls: Vec::new(),
+                position: 0.0,
+                duration: 0.0,
+                status: PlayState::Stopped,
+            }
+        }
+    }
+
+    impl RecordingCalls {
+        fn record(&mut self, call: &'static str) {
+            self.calls.push((call, self.position));
+        }
+    }
+
+    /// A synchronous engine that records every transport command, so tests can
+    /// assert that the TUI routes the same action to both video players.
+    struct RecordingEngine(Arc<StdMutex<RecordingCalls>>);
+
+    impl RecordingEngine {
+        fn new(duration: f64) -> (Self, Arc<StdMutex<RecordingCalls>>) {
+            let calls = Arc::new(StdMutex::new(RecordingCalls {
+                duration,
+                ..RecordingCalls::default()
+            }));
+            (Self(Arc::clone(&calls)), calls)
+        }
+    }
+
+    impl MediaEngine for RecordingEngine {
+        fn load(&mut self, _bytes: &[u8]) -> Result<f64, String> {
+            let mut inner = self.0.lock().unwrap();
+            inner.position = 0.0;
+            inner.status = PlayState::Paused;
+            inner.record("load");
+            Ok(inner.duration)
+        }
+
+        fn play(&mut self) {
+            let mut inner = self.0.lock().unwrap();
+            inner.record("play");
+            inner.status = PlayState::Playing;
+        }
+
+        fn pause(&mut self) {
+            let mut inner = self.0.lock().unwrap();
+            inner.record("pause");
+            inner.status = PlayState::Paused;
+        }
+
+        fn seek(&mut self, position_secs: f64) {
+            let mut inner = self.0.lock().unwrap();
+            inner.position = position_secs;
+            inner.calls.push(("seek", position_secs));
+        }
+
+        fn stop(&mut self) {
+            let mut inner = self.0.lock().unwrap();
+            inner.record("stop");
+            inner.position = 0.0;
+            inner.status = PlayState::Stopped;
+        }
+
+        fn position(&self) -> f64 {
+            self.0.lock().unwrap().position
+        }
+
+        fn duration(&self) -> f64 {
+            self.0.lock().unwrap().duration
+        }
+
+        fn status(&mut self) -> PlayState {
+            self.0.lock().unwrap().status
+        }
+
+        fn is_busy(&self) -> bool {
+            matches!(
+                self.0.lock().unwrap().status,
+                PlayState::Playing | PlayState::Paused
+            )
+        }
+
+        fn play_cue(&mut self, _bytes: &[u8]) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn install_recording_video_players(
+        app: &mut App,
+    ) -> (Arc<StdMutex<RecordingCalls>>, Arc<StdMutex<RecordingCalls>>) {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (video, video_calls) = RecordingEngine::new(10.0);
+        app.video_player = Player::new(move || Box::new(video), tx.clone());
+        let (audio, audio_calls) = RecordingEngine::new(10.0);
+        app.video_audio_player = Player::new(move || Box::new(audio), tx);
+        (video_calls, audio_calls)
+    }
+
+    async fn wait_for_call(calls: &Arc<StdMutex<RecordingCalls>>, expected: &'static str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if calls
+                .lock()
+                .unwrap()
+                .calls
+                .iter()
+                .any(|(call, _)| *call == expected)
+            {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {expected}; recorded {:?}",
+                calls.lock().unwrap().calls
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    fn last_seek(calls: &Arc<StdMutex<RecordingCalls>>) -> f64 {
+        calls
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .rev()
+            .find_map(|(call, position)| (*call == "seek").then_some(*position))
+            .expect("the player must have received a seek")
+    }
+
     fn audio_demo_message() -> Message {
         Message {
             message_id: MessageId::from("audio-1"),
@@ -2209,6 +2458,286 @@ mod tests {
         source
     }
 
+    #[tokio::test]
+    async fn video_transport_controls_reach_both_players() {
+        let mut app = test_app().await;
+        let (video, audio) = install_recording_video_players(&mut app);
+        app.state.create_popup(video_popup());
+        let source = seed_video_session(&mut app);
+        app.state.video.as_mut().unwrap().status = PlayState::Paused;
+        app.state.video_audio = Some(PlaybackState {
+            source: PlayKey {
+                track: PlayTrack::VideoAudio,
+                ..source
+            },
+            status: PlayState::Paused,
+            position: 0.0,
+            duration: 10.0,
+            updated_at: Instant::now(),
+        });
+
+        let space = KeyEvent::from(KeyCode::Char(' '));
+        app.handle_popup_key(space).await;
+        wait_for_call(&video, "play").await;
+        wait_for_call(&audio, "play").await;
+
+        // A video report says it is now playing; the next space is a pause and
+        // must reach the audio session as well.
+        app.state.video.as_mut().unwrap().status = PlayState::Playing;
+        app.state.video_audio.as_mut().unwrap().status = PlayState::Playing;
+        app.handle_popup_key(space).await;
+        wait_for_call(&video, "pause").await;
+        wait_for_call(&audio, "pause").await;
+    }
+
+    #[tokio::test]
+    async fn replaying_a_finished_video_restarts_both_sessions_at_zero() {
+        let mut app = test_app().await;
+        let (video, audio) = install_recording_video_players(&mut app);
+        app.state.create_popup(video_popup());
+        let source = seed_video_session(&mut app);
+        let state = |track, status| PlaybackState {
+            source: PlayKey {
+                track,
+                ..source.clone()
+            },
+            status,
+            position: 10.0,
+            duration: 10.0,
+            updated_at: Instant::now(),
+        };
+        app.state.video = Some(state(PlayTrack::VideoFrames, PlayState::Stopped));
+        app.state.video_audio = Some(state(PlayTrack::VideoAudio, PlayState::Paused));
+
+        app.handle_popup_key(KeyEvent::from(KeyCode::Char(' ')))
+            .await;
+        wait_for_call(&video, "play").await;
+        wait_for_call(&audio, "play").await;
+
+        assert_eq!(last_seek(&video), 0.0);
+        assert_eq!(last_seek(&audio), 0.0);
+        let calls: Vec<_> = video
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .map(|(call, _)| *call)
+            .collect();
+        assert_eq!(calls, ["pause", "seek", "play"]);
+    }
+
+    #[tokio::test]
+    async fn video_seek_uses_one_absolute_target_and_resumes_only_if_playing() {
+        let mut app = test_app().await;
+        let (video, audio) = install_recording_video_players(&mut app);
+        app.state.create_popup(video_popup());
+        let source = seed_video_session(&mut app);
+        let state = |track, status| PlaybackState {
+            source: PlayKey {
+                track,
+                ..source.clone()
+            },
+            status,
+            position: 3.0,
+            duration: 10.0,
+            updated_at: Instant::now(),
+        };
+        app.state.video = Some(state(PlayTrack::VideoFrames, PlayState::Paused));
+        app.state.video_audio = Some(state(PlayTrack::VideoAudio, PlayState::Paused));
+
+        let seek_forward = KeyEvent::from(KeyCode::Char('>'));
+        app.handle_popup_key(seek_forward).await;
+        wait_for_call(&video, "seek").await;
+        wait_for_call(&audio, "seek").await;
+
+        let video_target = last_seek(&video);
+        assert!(
+            (video_target - 8.0).abs() < 1e-6,
+            "the seek target must be 3s + 5s, got {video_target}"
+        );
+        assert_eq!(
+            video_target,
+            last_seek(&audio),
+            "both sessions must receive the same absolute target"
+        );
+        assert!(
+            !video
+                .lock()
+                .unwrap()
+                .calls
+                .iter()
+                .any(|(call, _)| *call == "play")
+                && !audio
+                    .lock()
+                    .unwrap()
+                    .calls
+                    .iter()
+                    .any(|(call, _)| *call == "play"),
+            "a paused seek must not start playback"
+        );
+
+        // A seek made while playing pauses both, seeks both to the same
+        // absolute target, then resumes both.
+        video.lock().unwrap().calls.clear();
+        audio.lock().unwrap().calls.clear();
+        app.state.video = Some(state(PlayTrack::VideoFrames, PlayState::Playing));
+        app.state.video_audio = Some(state(PlayTrack::VideoAudio, PlayState::Playing));
+        app.handle_popup_key(seek_forward).await;
+        wait_for_call(&video, "play").await;
+        wait_for_call(&audio, "play").await;
+
+        let video_target = last_seek(&video);
+        assert_eq!(
+            video_target,
+            last_seek(&audio),
+            "resumed sessions must land on the same target"
+        );
+        assert!(
+            (video_target - 8.0).abs() < 0.5,
+            "the playing seek target drifted: {video_target}"
+        );
+        let calls: Vec<_> = video
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .map(|(call, _)| *call)
+            .collect();
+        assert_eq!(calls, ["pause", "seek", "play"]);
+    }
+
+    #[tokio::test]
+    async fn video_frame_end_pauses_audio_but_audio_failure_does_not_stop_frames() {
+        let mut app = test_app().await;
+        let (video, audio) = install_recording_video_players(&mut app);
+        app.state.create_popup(video_popup());
+        let source = seed_video_session(&mut app);
+        let audio_source = PlayKey {
+            track: PlayTrack::VideoAudio,
+            ..source.clone()
+        };
+        let state = |source: PlayKey, status| PlaybackState {
+            source,
+            status,
+            position: 1.0,
+            duration: 10.0,
+            updated_at: Instant::now(),
+        };
+        app.state.video = Some(state(source.clone(), PlayState::Paused));
+        app.state.video_audio = Some(state(audio_source.clone(), PlayState::Paused));
+
+        // Audio-only failure: the visible frame session is untouched.
+        app.handle_playback_state(state(audio_source.clone(), PlayState::Error));
+        assert!(
+            video.lock().unwrap().calls.is_empty(),
+            "an audio failure must not stop the video frames"
+        );
+        assert_eq!(app.state.video.as_ref().unwrap().status, PlayState::Paused);
+
+        // Frame failure: both the visible error and the audio stop are applied.
+        app.handle_playback_state(state(source.clone(), PlayState::Error));
+        wait_for_call(&audio, "stop").await;
+        assert!(
+            !video
+                .lock()
+                .unwrap()
+                .calls
+                .iter()
+                .any(|(call, _)| *call == "stop"),
+            "the failed video session must not be stopped again"
+        );
+        assert_eq!(app.state.video.as_ref().unwrap().status, PlayState::Error);
+
+        // Video EOF after playback silences audio without destroying the
+        // loaded session, so a replay can start both again from zero.
+        audio.lock().unwrap().calls.clear();
+        app.state.video = Some(state(source.clone(), PlayState::Playing));
+        app.handle_playback_state(state(source.clone(), PlayState::Stopped));
+        wait_for_call(&audio, "pause").await;
+        assert!(
+            !audio
+                .lock()
+                .unwrap()
+                .calls
+                .iter()
+                .any(|(call, _)| *call == "stop"),
+            "EOF must pause, not destroy, the audio session"
+        );
+
+        // The `Stopped` report from `open_video_popup`'s reset arrives while
+        // the new session is still loading; it must not touch the new audio.
+        audio.lock().unwrap().calls.clear();
+        app.state.video = Some(state(source.clone(), PlayState::Loading));
+        app.handle_playback_state(state(source, PlayState::Stopped));
+        assert!(
+            audio.lock().unwrap().calls.is_empty(),
+            "a reset report during loading must not touch the new audio session"
+        );
+    }
+
+    #[tokio::test]
+    async fn reopening_a_different_video_starts_without_the_previous_sessions() {
+        let config = Config::default();
+        let keymap = config.keys.parse().unwrap();
+        let mock = MockMessenger::new("Telegram");
+        let mut app = App::new(
+            config,
+            keymap,
+            vec![MessengerKind::Mock(Provider::Telegram, mock)],
+            false,
+            ratatui_image::picker::Picker::halfblocks(),
+            tokio::sync::mpsc::unbounded_channel().0,
+        )
+        .await;
+        let (video, audio) = install_recording_video_players(&mut app);
+
+        let mut first = video_demo_message();
+        first.chat_id = ChatId::Telegram(103);
+        first.message_id = MessageId::from("video-1");
+        app.open_video_popup(first);
+        let first_source = app.state.video.as_ref().unwrap().source.clone();
+        app.state.video_audio = Some(PlaybackState {
+            source: PlayKey {
+                track: PlayTrack::VideoAudio,
+                ..first_source.clone()
+            },
+            status: PlayState::Playing,
+            position: 4.0,
+            duration: 10.0,
+            updated_at: Instant::now(),
+        });
+        video.lock().unwrap().calls.clear();
+        audio.lock().unwrap().calls.clear();
+
+        let mut second = video_demo_message();
+        second.chat_id = ChatId::Telegram(103);
+        second.message_id = MessageId::from("video-2");
+        app.open_video_popup(second);
+
+        wait_for_call(&video, "stop").await;
+        wait_for_call(&audio, "stop").await;
+        assert!(
+            app.state.video_audio.is_none(),
+            "the previous video's audio session must not survive reopening"
+        );
+        let current = app.state.video.as_ref().expect("new video seeded");
+        assert_eq!(current.source.message_id, MessageId::from("video-2"));
+        assert_eq!(current.source.track, PlayTrack::VideoFrames);
+        assert_eq!(current.status, PlayState::Loading);
+
+        // A late report from the previous video cannot touch the new session.
+        app.handle_playback_state(PlaybackState {
+            source: first_source,
+            status: PlayState::Playing,
+            position: 9.0,
+            duration: 10.0,
+            updated_at: Instant::now(),
+        });
+        let current = app.state.video.as_ref().unwrap();
+        assert_eq!(current.source.message_id, MessageId::from("video-2"));
+        assert_eq!(current.status, PlayState::Loading);
+    }
+
     /// Drain player reports, applying each to `app` and stopping once `done`
     /// accepts the latest one. Every wait is bounded: a report that never
     /// arrives must fail the test rather than hang the suite.
@@ -2378,15 +2907,22 @@ mod tests {
     #[tokio::test]
     async fn dismissing_video_popup_is_clean() {
         let mut app = test_app().await;
+        let (video, audio) = install_recording_video_players(&mut app);
         app.state.create_popup(video_popup());
         seed_video_session(&mut app);
 
         app.handle_popup_key(KeyEvent::from(KeyCode::Esc)).await;
 
+        wait_for_call(&video, "stop").await;
+        wait_for_call(&audio, "stop").await;
         assert!(app.state.pop_up.is_none());
         assert!(
             app.state.video.is_none(),
             "the video session must not survive dismissal"
+        );
+        assert!(
+            app.state.video_audio.is_none(),
+            "the video-audio session must not survive dismissal"
         );
     }
 

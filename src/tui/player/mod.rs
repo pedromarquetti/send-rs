@@ -130,6 +130,11 @@ enum PlayerCommand {
     Seek {
         delta_secs: f64,
     },
+    /// Seek to an absolute position; used when two sessions must land on the
+    /// same frame instead of drifting by independently sampled deltas.
+    SeekTo {
+        position_secs: f64,
+    },
     Stop,
     /// A notification cue. Bytes only: the notifier already dropped duplicates
     /// before enqueueing, and a cue is never reported to the UI, so nothing
@@ -179,6 +184,13 @@ impl Player {
     /// the loaded duration.
     pub fn seek_by(&self, delta_secs: f64) {
         let _ = self.tx.send(PlayerCommand::Seek { delta_secs });
+    }
+
+    /// Seek to an absolute position (clamped by the worker to the loaded
+    /// duration). Paired sessions use this so they cannot drift apart by
+    /// sampling their positions at different moments.
+    pub fn seek_to(&self, position_secs: f64) {
+        let _ = self.tx.send(PlayerCommand::SeekTo { position_secs });
     }
 
     pub fn stop(&self) {
@@ -255,6 +267,17 @@ impl Worker {
                 };
 
                 debug!(delta_secs, target, "player: seek");
+                self.engine.seek(target);
+            }
+            PlayerCommand::SeekTo { position_secs } => {
+                let duration = self.engine.duration();
+                let target = if duration > 0.0 {
+                    position_secs.clamp(0.0, duration)
+                } else {
+                    position_secs.max(0.0)
+                };
+
+                debug!(position_secs, target, "player: seek to");
                 self.engine.seek(target);
             }
             PlayerCommand::Stop => {
@@ -553,6 +576,36 @@ mod tests {
                 .filter(|c| **c == "seek")
                 .count(),
             3
+        );
+    }
+
+    #[test]
+    fn absolute_seek_is_clamped_to_duration_bounds() {
+        let (engine, inner) = StubEngine::new(10.0);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let player = Player::new(move || Box::new(engine), tx);
+
+        player.load(key(1, "42"), b"fake-ogg".to_vec());
+        rx.blocking_recv().unwrap();
+        rx.blocking_recv().unwrap();
+
+        player.seek_to(4.0);
+        assert_eq!(
+            assert_playback(rx.blocking_recv().unwrap(), PlayState::Paused).position,
+            4.0
+        );
+        assert_eq!(inner.lock().unwrap().position, 4.0);
+
+        player.seek_to(100.0);
+        assert_eq!(
+            assert_playback(rx.blocking_recv().unwrap(), PlayState::Paused).position,
+            10.0
+        );
+
+        player.seek_to(-100.0);
+        assert_eq!(
+            assert_playback(rx.blocking_recv().unwrap(), PlayState::Paused).position,
+            0.0
         );
     }
 
