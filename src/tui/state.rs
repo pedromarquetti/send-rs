@@ -1874,6 +1874,7 @@ impl AppState {
                 }
 
                 let text_preview: String = message.text.chars().take(60).collect();
+
                 debug!(
                     chat = ?message.chat_id,
                     from_me = message.from_me,
@@ -1881,6 +1882,10 @@ impl AppState {
                     chatlist_found,
                     open_chat_id = ?open_chat_id,
                     text_preview = %text_preview,
+                    reply_to_id = ?message.reply_to_id,
+                    sender = message.sender,
+                    author_id = ?message.author_id,
+                    sender = message.sender,
                     "TUI MessageReceived",
                 );
 

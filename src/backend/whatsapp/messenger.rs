@@ -657,6 +657,20 @@ impl Messenger for WhatsAppMessenger {
         let jid = Jid::from_str(jid_str)
             .map_err(|e| BackendError::Other(format!("WhatsApp: invalid chat jid: {e}")))?;
 
+        debug!(
+            chat = ?message.chat_id,
+            from_me = message.from_me,
+            is_open,
+            chatlist_found,
+            open_chat_id = ?open_chat_id,
+            text_preview = %text_preview,
+            reply_to_id = ?message.reply_to_id,
+            sender = message.sender,
+            author_id = ?message.author_id,
+            sender = message.sender,
+            "TUI MessageReceived",
+        );
+
         // Resolve the reply context once, before any upload: both arms embed
         // this same `ContextInfo`, so attribution (quoted author / group
         // participant) can never diverge between message kinds, and an
@@ -741,10 +755,17 @@ impl Messenger for WhatsAppMessenger {
             }
         };
 
+        // BUG: Peers from Whatsapp groups are still receiving notifications as if i
+        // replied to them, even though i did not
         let result = client
             .send_message(jid.clone(), message)
             .await
             .map_err(BackendError::from)?;
+
+        debug!(to = %result.to,
+            message_id = %result.message_id,
+            fanout = ?result.recipient_fanout,
+            "WhatsApp::messenger::send result for {:?}",result.message);
 
         let sent = Message {
             message_id: result.message_id.clone().into(),
@@ -761,6 +782,17 @@ impl Messenger for WhatsAppMessenger {
             pending: false,
             failed: false,
         };
+
+        debug!(
+            chat = ?sent.chat_id,
+            from_me =sent.from_me,
+            reply_to_id = ?sent.reply_to_id,
+            content = sent.text,
+            sender = sent.sender,
+            author_id = ?sent.author_id,
+            sender = sent.sender,
+            "WhatsApp::messenger::send",
+        );
 
         {
             let mut state = self.state.write().await;
