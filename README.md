@@ -8,6 +8,7 @@
       - [Linux](#linux)
       - [macOS](#macos)
       - [Windows](#windows)
+    - [Requirements for **video playback**](#requirements-for-video-playback)
     - [Requirements for OS Notifications](#requirements-for-os-notifications)
       - [Linux](#linux-1)
       - [macOS — the presenting application is identified by the **bundle](#macos-the-presenting-application-is-identified-by-the-bundle)
@@ -24,6 +25,7 @@
       - [Manual cold-start smoke test](#manual-cold-start-smoke-test)
   - [Controls / Key Bindings](#controls-key-bindings)
   - [Limitations](#limitations)
+    - [Video playback](#video-playback)
     - [Telegram (grammers / Telegram protocol)](#telegram-grammers-telegram-protocol)
     - [WhatsApp (whatsapp-rust / WhatsApp Web protocol)](#whatsapp-whatsapp-rust-whatsapp-web-protocol)
   - [Development](#development)
@@ -43,8 +45,8 @@ the future?) in one TUI app!
 ## System requirements
 
 Building needs only the Rust toolchain plus the system audio libraries used for
-**recording** (Playback needs no extra libs — opus-pure decodes Opus in pure
-Rust):
+**recording**. Audio playback needs no extra Rust libraries — opus-pure decodes
+Opus in pure Rust. Video playback uses external FFmpeg, described below.
 
 ### Requirements for **audio recording**
 
@@ -67,6 +69,22 @@ None — WASAPI is linked automatically.
 
 At runtime, a working microphone/input device is required to use voice-note
 recording.
+
+### Requirements for **video playback**
+
+Video is decoded by external FFmpeg tools; no decoder is linked into the binary.
+
+- Both `ffmpeg` and `ffprobe` must be available on `PATH` at runtime.
+- Install the complete FFmpeg package: `ffmpeg` on Arch, Debian/Ubuntu and
+  Fedora, `brew install ffmpeg` on macOS, or an official Windows build that
+  contains both executables.
+- `ffprobe` reads duration, display rotation, coded geometry and whether an
+  audio stream exists. `ffmpeg` decodes the frames and the container's first
+  audio stream.
+- If either executable is missing, opening a video shows a playback error note
+  in the popup's bottom border and writes the diagnostic to `sender.log`. The
+  rest of the app — audio popups, voice notes, images and notifications — keeps
+  working.
 
 ### Requirements for OS Notifications
 
@@ -118,6 +136,8 @@ can do for itself.
 - [x] **WhatsApp** - Support for endless chat scroll.
 - [x] Image rendering
 - [x] Audio playback
+- [x] Video playback - frames and the first audio stream are decoded through
+      FFmpeg
 - [ ] Send images / video / files - the provider backends can upload media, but
       the TUI has no path to attach them: only audio (voice notes) is composed
       in-app
@@ -351,6 +371,24 @@ dormant (no connection, no QR). To exercise the offline-recovery path:
 Only limitations imposed by the underlying libraries and their protocols —
 things senders cannot implement regardless of effort. Features that the
 libraries already support but senders has not wired up yet are not listed here.
+
+### Video playback
+
+- Video messages open in a two-column popup: the video/description pane stays on
+  the left and the caption stays on the right.
+- Container display rotation is honored. A portrait clip stored as landscape
+  plus 90°/270° metadata is shown upright, without changing the popup split.
+- The container's first audio stream (`0:a:0`) is decoded by the installed
+  `ffmpeg`. A video with no audio track plays silently and shows a non-fatal
+  `no audio track` note. If the installed build cannot decode the audio codec,
+  or no audio output device is available, the frames keep playing and the popup
+  reports `audio unavailable — video only`.
+- Video and audio codec support depends on the installed FFmpeg build. Anything
+  it cannot demux or decode is reported as a video playback error; FFmpeg's
+  diagnostics go to `sender.log`.
+- Media bytes come from the same on-demand provider fetch as other media. On
+  WhatsApp, a video whose bytes have not arrived yet cannot play until the
+  linked phone delivers them during a history sync.
 
 ### Telegram (grammers / Telegram protocol)
 

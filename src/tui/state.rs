@@ -5159,6 +5159,7 @@ mod tests {
     fn video_popup_kind(
         msg: Message,
         playback: Option<PlaybackState>,
+        audio: Option<PlaybackState>,
         error_note: Option<String>,
     ) -> PopupKind {
         let frames = Arc::new(Mutex::new(None));
@@ -5174,6 +5175,7 @@ mod tests {
             msg,
             view,
             playback,
+            audio,
             error_note,
         })
     }
@@ -5181,10 +5183,11 @@ mod tests {
     fn video_popup(
         msg: Message,
         playback: Option<PlaybackState>,
+        audio: Option<PlaybackState>,
         error_note: Option<String>,
     ) -> PopupState {
         PopupState {
-            popup_type: video_popup_kind(msg, playback, error_note),
+            popup_type: video_popup_kind(msg, playback, audio, error_note),
             prev_focus: Focus::Chat,
             scroll_idx: 0,
             focused: false,
@@ -5315,7 +5318,7 @@ mod tests {
 
         // A Video popup is a media popup too, so the transport keys apply.
         state.dismiss_popup();
-        state.create_popup(video_popup_kind(video_message("clip"), None, None));
+        state.create_popup(video_popup_kind(video_message("clip"), None, None, None));
         assert_eq!(
             state.media_controls(&key(KeyCode::Char(' ')), &km),
             Some(MediaAction::PlayPause)
@@ -5400,6 +5403,7 @@ mod tests {
             video_message("clip"),
             Some(video_playback(PlayState::Playing, 3.0, 12.0)),
             None,
+            None,
         );
 
         let area = Rect::new(0, 0, 100, 30);
@@ -5437,6 +5441,7 @@ mod tests {
             video_message("clip"),
             Some(video_playback(PlayState::Playing, 3.0, 12.0)),
             None,
+            None,
         );
 
         let area = Rect::new(0, 0, 80, 24);
@@ -5472,6 +5477,7 @@ mod tests {
             let mut popup = video_popup(
                 video_message("clip"),
                 Some(video_playback(PlayState::Paused, 0.0, 12.0)),
+                None,
                 None,
             );
             let area = Rect::new(0, 0, 80, height);
@@ -5516,6 +5522,7 @@ mod tests {
         let mut popup = video_popup(
             video_message(&caption),
             Some(video_playback(PlayState::Paused, 2.0, 12.0)),
+            None,
             None,
         );
 
@@ -5597,10 +5604,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn video_popup_reports_unavailable_audio_without_hiding_frames() {
+        let tag = app_state().await.chat_state.get_tag().unwrap_or("");
+        let render = |status| {
+            let audio = PlaybackState {
+                source: PlayKey {
+                    chat: ChatId::Myself,
+                    message_id: MessageId::from("video-1"),
+                    track: PlayTrack::VideoAudio,
+                },
+                status,
+                position: 0.0,
+                duration: 0.0,
+                updated_at: Instant::now(),
+            };
+            let mut popup = video_popup(
+                video_message("clip"),
+                Some(video_playback(PlayState::Paused, 0.0, 12.0)),
+                Some(audio),
+                None,
+            );
+            let area = Rect::new(0, 0, 80, 24);
+            let mut buf = Buffer::empty(area);
+            (&mut PopUp::new(tag)).render(area, &mut buf, &mut popup);
+            buf.content.iter().map(|c| c.symbol()).collect::<String>()
+        };
+
+        let silent = render(PlayState::Unavailable);
+        assert!(
+            silent.contains("no audio track"),
+            "a silent video must say audio is missing: {silent}"
+        );
+        assert!(
+            silent.contains("Video · 00:00 / 00:12"),
+            "the frame transport must stay visible: {silent}"
+        );
+
+        let failed = render(PlayState::Error);
+        assert!(
+            failed.contains("audio unavailable"),
+            "an undecodable audio track must be non-fatal: {failed}"
+        );
+        assert!(
+            failed.contains("Video · 00:00 / 00:12"),
+            "an audio failure must not hide the frame transport: {failed}"
+        );
+    }
+
+    #[tokio::test]
     async fn paused_video_without_duration_shows_icon_and_unknown_time() {
         let mut popup = video_popup(
             video_message("clip"),
             Some(video_playback(PlayState::Paused, 0.0, 0.0)),
+            None,
             None,
         );
 
@@ -5621,6 +5677,7 @@ mod tests {
         let mut popup = video_popup(
             video_message("clip"),
             Some(video_playback(PlayState::Error, 0.0, 0.0)),
+            None,
             Some("no ffmpeg on PATH".into()),
         );
 

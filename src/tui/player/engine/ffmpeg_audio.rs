@@ -61,10 +61,13 @@ fn decode_args(path: &Path, position: f64) -> Vec<OsString> {
     args
 }
 
-/// Duration of the selected audio stream, falling back to the container
-/// duration when the stream has none. `0.0` means "unknown"; playback still
-/// works and is terminated by the child's EOF.
-fn probe_duration(path: &Path) -> f64 {
+/// Probe the first audio stream.
+///
+/// `Ok(None)` means the container has no audio track at all: a valid silent
+/// video, not an error. `Ok(Some(duration))` returns `0.0` when the stream has
+/// no declared duration; playback still works and is bounded by the decoder's
+/// EOF.
+fn probe_audio(path: &Path) -> Result<Option<f64>, String> {
     let output = Command::new("ffprobe")
         .args([
             "-v",
@@ -72,29 +75,43 @@ fn probe_duration(path: &Path) -> f64 {
             "-select_streams",
             "a:0",
             "-show_entries",
-            "stream=duration",
+            "stream=index,duration",
             "-show_entries",
             "format=duration",
             "-of",
-            "default=noprint_wrappers=1:nokey=1",
+            "json",
         ])
         .arg(path)
-        .output();
+        .output()
+        .map_err(|err| format!("cannot run ffprobe: {err}"))?;
 
-    let Ok(output) = output else {
-        warn!("ffprobe is unavailable; video audio duration is unknown");
-        return 0.0;
-    };
     if !output.status.success() {
-        warn!("ffprobe could not read the video audio duration");
-        return 0.0;
+        return Err("ffprobe could not read the video audio".to_string());
     }
 
-    let raw = String::from_utf8_lossy(&output.stdout);
-    raw.lines()
-        .find_map(|line| line.trim().parse::<f64>().ok())
-        .filter(|duration| *duration > 0.0)
-        .unwrap_or(0.0)
+    parse_audio_probe_json(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_audio_probe_json(json: &str) -> Result<Option<f64>, String> {
+    let probe: serde_json::Value = serde_json::from_str(json)
+        .map_err(|err| format!("cannot read the ffprobe audio output: {err}"))?;
+
+    let streams = probe
+        .get("streams")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("the ffprobe audio output has no stream list")?;
+    let Some(stream) = streams.first() else {
+        return Ok(None);
+    };
+
+    let duration = stream["duration"]
+        .as_str()
+        .or_else(|| probe["format"]["duration"].as_str())
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|secs| *secs > 0.0)
+        .unwrap_or(0.0);
+
+    Ok(Some(duration))
 }
 
 /// A blocking PCM reader exposed to rodio as a streaming [`Source`].
@@ -209,7 +226,12 @@ pub struct FfmpegAudioEngine {
     /// The container spilled from the provider bytes, kept for replay after a
     /// clean EOF and unlinked by an explicit `stop`.
     temp: Option<NamedTempFile>,
+    /// Total duration of the audio stream; `0.0` when unknown or absent.
     duration: f64,
+    /// Whether the loaded container actually has an audio stream. A silent
+    /// video keeps its bytes for the frame engine but never spawns an audio
+    /// decoder.
+    has_audio: bool,
     child: Option<Child>,
     stderr_reader: Option<JoinHandle<()>>,
     ended: Arc<AtomicBool>,
@@ -235,6 +257,7 @@ impl FfmpegAudioEngine {
         Self {
             temp: None,
             duration: 0.0,
+            has_audio: false,
             child: None,
             stderr_reader: None,
             ended: Arc::new(AtomicBool::new(false)),
@@ -369,23 +392,55 @@ impl MediaEngine for FfmpegAudioEngine {
         self.kill_decode();
         self.drop_sink();
         self.temp = None;
-
-        let mut temp =
-            temp_file().map_err(|err| format!("cannot create video-audio scratch file: {err}"))?;
-        temp.write_all(bytes)
-            .map_err(|err| format!("cannot write video-audio scratch file: {err}"))?;
-
-        let duration = probe_duration(temp.path());
-        self.temp = Some(temp);
-        self.duration = duration;
+        self.has_audio = false;
+        self.duration = 0.0;
         self.timing.stop();
-        self.status = PlayState::Paused;
+        self.status = PlayState::Stopped;
 
-        debug!(duration, "video audio loaded, paused at the start");
-        Ok(duration)
+        let mut temp = match temp_file() {
+            Ok(temp) => temp,
+            Err(err) => {
+                self.status = PlayState::Error;
+                return Err(format!("cannot create video-audio scratch file: {err}"));
+            }
+        };
+        if let Err(err) = temp.write_all(bytes) {
+            self.status = PlayState::Error;
+            return Err(format!("cannot write video-audio scratch file: {err}"));
+        }
+
+        let audio = probe_audio(temp.path());
+        self.temp = Some(temp);
+
+        match audio {
+            Ok(Some(duration)) => {
+                self.has_audio = true;
+                self.duration = duration;
+                self.status = PlayState::Paused;
+                debug!(duration, "video audio loaded, paused at the start");
+                Ok(duration)
+            }
+            Ok(None) => {
+                // A silent video is valid media: keep the bytes for the frame
+                // engine, but never spawn a decoder that would fail on a
+                // stream that does not exist.
+                self.status = PlayState::Unavailable;
+                debug!("video has no audio track, playing frames only");
+                Ok(0.0)
+            }
+            Err(err) => {
+                self.status = PlayState::Error;
+                warn!(error = %err, "video audio could not be probed");
+                Err(err)
+            }
+        }
     }
 
     fn play(&mut self) {
+        if !self.has_audio {
+            return;
+        }
+
         let Some(path) = self.temp.as_ref().map(|temp| temp.path().to_path_buf()) else {
             self.status = PlayState::Stopped;
             return;
@@ -429,6 +484,10 @@ impl MediaEngine for FfmpegAudioEngine {
     }
 
     fn seek(&mut self, position_secs: f64) {
+        if !self.has_audio {
+            return;
+        }
+
         let Some(path) = self.temp.as_ref().map(|temp| temp.path().to_path_buf()) else {
             return;
         };
@@ -468,6 +527,7 @@ impl MediaEngine for FfmpegAudioEngine {
         // Dropping the `NamedTempFile` unlinks the scratch copy.
         self.temp = None;
         self.duration = 0.0;
+        self.has_audio = false;
         self.timing.stop();
         self.status = PlayState::Stopped;
     }
@@ -559,13 +619,15 @@ mod tests {
             .collect()
     }
 
-    fn ffmpeg_available() -> bool {
-        Command::new("ffmpeg")
-            .arg("-version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
+    fn media_tools_available() -> bool {
+        ["ffmpeg", "ffprobe"].iter().all(|tool| {
+            Command::new(tool)
+                .arg("-version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        })
     }
 
     fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) {
@@ -688,9 +750,97 @@ mod tests {
     }
 
     #[test]
+    fn audio_probe_distinguishes_a_missing_track_from_an_unknown_duration() {
+        assert_eq!(
+            parse_audio_probe_json(r#"{"streams":[],"format":{"duration":"9.5"}}"#),
+            Ok(None),
+            "an empty selected-stream list means the video is silent"
+        );
+        assert_eq!(
+            parse_audio_probe_json(
+                r#"{"streams":[{"index":1,"duration":"3.25"}],"format":{"duration":"9.5"}}"#
+            ),
+            Ok(Some(3.25)),
+            "the audio stream's own duration wins"
+        );
+        assert_eq!(
+            parse_audio_probe_json(r#"{"streams":[{"index":1}],"format":{"duration":"9.5"}}"#),
+            Ok(Some(9.5)),
+            "the container duration is the fallback"
+        );
+        assert_eq!(
+            parse_audio_probe_json(r#"{"streams":[{"index":1}]}"#),
+            Ok(Some(0.0)),
+            "a stream with no duration is still present"
+        );
+        assert!(parse_audio_probe_json("not json").is_err());
+    }
+
+    #[test]
+    fn a_video_without_an_audio_track_stays_viewable_and_silent() {
+        if !media_tools_available() {
+            eprintln!("skipping: ffmpeg/ffprobe are not installed");
+            return;
+        }
+
+        let holder = temp_file().expect("a scratch clip holder");
+        let clip = holder.path().to_path_buf();
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x64:rate=10:duration=1",
+                "-c:v",
+                "mpeg4",
+                "-pix_fmt",
+                "yuv420p",
+                "-y",
+                "-f",
+                "mp4",
+            ])
+            .arg(&clip)
+            .status()
+            .expect("ffmpeg generates the silent test clip");
+        assert!(status.success());
+
+        let bytes = std::fs::read(&clip).unwrap();
+        let mut engine = FfmpegAudioEngine::headless();
+        assert_eq!(engine.load(&bytes), Ok(0.0));
+        assert_eq!(engine.status(), PlayState::Unavailable);
+        assert_eq!(engine.duration(), 0.0);
+        assert!(
+            engine.child.is_none(),
+            "a silent video must not spawn an audio decoder at load"
+        );
+
+        // Play, pause and seek must all stay no-ops: there is no stream to
+        // decode, and a silent video must never become an error.
+        engine.play();
+        assert_eq!(engine.status(), PlayState::Unavailable);
+        assert!(
+            engine.child.is_none(),
+            "a silent video must not spawn an audio decoder when played"
+        );
+        engine.pause();
+        assert_eq!(engine.status(), PlayState::Unavailable);
+        engine.seek(5.0);
+        assert_eq!(engine.status(), PlayState::Unavailable);
+        assert_eq!(engine.position(), 0.0);
+
+        engine.stop();
+        assert_eq!(engine.status(), PlayState::Stopped);
+        assert!(!engine.is_busy());
+    }
+
+    #[test]
     fn a_video_with_audio_streams_plays_and_seeks() {
-        if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg is not installed");
+        if !media_tools_available() {
+            eprintln!("skipping: ffmpeg/ffprobe are not installed");
             return;
         }
 
@@ -743,12 +893,91 @@ mod tests {
 
         engine.pause();
         assert_eq!(engine.status(), PlayState::Paused);
+        assert!(
+            engine.child.is_none(),
+            "pause must reap the audio decoder instead of leaving it running"
+        );
+        assert!(
+            engine.stderr_reader.is_none(),
+            "pause must join the diagnostics drainer"
+        );
         let paused_at = engine.position();
         std::thread::sleep(Duration::from_millis(100));
         assert!((engine.position() - paused_at).abs() < 1e-6);
 
         engine.stop();
         assert_eq!(engine.status(), PlayState::Stopped);
+        assert!(
+            engine.child.is_none(),
+            "stop must leave no audio decoder child behind"
+        );
+        assert!(
+            engine.stderr_reader.is_none(),
+            "stop must join the diagnostics drainer"
+        );
         assert!(!engine.is_busy());
+    }
+
+    #[test]
+    fn dropping_a_playing_engine_kills_and_reaps_its_audio_decoder() {
+        if !media_tools_available() {
+            eprintln!("skipping: ffmpeg/ffprobe are not installed");
+            return;
+        }
+
+        let holder = temp_file().expect("a scratch clip holder");
+        let clip = holder.path().to_path_buf();
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x64:rate=10:duration=2",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=2",
+                "-c:v",
+                "mpeg4",
+                "-c:a",
+                "aac",
+                "-pix_fmt",
+                "yuv420p",
+                "-shortest",
+                "-y",
+                "-f",
+                "mp4",
+            ])
+            .arg(&clip)
+            .status()
+            .expect("ffmpeg generates the test clip");
+        assert!(status.success());
+
+        let bytes = std::fs::read(&clip).unwrap();
+        let mut engine = FfmpegAudioEngine::headless();
+        engine.load(&bytes).expect("the audio track loads");
+        engine.play();
+        wait_until(Duration::from_secs(5), || engine.position() > 0.1);
+
+        assert!(
+            engine.child.is_some(),
+            "the test needs a live audio decoder to drop"
+        );
+        #[cfg(target_os = "linux")]
+        let pid = engine.child.as_ref().unwrap().id();
+        let scratch = engine.temp.as_ref().unwrap().path().to_path_buf();
+
+        drop(engine);
+
+        assert!(!scratch.exists(), "drop must unlink the scratch copy");
+        #[cfg(target_os = "linux")]
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "drop must kill and reap the audio decoder child"
+        );
     }
 }

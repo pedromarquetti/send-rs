@@ -112,7 +112,10 @@ fn decode_args(
 
     args.push("-i".into());
     args.push(path.as_os_str().to_os_string());
-    // BUG: this is making the video not have audio, refactor this
+    // Deliberately video-only: this pipe carries raw rgb24 frames, which
+    // cannot interleave audio. The container's first audio stream is decoded
+    // independently by `FfmpegAudioEngine`, which has its own fallback when the
+    // track is missing or unsupported.
     args.push("-an".into());
     args.push("-sn".into());
     args.push("-vf".into());
@@ -1534,6 +1537,15 @@ mod tests {
         let frozen = engine.position();
         assert_eq!(engine.status(), PlayState::Paused);
         assert!(
+            engine.child.is_none(),
+            "pause must reap the decoder instead of leaving it running"
+        );
+        assert!(engine.reader.is_none(), "pause must join the frame reader");
+        assert!(
+            engine.stderr_reader.is_none(),
+            "pause must join the diagnostics drainer"
+        );
+        assert!(
             slot.try_lock().is_ok_and(|guard| guard.is_some()),
             "pausing must keep the displayed frame available"
         );
@@ -1557,6 +1569,15 @@ mod tests {
 
         engine.stop();
         assert_eq!(engine.status(), PlayState::Stopped);
+        assert!(
+            engine.child.is_none(),
+            "stop must leave no decoder child behind"
+        );
+        assert!(engine.reader.is_none(), "stop must join the frame reader");
+        assert!(
+            engine.stderr_reader.is_none(),
+            "stop must join the diagnostics drainer"
+        );
         assert!(!scratch.exists(), "stopping must delete the scratch file");
         assert!(
             slot.try_lock().is_ok_and(|guard| guard.is_none()),
@@ -1631,6 +1652,64 @@ mod tests {
         );
 
         engine.stop();
+    }
+
+    #[test]
+    fn dropping_a_playing_engine_kills_and_reaps_its_decoder() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg is not installed");
+            return;
+        }
+
+        let holder = temp_file().expect("a scratch clip holder");
+        let clip = holder.path().to_path_buf();
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x64:rate=25:duration=2",
+                "-pix_fmt",
+                "yuv420p",
+                "-y",
+                "-f",
+                "mp4",
+            ])
+            .arg(&clip)
+            .status()
+            .expect("ffmpeg generates the test clip");
+        assert!(status.success());
+
+        let bytes = std::fs::read(&clip).unwrap();
+        let mut engine = FfmpegEngine::new(
+            Arc::new(Mutex::new(None)),
+            tokio::sync::mpsc::unbounded_channel().0,
+            Arc::new(AtomicBool::new(false)),
+        );
+        engine.load(&bytes).unwrap();
+        engine.play();
+        wait_until(Duration::from_secs(10), || engine.position() > 0.1);
+
+        assert!(
+            engine.child.is_some(),
+            "the test needs a live decoder to drop"
+        );
+        #[cfg(target_os = "linux")]
+        let pid = engine.child.as_ref().unwrap().id();
+        let scratch = engine.temp.as_ref().unwrap().path().to_path_buf();
+
+        drop(engine);
+
+        assert!(!scratch.exists(), "drop must unlink the scratch copy");
+        #[cfg(target_os = "linux")]
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "drop must kill and reap the decoder child"
+        );
     }
 
     #[test]

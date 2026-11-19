@@ -515,11 +515,11 @@ impl ChatState {
     /// Restore the list selection to a message after history has been rebuilt.
     /// The message ID remains stable while source indices can change.
     fn select_message_by_id(&mut self, id: &MessageId) -> bool {
-        let Some(source) = self
-            .open_chat
-            .as_ref()
-            .and_then(|open| open.history.iter().position(|message| message.message_id == *id))
-        else {
+        let Some(source) = self.open_chat.as_ref().and_then(|open| {
+            open.history
+                .iter()
+                .position(|message| message.message_id == *id)
+        }) else {
             return false;
         };
 
@@ -711,7 +711,9 @@ impl ChatState {
     /// current scroll position.
     pub fn refresh_chat_history(&mut self, chat_id: &ChatId, history: Vec<Message>) {
         let mut handled = false;
-        let selected_id = self.selected_message().map(|message| message.message_id.clone());
+        let selected_id = self
+            .selected_message()
+            .map(|message| message.message_id.clone());
         let old_selected = self.message_list_state.selected();
         let old_len = self
             .open_chat
@@ -757,10 +759,7 @@ impl ChatState {
                 };
                 self.message_list_state.select(new_selected);
 
-                if old_len > 0
-                    && old_selected == Some(old_len - 1)
-                    && new_len > old_len
-                {
+                if old_len > 0 && old_selected == Some(old_len - 1) && new_len > old_len {
                     self.message_list_state.select(Some(new_len - 1));
                 }
             }
@@ -782,7 +781,9 @@ impl ChatState {
     /// current selection or duplicate entries. This is the foundation for lazy
     pub fn prepend_history(&mut self, chat_id: &ChatId, older: Vec<Message>) {
         let mut handled = false;
-        let selected_id = self.selected_message().map(|message| message.message_id.clone());
+        let selected_id = self
+            .selected_message()
+            .map(|message| message.message_id.clone());
         if let Some(open) = &mut self.open_chat
             && open.chat.id == *chat_id
         {
@@ -2242,7 +2243,9 @@ mod tests {
         state.message_list_state.select(Some(1));
 
         assert_eq!(
-            state.selected_message().map(|message| message.text.as_str()),
+            state
+                .selected_message()
+                .map(|message| message.text.as_str()),
             Some("needle two")
         );
     }

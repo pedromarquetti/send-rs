@@ -66,6 +66,9 @@ pub struct VideoPopup {
     pub msg: Message,
     pub view: VideoWidgetState,
     pub playback: Option<PlaybackState>,
+    /// The separate audio-track session. When it is `Unavailable` or `Error`,
+    /// the popup shows a non-fatal note; frame playback keeps working.
+    pub audio: Option<PlaybackState>,
     /// As in [`AudioPopup`]: no ffmpeg on the system, an undecodable
     /// container, a download that never arrived.
     pub error_note: Option<String>,
@@ -489,6 +492,7 @@ impl StatefulWidget for &mut PopUp {
                 msg,
                 view,
                 playback,
+                audio,
                 error_note,
             }) => {
                 let max_width = area.width.saturating_sub(2);
@@ -504,8 +508,21 @@ impl StatefulWidget for &mut PopUp {
                     ))
                     .border_style(border_style);
 
-                block = match error_note {
-                    Some(note) => block.title_bottom(format!(" ⚠ {note} ")),
+                // A fatal video/download note takes precedence. Otherwise a
+                // missing or undecodable audio track is reported as a separate
+                // non-fatal note; the frame viewport keeps rendering.
+                let audio_note = match audio.as_ref().map(|state| state.status) {
+                    Some(PlayState::Unavailable) => Some("🔇 no audio track"),
+                    Some(PlayState::Error) => Some("⚠ audio unavailable — video only"),
+                    _ => None,
+                };
+                let bottom_note = error_note
+                    .as_deref()
+                    .map(|note| format!(" ⚠ {note} "))
+                    .or_else(|| audio_note.map(|note| format!(" {note} ")));
+
+                block = match bottom_note {
+                    Some(note) => block.title_bottom(note),
                     None => block,
                 };
 
@@ -533,7 +550,7 @@ impl StatefulWidget for &mut PopUp {
                 .split(inner);
 
                 let split_hor =
-                    Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    Layout::horizontal([Constraint::Percentage(70), Constraint::Percentage(30)])
                         .split(split_vert[0]);
 
                 VideoWidget.render(split_hor[0], buf, view);
@@ -608,6 +625,7 @@ fn playback_status(playback: Option<&PlaybackState>) -> (&'static str, f64, f64,
             let icon = match p.status {
                 PlayState::Playing => "▶",
                 PlayState::Paused | PlayState::Stopped => "⏸",
+                PlayState::Unavailable => "–",
                 PlayState::Loading => "…",
                 PlayState::Error => "⚠",
             };

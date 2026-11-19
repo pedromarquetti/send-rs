@@ -1078,6 +1078,7 @@ impl App {
                 Arc::clone(&self.video_redraw_pending),
             ),
             playback: None,
+            audio: None,
             error_note: None,
         }));
 
@@ -1215,6 +1216,18 @@ impl App {
         if !reset_report && status == PlayState::Error {
             debug!("video session failed, stopping its audio");
             self.video_audio_player.stop();
+
+            // The player protocol carries no error text, so point the user at
+            // the log instead of leaving the popup on its loading placeholder.
+            // A download failure already set a more specific note; never
+            // overwrite it.
+            if let Some(popup) = self.state.pop_up.as_mut()
+                && let PopupKind::Video(video) = &mut popup.popup_type
+                && video.error_note.is_none()
+            {
+                video.error_note =
+                    Some("video playback failed — see sender.log for details".to_string());
+            }
         } else if !reset_report && status == PlayState::Stopped {
             // EOF is not a failure: pause instead of stopping so the replay
             // path can seek both sessions back to the start with their bytes
@@ -1940,6 +1953,7 @@ impl App {
 
             if let PopupKind::Video(video) = &mut popup_state.popup_type {
                 video.playback = self.state.video.clone();
+                video.audio = self.state.video_audio.clone();
             }
 
             let tag = self.state.chat_state.get_tag();
@@ -2415,6 +2429,7 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
             ),
             playback: None,
+            audio: None,
             error_note: None,
         })
     }
@@ -2633,6 +2648,15 @@ mod tests {
         assert!(
             video.lock().unwrap().calls.is_empty(),
             "an audio failure must not stop the video frames"
+        );
+        assert_eq!(app.state.video.as_ref().unwrap().status, PlayState::Paused);
+
+        // A silent container reports `Unavailable`; that is also non-fatal for
+        // the visible frame session.
+        app.handle_playback_state(state(audio_source.clone(), PlayState::Unavailable));
+        assert!(
+            video.lock().unwrap().calls.is_empty(),
+            "a missing audio track must not stop the video frames"
         );
         assert_eq!(app.state.video.as_ref().unwrap().status, PlayState::Paused);
 
@@ -2929,6 +2953,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_stops_both_video_players() {
+        let mut app = test_app().await;
+        let (video, audio) = install_recording_video_players(&mut app);
+
+        app.shutdown().await;
+
+        wait_for_call(&video, "stop").await;
+        wait_for_call(&audio, "stop").await;
+    }
+
+    #[tokio::test]
+    async fn a_frame_failure_explains_itself_without_a_download_error() {
+        let mut app = test_app().await;
+        app.state.create_popup(video_popup());
+        let source = seed_video_session(&mut app);
+        let audio_source = PlayKey {
+            track: PlayTrack::VideoAudio,
+            ..source.clone()
+        };
+        let state = |source: PlayKey, status| PlaybackState {
+            source,
+            status,
+            position: 1.0,
+            duration: 10.0,
+            updated_at: Instant::now(),
+        };
+        app.state.video = Some(state(source.clone(), PlayState::Playing));
+        app.state.video_audio = Some(state(audio_source.clone(), PlayState::Paused));
+
+        // An audio-only failure must not invent a video error note.
+        app.handle_playback_state(state(audio_source, PlayState::Error));
+        let Some(PopupKind::Video(video)) = app.state.pop_up.as_ref().map(|p| &p.popup_type) else {
+            panic!("popup must still be open");
+        };
+        assert!(
+            video.error_note.is_none(),
+            "an audio failure must stay non-fatal for the frame session"
+        );
+
+        // A visible frame failure carries no text through the player protocol,
+        // so the popup must point at the log instead of staying on "Loading".
+        app.handle_playback_state(state(source, PlayState::Error));
+        let Some(PopupKind::Video(video)) = app.state.pop_up.as_ref().map(|p| &p.popup_type) else {
+            panic!("popup must still be open");
+        };
+        let note = video
+            .error_note
+            .as_deref()
+            .expect("a frame failure must explain itself");
+        assert!(note.contains("video playback failed"), "note was {note}");
+        assert!(note.contains("sender.log"), "note was {note}");
+    }
+
+    #[tokio::test]
     async fn video_popup_digit_routes_to_message_action() {
         let mut app = test_app().await;
         app.state.chat_state.open_chat = Some(OpenChat {
@@ -3053,6 +3131,22 @@ mod tests {
             true
         })
         .await;
+
+        // Replay: the space bar after EOF seeks the frame session back to zero
+        // and starts it again instead of doing nothing.
+        app.handle_popup_key(KeyEvent::from(KeyCode::Char(' ')))
+            .await;
+        wait_for_playback(&mut app, &mut rx, |state| {
+            state.source == source && state.status == PlayState::Playing
+        })
+        .await;
+        assert_eq!(app.state.video.as_ref().unwrap().status, PlayState::Playing);
+
+        // Dismissal closes the popup and drops both session snapshots.
+        app.handle_popup_key(KeyEvent::from(KeyCode::Esc)).await;
+        assert!(app.state.pop_up.is_none());
+        assert!(app.state.video.is_none());
+        assert!(app.state.video_audio.is_none());
     }
 
     /// Hardware-free mic for push-to-talk dispatch tests; always yields an

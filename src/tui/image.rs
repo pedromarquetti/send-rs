@@ -133,6 +133,10 @@ pub struct VideoWidgetState {
     /// without it a frame would be taken out of the slot on every draw.
     in_flight: bool,
     status: String,
+    /// Set by the encode worker just before it exits. Test-only: it lets the
+    /// lifecycle test prove the thread ends when this state is dropped.
+    #[cfg(test)]
+    worker_done: Arc<AtomicBool>,
 }
 
 impl VideoWidgetState {
@@ -149,6 +153,11 @@ impl VideoWidgetState {
     ) -> Self {
         let (job_tx, jobs) = mpsc::sync_channel::<(StatefulProtocol, Size)>(1);
         let (result_tx, results) = mpsc::channel();
+
+        #[cfg(test)]
+        let worker_done = Arc::new(AtomicBool::new(false));
+        #[cfg(test)]
+        let worker_done_probe = Arc::clone(&worker_done);
 
         std::thread::spawn(move || {
             while let Ok((mut protocol, size)) = jobs.recv() {
@@ -169,6 +178,9 @@ impl VideoWidgetState {
                 let _ = result_tx.send(encoded.then_some(protocol));
                 video_redraw_wake(&wake, &redraw_pending);
             }
+
+            #[cfg(test)]
+            worker_done_probe.store(true, std::sync::atomic::Ordering::SeqCst);
         });
 
         Self {
@@ -179,6 +191,8 @@ impl VideoWidgetState {
             results,
             in_flight: false,
             status: "Loading video…".to_string(),
+            #[cfg(test)]
+            worker_done,
         }
     }
 
@@ -393,6 +407,25 @@ mod tests {
         }))
     }
 
+    #[test]
+    fn dropping_the_video_widget_stops_its_encode_worker() {
+        let (_frames, state) = video();
+        let done = Arc::clone(&state.worker_done);
+
+        // The worker blocks on `jobs.recv()`; dropping the state closes that
+        // channel, which is the only shutdown signal it has.
+        drop(state);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !done.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the encode worker did not exit after VideoWidgetState was dropped"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     /// A [`VideoWidgetState`] with no worker thread: the test owns both channel
     /// ends, so a dispatched job can be observed and its completion delivered
     /// on demand. Inferring the worker's progress from thread scheduling was
@@ -423,6 +456,7 @@ mod tests {
                     results,
                     in_flight: false,
                     status: "Loading video…".to_string(),
+                    worker_done: Arc::new(AtomicBool::new(true)),
                 },
                 jobs,
                 results: result_tx,

@@ -23,6 +23,9 @@ pub enum PlayState {
     Loading,
     Playing,
     Paused,
+    /// The media has no track of this kind (for example a silent video). This
+    /// is a deliberate, non-fatal outcome, distinct from a decode failure.
+    Unavailable,
     /// The engine failed to load or decode the media; playback is unusable.
     Error,
 }
